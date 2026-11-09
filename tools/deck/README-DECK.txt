@@ -38,7 +38,7 @@ Files the game writes
 Known limits
   - The first time through an area stutters while shaders compile; later runs use the cache.
   - Gyro works with Steam Input on: the game keeps the Deck's motion sensor switched on (Steam turns it
-    off in-game). "Gyro turning: World" in the menu measures turns around the real vertical.
+    off in-game).
   - Tested on the Deck through the opening, Kakariko, Hateno, Wetland, Tarrey Town, Zora's Domain and
     Rito; not a full play-through.
 

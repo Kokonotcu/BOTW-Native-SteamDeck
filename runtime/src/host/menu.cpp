@@ -25,7 +25,6 @@ enum RowId {
     kFilter,
     kGamepadView,
     kGyro,
-    kGyroTurn,
     kRumble,
     kLayout,
     kTouch,
@@ -46,7 +45,7 @@ const char* kTabNames[kTabs] = {"Graphics", "Controls", "Audio", "Mods", "About"
 constexpr int kModRowBase = 1000;
 const std::vector<int>& tab_rows(int t) {
     static const std::vector<int> graphics = {kFps, kScale, kDisplay, kFilter, kGamepadView, kShowFps, kTelemetry, kMods};
-    static const std::vector<int> controls = {kGyro, kGyroTurn, kRumble, kLayout, kTouch};
+    static const std::vector<int> controls = {kGyro, kRumble, kLayout, kTouch};
     static const std::vector<int> audio = {kVolume};
     static const std::vector<int> about;
     switch (t) {
@@ -103,7 +102,6 @@ void step(Settings& s, int row, int dir) {
         case kGamepadView: s.gamepad_view = !s.gamepad_view; break;
         case kMods: break;
         case kGyro: s.gyro = !s.gyro; break;
-        case kGyroTurn: s.gyro_world = !s.gyro_world; break;
         case kRumble: s.rumble = !s.rumble; break;
         case kLayout: {
             // -1 auto, 0 Nintendo positions, 1 Xbox/PlayStation labels.
@@ -323,7 +321,6 @@ View view() {
     all[kDisplay] = {"Aspect", kDisplays[std::clamp(s.display, 0, 2)]};
     all[kFilter] = {"Upscale filter", kFilters[std::clamp(s.filter, 0, 3)]};
     all[kGyro] = {"Gyro aiming", s.gyro ? "On" : "Off"};
-    all[kGyroTurn] = {"Gyro turning", s.gyro_world ? "World (any holding angle)" : "Controller axes"};
     all[kRumble] = {"Rumble", s.rumble ? "On" : "Off"};
     all[kLayout] = {"Buttons", s.layout < 0 ? "Auto (per controller)"
                                      : s.layout > 0 ? "A = bottom (Cross / Xbox A)"

@@ -38,7 +38,7 @@ frames where the game's own work runs past 16.7 ms.
 
 - Boot, title screen, movies (H.264 decoded with FFmpeg on Linux), loading saves, the open world, combat, the map
   and fast travel, villages with NPCs and shops, the DLC (as `aoc/`).
-- Gyro on the Deck (motion shrines, aiming), with a "world" turning mode.
+- Gyro on the Deck (motion shrines, aiming).
 - Long sessions: 15–16 minute random-input soaks with no fatal errors; 10-minute Deck runs at a steady 60 fps.
 - In-game menu with L3+R3 (frame rate, render scale, gyro, telemetry, ...).
 
@@ -170,7 +170,7 @@ hardware threads.
 ### Steam Deck platform
 
 - Gyro: Steam switches the Deck's IMU off in-game; the runtime re-enables it every 2 s through the HID feature
-  report. "Gyro turning: World" measures turns around the real vertical.
+  report.
 - Linux fixes: case-insensitive game paths, a 32-bit indirect-call table on Linux, H.264 movies through FFmpeg,
   pipeline-compile threads at lower priority, a timebase without 128-bit division.
 - Fixed for all platforms: a DLC boot crash (`AOC_OpenTitle` wiped the next string), a dangling `string_view` in

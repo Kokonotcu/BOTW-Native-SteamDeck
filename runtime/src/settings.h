@@ -15,7 +15,6 @@ struct Settings {
     int display = 0;       // 0 fit (letterbox), 1 stretch, 2 fill (crop)
     int filter = 1;        // output scaling: 0 bilinear, 1 bicubic, 2 hermite, 3 nearest
     bool gyro = true;      // controller gyro -> GamePad motion
-    bool gyro_world = true;  // left/right turns measured around the real vertical, not the controller's axis
     bool rumble = true;
     int layout = -1;       // -1 automatic per controller, 0 Nintendo positions, 1 Xbox/PlayStation labels
     bool show_fps = false;

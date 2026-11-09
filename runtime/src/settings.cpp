@@ -25,8 +25,8 @@ void save_locked() {
     FILE* f = fopen(g_path.c_str(), "w");
     if (!f) return;
     fprintf(f, "# BotWRecomp settings (also editable from the in-game menu: touchpad, L3+R3 or F1)\n");
-    fprintf(f, "fps=%d\nscale=%g\ndisplay=%d\nfilter=%d\ngyro=%d\ngyro_world=%d\nrumble=%d\nlayout=%d\nshow_fps=%d\nvolume=%d\ntouch=%d\ntouch_hidden=%d\ngamepad_view=%d\ntelemetry=%d\n",
-            g_s.fps, g_s.scale, g_s.display, g_s.filter, g_s.gyro, g_s.gyro_world, g_s.rumble, g_s.layout, g_s.show_fps, g_s.volume,
+    fprintf(f, "fps=%d\nscale=%g\ndisplay=%d\nfilter=%d\ngyro=%d\nrumble=%d\nlayout=%d\nshow_fps=%d\nvolume=%d\ntouch=%d\ntouch_hidden=%d\ngamepad_view=%d\ntelemetry=%d\n",
+            g_s.fps, g_s.scale, g_s.display, g_s.filter, g_s.gyro, g_s.rumble, g_s.layout, g_s.show_fps, g_s.volume,
             g_s.touch, g_s.touch_hidden, g_s.gamepad_view, g_s.telemetry);
     fclose(f);
 }
@@ -44,7 +44,6 @@ void apply() {
     latte::set_output_filter(s.filter);
     latte::set_gamepad_view(s.gamepad_view);
     window::set_gyro(s.gyro);
-    input::set_motion_world_turn(s.gyro_world);
     window::set_rumble(s.rumble);
     window::set_layout(s.layout);
     audio::set_volume(s.volume / 100.0f);
@@ -80,7 +79,6 @@ void load(const std::string& path) {
                 else if (!strcmp(line, "display")) g_s.display = atoi(v);
                 else if (!strcmp(line, "filter")) g_s.filter = atoi(v);
                 else if (!strcmp(line, "gyro")) g_s.gyro = atoi(v) != 0;
-                else if (!strcmp(line, "gyro_world")) g_s.gyro_world = atoi(v) != 0;
                 else if (!strcmp(line, "rumble")) g_s.rumble = atoi(v) != 0;
                 else if (!strcmp(line, "layout")) {
                     int n = atoi(v);
