@@ -153,6 +153,7 @@ void init() {
     }
     g_mem = (uint8_t*)p;
     memory_base = g_mem;
+    madvise(g_mem, size, MADV_HUGEPAGE);  // the game's heaps span ~1 GB: 2 MB pages keep its data TLB hits
     mprotect(g_mem, 0x10000, PROT_NONE);  // catch guest null-pointer accesses
 #endif
     LOG("guest memory at %p", (void*)g_mem);

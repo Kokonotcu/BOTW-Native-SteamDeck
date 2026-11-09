@@ -149,6 +149,9 @@ public:
 	MPTR texDataPtrLow{};
 	MPTR texDataPtrHigh{};
 	uint32 texDataHash2{};
+	// BotW-Native: 2D arrays, mip-0 hash per slice and the slices changed at the last reload (LatteTexture_ReloadData)
+	std::vector<uint64> sliceHash;
+	std::vector<uint32> sliceRecheck;
 	// state
 	bool isUpdatedOnGPU{ false }; // set if any GPU-side operation modified this texture and strict one-way RAM->VRAM memory mirroring no longer applies
 	bool enableReadback{ false }; // if true, texture will be mirrored back to CPU RAM under specific circumstances

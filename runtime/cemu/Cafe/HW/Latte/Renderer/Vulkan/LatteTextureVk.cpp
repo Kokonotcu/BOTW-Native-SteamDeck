@@ -57,6 +57,17 @@ LatteTextureVk::LatteTextureVk(class VulkanRenderer* vkRenderer, Latte::E_DIM di
 	}
 	if (isDepth == false)
 		imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+	// BotW-Native: RADV gives MUTABLE_FORMAT images DCC (color compression) only with a format list. BotW views every
+	// texture in its own format (no other view format seen in an open-world run), so list just that one.
+	// Off unless BOTW_DCC=1: BotW samples its 1280x720 G-buffer targets while drawing into them (self dependencies,
+	// mostly without a barrier, see draw_setRenderPass), and RADV can't read and write a DCC image at once: block
+	// garbage on the Deck. A view in another format is logged once (LatteTextureViewVk).
+	static const bool s_formatList = []{ const char* e = getenv("BOTW_DCC"); return e && e[0] == '1'; }();
+	VkImageFormatListCreateInfo formatList{ VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO };
+	formatList.viewFormatCount = 1;
+	formatList.pViewFormats = &imageInfo.format;
+	if (s_formatList && isDepth == false && texFormatInfo.isCompressed == false)
+		imageInfo.pNext = &formatList;
 
 	if (isDepth)
 	{

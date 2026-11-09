@@ -4,6 +4,13 @@
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
 #include "Common/cpu_features.h"
 
+#include <bit>
+#include <algorithm>
+#include <cstdlib>
+#if defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
+
 std::unordered_set<LatteTexture*> g_allTextures;
 
 void LatteTC_Init()
@@ -51,6 +58,51 @@ uint32 _quickStochasticHash(void* texData, uint32 memRange, bool is16ByteFormat)
 
 	}
 	return (uint32)hashVal ^ (uint32)(hashVal >> 32);
+}
+
+// BotW-Native: the add-rotate hash over every step-th word, in four independent chains. The single chain was latency
+// bound (each sample waited for the previous rotate). The words sampled, and so which changes are seen, are the same.
+// Each texture in use is hashed once a frame and the small/medium ones touch every cache line, so these reads came from
+// DRAM (19% of the GPU thread's DRAM fills, b107 Deck event sampling) and evicted the main thread's data from the shared
+// 4 MB L3 (main's L2 misses came from DRAM more often than from L3). Non-temporal prefetches ~2 KB ahead fetch the same
+// words without installing them in L2/L3. Same words, same hash. BOTW_TEXHASH_NTA=0 off.
+#if defined(__x86_64__)
+static const bool s_texHashNta = !(getenv("BOTW_TEXHASH_NTA") && getenv("BOTW_TEXHASH_NTA")[0] == '0');
+#endif
+
+template<typename T, int R>
+static T hashStrided(const T* p, uint32 count, uint32 step)
+{
+	T h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+	uint32 i = 0;
+#if defined(__x86_64__)
+	if (s_texHashNta)
+	{
+		const uint32 ahead = 4 * step * std::max<uint32>(2, 2048 / (4 * step * sizeof(T)));  // elements, whole iterations
+		for (; i + 4 <= count; i += 4, p += 4 * step)
+		{
+			_mm_prefetch((const char*)(p + ahead), _MM_HINT_NTA);
+			_mm_prefetch((const char*)(p + ahead + step), _MM_HINT_NTA);
+			_mm_prefetch((const char*)(p + ahead + 2 * step), _MM_HINT_NTA);
+			_mm_prefetch((const char*)(p + ahead + 3 * step), _MM_HINT_NTA);
+			h0 = std::rotl<T>(h0 + p[0], R);
+			h1 = std::rotl<T>(h1 + p[step], R);
+			h2 = std::rotl<T>(h2 + p[2 * step], R);
+			h3 = std::rotl<T>(h3 + p[3 * step], R);
+		}
+	}
+#endif
+	for (; i + 4 <= count; i += 4, p += 4 * step)
+	{
+		h0 = std::rotl<T>(h0 + p[0], R);
+		h1 = std::rotl<T>(h1 + p[step], R);
+		h2 = std::rotl<T>(h2 + p[2 * step], R);
+		h3 = std::rotl<T>(h3 + p[3 * step], R);
+	}
+	for (; i < count; i++, p += step)
+		h0 = std::rotl<T>(h0 + p[0], R);
+	constexpr int bits = sizeof(T) * 8;
+	return h0 ^ std::rotl<T>(h1, bits / 4) ^ std::rotl<T>(h2, bits / 2) ^ std::rotl<T>(h3, bits / 4 * 3);
 }
 
 #if BOOST_OS_WINDOWS
@@ -137,50 +189,18 @@ uint32 LatteTexture_CalculateTextureDataHash(LatteTexture* hostTexture)
 		// small texture size
 		bool isCompressedFormat = hostTexture->IsCompressedFormat();
 		if( isCompressedFormat == false || memRange < 0x200 )
-		{
-			memRange /= (4*sizeof(uint32));
-			while( memRange-- )
-			{
-				hashVal += *texDataU32;
-				hashVal = (hashVal<<3)|(hashVal>>29);
-				texDataU32 += 4;
-			}
-		}
+			hashVal = hashStrided<uint32, 3>(texDataU32, memRange / (4 * sizeof(uint32)), 4);
 		else
-		{
-			memRange /= (32*sizeof(uint32));
-			while( memRange-- )
-			{
-				hashVal += *texDataU32;
-				hashVal = (hashVal<<3)|(hashVal>>29);
-				texDataU32 += 32;
-			}
-		}
+			hashVal = hashStrided<uint32, 3>(texDataU32, memRange / (32 * sizeof(uint32)), 32);
 	}
 	else if( pixelCount <= (1200*1200) )
 	{
 		// medium texture size
 		bool isCompressedFormat = hostTexture->IsCompressedFormat();
 		if( isCompressedFormat == false )
-		{
-			memRange /= (12*sizeof(uint32));
-			while( memRange-- )
-			{
-				hashVal += *texDataU32;
-				hashVal = (hashVal<<3)|(hashVal>>29);
-				texDataU32 += 12;
-			}
-		}
+			hashVal = hashStrided<uint32, 3>(texDataU32, memRange / (12 * sizeof(uint32)), 12);
 		else
-		{
-			memRange /= (96*sizeof(uint32));
-			while( memRange-- )
-			{
-				hashVal += *texDataU32;
-				hashVal = (hashVal<<3)|(hashVal>>29);
-				texDataU32 += 96;
-			}
-		}
+			hashVal = hashStrided<uint32, 3>(texDataU32, memRange / (96 * sizeof(uint32)), 96);
 	}
 	else
 	{
@@ -196,28 +216,12 @@ uint32 LatteTexture_CalculateTextureDataHash(LatteTexture* hostTexture)
 #endif
 			else
 			{
-				memRange /= (32 * sizeof(uint64));
-				uint64 h64 = 0;
-				uint64* texDataU64 = (uint64*)texDataU32;
-				while (memRange--)
-				{
-					h64 += *texDataU64;
-					h64 = (h64 << 3) | (h64 >> 61);
-					texDataU64 += 32;
-				}
+				const uint64 h64 = hashStrided<uint64, 3>((const uint64*)texDataU32, memRange / (32 * sizeof(uint64)), 32);
 				hashVal = (h64 & 0xFFFFFFFF) + (h64 >> 32);
 			}
 		}
 		else
-		{
-			memRange /= (512*sizeof(uint32));
-			while( memRange-- )
-			{
-				hashVal += *texDataU32;
-				hashVal = (hashVal<<3)|(hashVal>>29);
-				texDataU32 += 512;
-			}
-		}
+			hashVal = hashStrided<uint32, 3>(texDataU32, memRange / (512 * sizeof(uint32)), 512);
 	}
 
 	return hashVal;
@@ -359,6 +363,25 @@ void LatteTexture_Delete(LatteTexture* texture)
  * Checks if the texture can be dropped from the cache and if yes, delete it
  * Returns true if the texture was deleted
  */
+// BotW-Native: VRAM pressure. RAM-backed textures stayed until unused for 120 s and 2000 frames, so the Deck's 1 GB VRAM
+// carve-out held everything shown in the last two minutes (990 of 1024 MB in play) and the kernel moved memory around
+// mid-frame. Above 75% of the carve-out they go after 15 s and 900 frames instead. Opt-in (BOTW_VRAM_TRIM=1): with
+// texture memory moving to system memory once the carve-out is nearly full (VKRMemoryManager), the carve-out no longer
+// overflows, and the early frees tripled texture re-uploads at 8 W (166 vs 50-64 a second) for no gain.
+bool BotW_ReadVramCarveout(uint64& used, uint64& total);  // VKRMemoryManager.cpp
+static bool s_vramPressure = false;
+
+static void LatteTC_UpdateVramPressure(uint32 currentTick)
+{
+	static const bool s_on = [] { const char* e = getenv("BOTW_VRAM_TRIM"); return e && e[0] == '1'; }();
+	static uint32 s_lastCheck = 0;
+	if (!s_on || currentTick - s_lastCheck < 1000)
+		return;
+	s_lastCheck = currentTick;
+	uint64 used, total;
+	s_vramPressure = BotW_ReadVramCarveout(used, total) && total > 0 && total <= (4ull << 30) && used * 4 > total * 3;
+}
+
 bool LatteTC_CleanupCheckTexture(LatteTexture* texture, uint32 currentTick)
 {
 	uint32 currentFrameCount = LatteGPUState.frameCounter;
@@ -367,7 +390,9 @@ bool LatteTC_CleanupCheckTexture(LatteTexture* texture, uint32 currentTick)
 	if( !texture->isUpdatedOnGPU )
 	{
 		// RAM-only textures are safe to be deleted since we can always restore them from RAM
-		if( ticksSinceLastAccess >= (120*1000) && framesSinceLastAccess >= 2000 )
+		const uint32 tickLimit = s_vramPressure ? 15 * 1000 : 120 * 1000;
+		const uint32 frameLimit = s_vramPressure ? 900 : 2000;
+		if( ticksSinceLastAccess >= tickLimit && framesSinceLastAccess >= frameLimit )
 		{
 			LatteTexture_Delete(texture);
 			return true;
@@ -406,6 +431,7 @@ void LatteTC_CleanupUnusedTextures()
 {
 	static size_t currentScanIndex = 0;
 	uint32 currentTick = GetTickCount();
+	LatteTC_UpdateVramPressure(currentTick);
 	sint32 maxDelete = 10;
 	std::vector<LatteTexture*>& allTextures = LatteTexture::GetAllTextures();
 	if (!allTextures.empty())

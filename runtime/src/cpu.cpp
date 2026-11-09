@@ -50,11 +50,10 @@ extern "C" uint64_t rt_timebase(void) {
     if (clock_gettime(clk, &ts) != 0) clock_gettime(CLOCK_MONOTONIC, &ts);
     static const uint64_t t0 = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
     uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec - t0;
-#if defined(__SIZEOF_INT128__)
-    return (uint64_t)((__uint128_t)ns * kTimerHz / 1000000000ull);
-#else
-    return ns / 1000000000ull * kTimerHz + (ns % 1000000000ull) * kTimerHz / 1000000000ull;
-#endif
+    // 62156250 / 1e9 = 1989 / 32000: a multiply and shift instead of a 128-bit division (__udivti3)
+    // on this hot path. Exact; ns * 1989 stays below 2^64 for 107 days after the first call.
+    static_assert(kTimerHz * 32000ull == 1989ull * 1000000000ull, "timebase ratio");
+    return ns * 1989ull / 32000ull;
 #endif
 }
 

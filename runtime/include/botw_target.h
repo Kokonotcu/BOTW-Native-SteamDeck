@@ -30,11 +30,20 @@
 #endif
 
 #include <stdint.h>
+#include <stdio.h>
+
+// Core plan (runtime/src/thread.cpp): 0 = an ordinary thread, 1 = LatteThread / VkRecord. No-op off the Deck layout.
+extern "C" void botw_place_thread(int kind);
 
 inline void botw_set_thread_name(const char* name) {
 #if defined(__APPLE__)
     pthread_setname_np(name);
-#elif defined(__linux__) || defined(__FreeBSD__) || defined(__MINGW32__) || defined(__MINGW64__)
+#elif defined(__linux__)
+    char shortName[16];  // Linux refuses names over 15 characters; the thread would keep its creator's name
+    snprintf(shortName, sizeof shortName, "%s", name);
+    pthread_setname_np(pthread_self(), shortName);
+    botw_place_thread(0);
+#elif defined(__FreeBSD__) || defined(__MINGW32__) || defined(__MINGW64__)
     pthread_setname_np(pthread_self(), name);
 #else
     (void)name;

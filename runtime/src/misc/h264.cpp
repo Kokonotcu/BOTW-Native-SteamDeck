@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -21,6 +22,14 @@
 #include <mftransform.h>
 #include <mferror.h>
 #include <wmcodecdsp.h>
+#elif defined(BOTW_HAVE_FFMPEG)
+// Linux: a static FFmpeg with only the H.264 decoder (tools/deck/ffmpeg.sh) stands in for Media Foundation.
+extern "C" {
+#include <libavcodec/avcodec.h>
+}
+#endif
+#if defined(_WIN32) || defined(BOTW_HAVE_FFMPEG)
+#define BOTW_H264_DECODE 1
 #endif
 
 namespace {
@@ -532,11 +541,124 @@ struct H264DecoderSession {
 
         return drainMftOutputs(width, height);
     }
+#elif defined(BOTW_HAVE_FFMPEG)
+    AVCodecContext* av = nullptr;
+    AVPacket* avPkt = nullptr;
+    AVFrame* avFrame = nullptr;
+
+    // Like Cemu: every picture goes back in the buffer and with the timestamp of its own access unit.
+    // Packet pts = index into inputs; decoded pictures (display order) queue in ready.
+    struct Picture { uint32_t buffer; double timestamp; };
+    std::unordered_map<int64_t, Picture> inputs;
+    std::deque<Picture> ready;
+    int64_t nextPts = 0;
+    uint32_t inFlight = 0;
+
+    void releaseAv() {
+        avcodec_free_context(&av);
+        av_packet_free(&avPkt);
+        av_frame_free(&avFrame);
+        sentSpsPpsToDecoder = false;
+        inputs.clear();
+        ready.clear();
+        inFlight = 0;
+    }
+
+    bool initAv() {
+        releaseAv();
+        const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+        av = codec ? avcodec_alloc_context3(codec) : nullptr;
+        avPkt = av_packet_alloc();
+        avFrame = av_frame_alloc();
+        if (!av || !avPkt || !avFrame) {
+            releaseAv();
+            return false;
+        }
+        // Display order (the movies are High profile with B-frames, reorder delay 2). Uncropped output;
+        // the game crops with the SPS crop fields it is handed.
+        av->thread_count = 1;
+        av->apply_cropping = 0;
+        if (avcodec_open2(av, codec, nullptr) < 0) {
+            LOG("h264: avcodec_open2 failed");
+            releaseAv();
+            return false;
+        }
+        return true;
+    }
+
+    // Planar 4:2:0 picture -> NV12 in the guest buffer at the game's pitch: Y rows, then interleaved UV rows.
+    bool storeFrame(const AVFrame* f, uint32_t width, uint32_t height, uint32_t buffer) {
+        if (f->format != AV_PIX_FMT_YUV420P && f->format != AV_PIX_FMT_YUVJ420P) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LOG("h264: unsupported decoded pixel format %d", f->format);
+            }
+            return false;
+        }
+        uint32_t dstPitch = (width + 255u) & ~255u;
+        size_t ySize = static_cast<size_t>(dstPitch) * height;
+        mem::commit(buffer, ySize * 3u / 2u, true);
+        uint8_t* dstY = mem::host(buffer);
+        uint8_t* dstUV = dstY + ySize;
+        uint32_t w = std::min(width, static_cast<uint32_t>(f->width));
+        uint32_t h = std::min(height, static_cast<uint32_t>(f->height));
+        for (uint32_t y = 0; y < h; ++y)
+            std::memcpy(dstY + static_cast<size_t>(y) * dstPitch, f->data[0] + static_cast<size_t>(y) * f->linesize[0], w);
+        for (uint32_t y = 0; y < h / 2u; ++y) {
+            const uint8_t* u = f->data[1] + static_cast<size_t>(y) * f->linesize[1];
+            const uint8_t* v = f->data[2] + static_cast<size_t>(y) * f->linesize[2];
+            uint8_t* uv = dstUV + static_cast<size_t>(y) * dstPitch;
+            for (uint32_t x = 0; x < w / 2u; ++x) {
+                uv[2 * x] = u[x];
+                uv[2 * x + 1] = v[x];
+            }
+        }
+        return true;
+    }
+
+    void receiveAll(uint32_t width, uint32_t height) {
+        while (avcodec_receive_frame(av, avFrame) == 0) {
+            auto it = inputs.find(avFrame->pts);
+            if (it != inputs.end()) {
+                if (storeFrame(avFrame, width, height, it->second.buffer)) ready.push_back(it->second);
+                inputs.erase(it);
+            }
+            av_frame_unref(avFrame);
+        }
+    }
+
+    void feedAnnexB(const uint8_t* data, size_t len, uint32_t width, uint32_t height, uint32_t buffer, double timestamp) {
+        if (!av && !initAv()) return;
+        inputs[nextPts] = {buffer, timestamp};
+        // Not reference-counted, so avcodec_send_packet copies it into a padded buffer.
+        avPkt->data = const_cast<uint8_t*>(data);
+        avPkt->size = static_cast<int>(len);
+        avPkt->pts = nextPts++;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            int sent = avcodec_send_packet(av, avPkt);
+            receiveAll(width, height);
+            if (sent != AVERROR(EAGAIN)) break;  // EAGAIN: output was full; drained above, send again
+        }
+        avPkt->data = nullptr;
+        avPkt->size = 0;
+    }
+
+    // End of stream: the pictures still held for reordering come out; the decoder is ready for new input.
+    void drain(uint32_t width, uint32_t height) {
+        if (!av) return;
+        avcodec_send_packet(av, nullptr);
+        receiveAll(width, height);
+        avcodec_flush_buffers(av);
+        inputs.clear();
+    }
 #endif
 
     ~H264DecoderSession() {
 #ifdef _WIN32
         releaseMft();
+#elif defined(BOTW_HAVE_FFMPEG)
+        releaseAv();
 #endif
     }
 };
@@ -718,6 +840,8 @@ HLE_EXPORT(h264, H264DECBegin) {
     sess.lastFrameNV12.clear();
 #ifdef _WIN32
     sess.releaseMft();
+#elif defined(BOTW_HAVE_FFMPEG)
+    sess.releaseAv();
 #endif
     RET(H264_STATUS_OK);
 }
@@ -782,6 +906,9 @@ HLE_EXPORT(h264, H264DECSetBitstream) {
     sess.timestamp    = ts;
     RET(H264_STATUS_OK);
 }
+
+static void outputPicture(PPCContext* c, uint32_t memPtr, uint32_t fptrOutput, uint32_t userMemory, const SpsInfo& sps,
+                          uint32_t frameBuffer, double timestamp);
 
 // H264DECExecute(memory, frameBuffer)
 HLE_EXPORT(h264, H264DECExecute) {
@@ -849,7 +976,7 @@ HLE_EXPORT(h264, H264DECExecute) {
         pitch  = (width + 255u) & ~255u;
 
         bool decodedNew = false;
-#ifdef _WIN32
+#if BOTW_H264_DECODE
         if (bsData && bsLen > 0) {
             std::vector<uint8_t> combined;
             const uint8_t* feedPtr = bsData;
@@ -869,11 +996,33 @@ HLE_EXPORT(h264, H264DECExecute) {
                 feedLen = combined.size();
                 sess.sentSpsPpsToDecoder = true;
             }
+#ifdef _WIN32
             uint64_t pts100ns = static_cast<uint64_t>(sess.decodedFrameCount) * 333333ULL;
             decodedNew = sess.feedAnnexB(feedPtr, feedLen, pts100ns, width, height);
+#else
+            sess.feedAnnexB(feedPtr, feedLen, width, height, frameBuffer, timestamp);
+            ++sess.inFlight;
+#endif
         }
 #endif
 
+#if !defined(_WIN32) && defined(BOTW_HAVE_FFMPEG)
+        // Cemu: buffered mode (OUTPUT_PER_FRAME 0) keeps 5 frames in flight, then one picture per call.
+        (void)hasSlice;
+        (void)decodedNew;
+        static bool loggedMode = false;
+        if (!loggedMode) {
+            loggedMode = true;
+            LOG("h264: output per frame %u (%s)", sess.outputPerFrame, sess.outputPerFrame == 0 ? "buffered, 5 in flight" : "unbuffered");
+        }
+        if (sess.inFlight > (sess.outputPerFrame == 0 ? 5u : 0u) && !sess.ready.empty()) {
+            frameBuffer = sess.ready.front().buffer;
+            timestamp = sess.ready.front().timestamp;
+            sess.ready.pop_front();
+            --sess.inFlight;
+            emitFrame = true;
+        }
+#else
         emitFrame = hasSlice || decodedNew;
         if (emitFrame) {
             size_t ySize  = static_cast<size_t>(pitch) * height;
@@ -889,13 +1038,28 @@ HLE_EXPORT(h264, H264DECExecute) {
             }
             ++sess.decodedFrameCount;
         }
+#endif
     }
 
+#if !defined(_WIN32) && defined(BOTW_HAVE_FFMPEG)
+    if (emitFrame) outputPicture(c, memPtr, fptrOutput, userMemory, sps, frameBuffer, timestamp);
+    RET(H264_STATUS_OUT_FRAME_FLAG | H264_STATUS_HAS_NOT_ENOUGH);  // Cemu: 0x80 | 100 on every call
+#else
     if (!emitFrame) {
         RET(H264_STATUS_HAS_NOT_ENOUGH);
         return;
     }
+    outputPicture(c, memPtr, fptrOutput, userMemory, sps, frameBuffer, timestamp);
+    RET(H264_STATUS_OUT_FRAME_FLAG | H264_STATUS_HAS_NOT_ENOUGH);
+#endif
+}
 
+// One decoded picture to the game's output callback (H264DECFrameOutput layout as Cemu).
+static void outputPicture(PPCContext* c, uint32_t memPtr, uint32_t fptrOutput, uint32_t userMemory, const SpsInfo& sps,
+                          uint32_t frameBuffer, double timestamp) {
+    uint32_t width = sps.width;
+    uint32_t height = sps.height;
+    uint32_t pitch = (width + 255u) & ~255u;
     if (fptrOutput != 0) {
         uint32_t outputAddr   = memPtr + 0x100u;
         uint32_t ptrArrayAddr = memPtr + 0x110u;
@@ -930,8 +1094,6 @@ HLE_EXPORT(h264, H264DECExecute) {
 
         guest_call(c, fptrOutput, {outputAddr});
     }
-
-    RET(H264_STATUS_OUT_FRAME_FLAG | H264_STATUS_HAS_NOT_ENOUGH);
 }
 
 // H264DECFlush(memory)
@@ -948,6 +1110,11 @@ HLE_EXPORT(h264, H264DECFlush) {
         if (it->second.mft) {
             it->second.mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
         }
+#elif defined(BOTW_HAVE_FFMPEG)
+        if (it->second.av) avcodec_flush_buffers(it->second.av);
+        it->second.inputs.clear();
+        it->second.ready.clear();
+        it->second.inFlight = 0;
 #endif
     }
     RET(H264_STATUS_OK);
@@ -960,6 +1127,30 @@ HLE_EXPORT(h264, H264DECEnd) {
         RET(H264_ERR_PARAM);
         return;
     }
+#if !defined(_WIN32) && defined(BOTW_HAVE_FFMPEG)
+    // Cemu: End drains the decoder and hands every remaining picture to the output callback.
+    std::deque<H264DecoderSession::Picture> rest;
+    uint32_t fptrOutput = 0, userMemory = 0;
+    SpsInfo sps{};
+    {
+        std::lock_guard<std::mutex> lock(g_h264Mutex);
+        auto it = g_sessions.find(memPtr);
+        if (it != g_sessions.end()) {
+            auto& sess = it->second;
+            sps = sess.sps.valid ? sess.sps : g_lastParsedSps;
+            if (!sps.valid) {
+                sps.width = 1280;
+                sps.height = 720;
+            }
+            sess.drain(sps.width, sps.height);
+            rest.swap(sess.ready);
+            fptrOutput = sess.fptrOutput;
+            userMemory = sess.userMemory;
+            sess.releaseAv();
+        }
+    }
+    for (const auto& p : rest) outputPicture(c, memPtr, fptrOutput, userMemory, sps, p.buffer, p.timestamp);
+#else
     std::lock_guard<std::mutex> lock(g_h264Mutex);
     auto it = g_sessions.find(memPtr);
     if (it != g_sessions.end()) {
@@ -968,6 +1159,7 @@ HLE_EXPORT(h264, H264DECEnd) {
 #endif
         it->second.lastFrameNV12.clear();
     }
+#endif
     RET(H264_STATUS_OK);
 }
 

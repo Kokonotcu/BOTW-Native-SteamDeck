@@ -8,7 +8,8 @@ hle_decls.h, hle_stubs.cpp (weak fallbacks that trap with the import's name) and
 Files are only rewritten when their content changes, so rebuilds stay incremental.
 Env: BOTW_PROBES=addr,... adds rt_probe() register dumps at those guest addresses.
 Hooks: every BOTW_HOOK(0xADDR) in runtime/src/game/*.cpp makes the code call that host function right
-after the instruction at ADDR (game patches such as 60 fps).
+after the instruction at ADDR (game patches such as 60 fps). A line "// BOTW_NATIVE(0xADDR)" there replaces the
+function at ADDR with a host f_ADDR; the recompiled one is still emitted, as f_ADDR_guest.
 """
 import glob
 import os
@@ -88,6 +89,26 @@ def main() -> None:
     t0 = time.time()
     print("[recomp 1/4] Decompressing & parsing U-King.rpx...", flush=True)
     img = Image(rpx_path)
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    # Cemu graphic packs applied ahead of time (tools/gfxpack.py): gfxpacks/<name>/, Cemu's files unchanged.
+    # BOTW_GFXPACKS=FPS++ (default) / "" for none; BOTW_GFXPACK_VARS="fpsLimitNormal=60,..." overrides presets.
+    pack_words: dict[int, int] = {}
+    pack_cave = (0, 0)
+    packs = [p for p in os.environ.get("BOTW_GFXPACKS", "FPS++").split(",") if p.strip()]
+    if packs:
+        from tools import gfxpack
+        if len(packs) != 1:
+            sys.exit("recompile.py: one graphic pack at a time (they share the code cave)")
+        overrides = {}
+        for kv in os.environ.get("BOTW_GFXPACK_VARS", "fpsLimitNormal=60").split(","):
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                overrides[k.strip()] = float(v) if "." in v else int(v, 0)
+        pk = gfxpack.load(os.path.join(root, "gfxpacks", packs[0]), overrides)
+        img.apply_pack(pk)
+        pack_words, pack_cave = pk.words, (pk.cave_lo, pk.cave_hi)
+        print(f"[recomp 1/4] Graphic pack {packs[0]}: {len(pk.words)} words, cave {pk.cave_lo:08x}-{pk.cave_hi:08x}",
+              flush=True)
     an = Analyzer(img)
     an.run(progress=True)
     t1 = time.time()
@@ -95,10 +116,33 @@ def main() -> None:
     for tok in os.environ.get("BOTW_PROBES", "").split(","):
         if tok.strip():
             gen.probes.add(int(tok, 16))
-    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    # the runtime writes the same words into guest memory at load (data patches, cave code and variables)
+    lines = [HEADER, "// Graphic pack words (tools/gfxpack.py): written into guest memory at load.\n",
+             f"extern \"C\" const unsigned g_gfxpack_cave_lo = 0x{pack_cave[0]:08x}u, g_gfxpack_cave_hi = 0x{pack_cave[1]:08x}u;\n",
+             f"extern \"C\" const unsigned g_gfxpack_word_count = {len(pack_words)}u;\n",
+             "extern \"C\" const unsigned g_gfxpack_words[][2] = {\n"]
+    lines += [f"    {{0x{a:08x}u, 0x{w:08x}u}},\n" for a, w in sorted(pack_words.items())]
+    lines.append("    {0u, 0u}};\n")
+    write_if_changed(os.path.join(out, "gfxpack_data.cpp"), "".join(lines))
     for path in glob.glob(os.path.join(root, "runtime", "src", "game", "*.cpp")):
         with open(path) as f:
-            gen.hooks.update(int(h, 16) for h in re.findall(r"^BOTW_HOOK\((0x[0-9a-fA-F]+)\)", f.read(), re.M))
+            text = f.read()
+        gen.hooks.update(int(h, 16) for h in re.findall(r"^BOTW_HOOK\((0x[0-9a-fA-F]+)\)", text, re.M))
+        gen.natives.update(int(h, 16) for h in re.findall(r"^// BOTW_NATIVE\((0x[0-9a-fA-F]+)\)", text, re.M))
+    from cafe import regctx
+    if os.environ.get("BOTW_LOCAL_REGS", "1") != "0" and os.environ.get("BOTW_REGCTX_FILE"):
+        # TEST: reuse a regctx.txt from an earlier run (same RPX and analysis), skips the analysis
+        with open(os.environ["BOTW_REGCTX_FILE"]) as f:
+            for line in f:
+                p = line.split()
+                gen.regctx[int(p[0][2:], 16)] = regctx.Sync.parse(p[1:])
+    elif os.environ.get("BOTW_LOCAL_REGS", "1") != "0":
+        # registers a function exchanges outside the EABI are synced at the exchange (codegen local_regs)
+        print("[recomp 2/4] Register exchange analysis (locals vs context)...", flush=True)
+        gen.regctx = regctx.compute(an, gen)
+        with open(os.path.join(out, "regctx.txt"), "w") as f:
+            for e in sorted(gen.regctx):
+                f.write(f"f_{e:08x} {gen.regctx[e].dump()}\n")
 
     defined = {f"f_{entry:08x}" for entry in an.functions}
     bucket_entries: dict[int, list[int]] = {}

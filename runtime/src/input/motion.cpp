@@ -1,6 +1,7 @@
 // GamePad motion (gyro / accelerometer / attitude) from a host controller's sensors, e.g. the
 // DualSense. Port of Cemu's input/motion (MahonySensorFusion, WiiUMotionHandler, MotionSample) and
 // its SDL sensor handling (SDLControllerProvider), MPL-2.0, so values match what games expect there.
+#include <atomic>
 #include <cmath>
 #include <mutex>
 
@@ -111,8 +112,26 @@ void integrate(float dt) {
 }
 }  // namespace
 
+// World turning (settings: Gyro turning). Held tilted toward the face, a left/right turn of the body is a
+// rotation around the real vertical, which the controller sees split between its yaw and roll axes, so
+// aiming felt slower sideways than up/down. The rotation around the real vertical (from the low-passed
+// accelerometer) is moved onto the controller's yaw axis; tilting forward/back and sideways is unchanged.
+std::atomic<bool> g_world_turn{true};
+float g_up[3] = {};  // low-passed accelerometer, SDL axes, m/s^2 (points up)
+
+void world_turn(float w[3]) {
+    const float n = sqrtf(g_up[0] * g_up[0] + g_up[1] * g_up[1] + g_up[2] * g_up[2]);
+    if (n < 4.9f) return;  // under half a g: no reliable vertical (free fall, startup)
+    const float u[3] = {g_up[0] / n, g_up[1] / n, g_up[2] / n};
+    const float v = w[0] * u[0] + w[1] * u[1] + w[2] * u[2];  // turn around the real vertical
+    for (int k = 0; k < 3; k++) w[k] -= v * u[k];
+    w[1] += v;  // SDL +y: the yaw axis of a controller lying flat
+}
+
 void motion_sensor(bool gyro, const float data[3], uint64_t ts) {
     std::lock_guard<std::mutex> l(g_lock);
+    if (!gyro)
+        for (int k = 0; k < 3; k++) g_up[k] += (data[k] - g_up[k]) * (g_up[0] == 0 && g_up[1] == 0 && g_up[2] == 0 ? 1.0f : 0.05f);
     uint64_t& last = gyro ? g_ts_gyro : g_ts_acc;
     if (ts <= last) return;
     if (ts - last >= 10000000000ull) {  // stale stream: restart pairing
@@ -122,7 +141,9 @@ void motion_sensor(bool gyro, const float data[3], uint64_t ts) {
     }
     last = ts;
     if (gyro) {
-        g_sens_gyro[0] = data[0], g_sens_gyro[1] = -data[1], g_sens_gyro[2] = -data[2];  // rad/s
+        float w[3] = {data[0], data[1], data[2]};
+        if (g_world_turn.load(std::memory_order_relaxed)) world_turn(w);
+        g_sens_gyro[0] = w[0], g_sens_gyro[1] = -w[1], g_sens_gyro[2] = -w[2];  // rad/s
         g_has_gyro = true;
     } else {
         for (int k = 0; k < 3; k++) g_sens_acc[k] = -data[k] / 9.81f;  // m/s^2 -> g
@@ -138,6 +159,8 @@ void motion_sensor(bool gyro, const float data[3], uint64_t ts) {
         g_has_acc = g_has_gyro = false;
     }
 }
+
+void set_motion_world_turn(bool on) { g_world_turn.store(on, std::memory_order_relaxed); }
 
 void motion_reset() {
     std::lock_guard<std::mutex> l(g_lock);

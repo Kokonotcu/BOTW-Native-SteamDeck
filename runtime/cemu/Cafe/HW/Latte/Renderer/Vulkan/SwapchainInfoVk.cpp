@@ -33,7 +33,8 @@ void SwapchainInfoVk::Create()
 	m_actualExtent = ChooseSwapExtent(details.capabilities);
 
 	// use at least two swapchain images. fewer than that causes problems on some drivers
-	uint32_t image_count = std::max(2u, details.capabilities.minImageCount);
+	// BotW-Native: three, so mailbox / two queued FIFO presents leave an image to render into
+	uint32_t image_count = std::max(3u, details.capabilities.minImageCount);
 	if(details.capabilities.maxImageCount > 0)
 		image_count = std::min(image_count, details.capabilities.maxImageCount);
 	if(image_count < 2)
@@ -225,6 +226,10 @@ VkSemaphore SwapchainInfoVk::ConsumeAcquireSemaphore()
 
 bool SwapchainInfoVk::AcquireImage()
 {
+	// BotW-Native: the previous acquire's fence is waited for here, before its reuse, not in SwapBuffer: there it held
+	// the GPU thread until the presentation engine let go of the image (the frame's submit already waits on the
+	// acquire semaphore, so the CPU wait was only a throttle). A frame later it has long been signaled.
+	WaitAvailableFence();
 	ResetAvailableFence();
 
 	VkSemaphore acquireSemaphore = m_acquireSemaphores[m_acquireIndex];
@@ -354,6 +359,16 @@ VkPresentModeKHR SwapchainInfoVk::ChoosePresentMode(const std::vector<VkPresentM
 			return VK_PRESENT_MODE_IMMEDIATE_KHR;
 
 		cemuLog_log(LogType::Force, "Vulkan: Can't find immediate present mode");
+		// BotW-Native: gamescope (Steam Deck) has no immediate mode. Mailbox also never blocks the GPU thread;
+		// FIFO with one queued present made it wait for the previous frame's scanout (up to a refresh per frame).
+		if (std::find(modes.cbegin(), modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) != modes.cend())
+		{
+			cemuLog_log(LogType::Force, "Vulkan: using mailbox present mode instead");
+			return VK_PRESENT_MODE_MAILBOX_KHR;
+		}
+		cemuLog_log(LogType::Force, "Vulkan: using FIFO with two queued presents instead");
+		m_maxQueued = 2;
+		return VK_PRESENT_MODE_FIFO_KHR;
 	}
 	else if (vsyncState == VSync::SYNC_AND_LIMIT)
 	{

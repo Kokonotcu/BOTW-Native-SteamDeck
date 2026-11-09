@@ -96,7 +96,29 @@ struct LatteTexViewLookupDesc
 struct LatteTexViewBucket
 {
 	std::vector<LatteTexViewLookupDesc> list;
+	// BotW-Native: all views of a surface (mips, array slices, formats) share a bucket, so lookup() and
+	// lookupWithColorOrDepthType() scanned long lists for the same few keys every draw (the 56-byte-stride scan was the
+	// hottest loop in updateTexturesForStage and UpdateCurrentFBO, b99). The last matching index is tried first. That
+	// returns the same view as the scan only if no other entry has the same full key, so a bucket that ever got a
+	// duplicate key keeps scanning (hasDupKeys is sticky; Add is rare).
+	uint32 lastHit = 0;
+	bool hasDupKeys = false;
+	// the same for lookupSliceEx (render targets, UpdateCurrentFBO), whose key leaves out mip/slice counts and dim
+	uint32 lastHitSlice = 0;
+	bool hasDupSliceKeys = false;
 };
+
+static inline bool _viewSliceKeyEquals(const LatteTexViewLookupDesc& a, const LatteTexViewLookupDesc& b)
+{
+	return a.physAddr == b.physAddr && a.width == b.width && a.height == b.height && a.pitch == b.pitch && a.format == b.format &&
+	       a.isDepth == b.isDepth && a.firstSlice == b.firstSlice && a.firstMip == b.firstMip;
+}
+
+static inline bool _viewKeyEquals(const LatteTexViewLookupDesc& a, const LatteTexViewLookupDesc& b)
+{
+	return a.physAddr == b.physAddr && a.format == b.format && a.dim == b.dim && a.width == b.width && a.height == b.height &&
+	       a.pitch == b.pitch && a.firstMip == b.firstMip && a.numMip == b.numMip && a.firstSlice == b.firstSlice && a.numSlice == b.numSlice;
+}
 
 #define TEXTURE_VIEW_BUCKETS	(1061)
 
@@ -112,14 +134,25 @@ inline uint32 _getViewBucketKeyNoRes(MPTR physAddress, uint32 pitch)
 
 LatteTexViewBucket texViewBucket[TEXTURE_VIEW_BUCKETS] = { };
 LatteTexViewBucket texViewBucket_nores[TEXTURE_VIEW_BUCKETS] = { };
+// BotW-Native: bumped whenever a view enters or leaves the lookup cache; LatteTexture_updateTexturesForStage keeps
+// the last view per texture unit only while it is unchanged
+uint32 g_texViewLookupGen = 1;
 
 void LatteTextureViewLookupCache::Add(LatteTextureView* view, uint32 baseMip, uint32 baseSlice)
 {
+	g_texViewLookupGen++;
 	LatteTexViewLookupDesc desc(view);
 	if (baseMip != 0 || baseSlice != 0)
 		desc.SetParametersForSubTexture(baseMip, baseSlice);
 	// generic bucket
 	uint32 key = _getViewBucketKey(desc.physAddr, desc.width, desc.height, desc.pitch);
+	for (const auto& it : texViewBucket[key].list)
+	{
+		if (_viewKeyEquals(it, desc))
+			texViewBucket[key].hasDupKeys = true;
+		if (_viewSliceKeyEquals(it, desc))
+			texViewBucket[key].hasDupSliceKeys = true;
+	}
 	texViewBucket[key].list.emplace_back(desc);
 	vectorAppendUnique(view->viewLookUpCacheKeys, key);
 	// resolution-independent bucket
@@ -130,6 +163,7 @@ void LatteTextureViewLookupCache::Add(LatteTextureView* view, uint32 baseMip, ui
 
 void LatteTextureViewLookupCache::RemoveAll(LatteTextureView* view)
 {
+	g_texViewLookupGen++;
 	for (auto& key : view->viewLookUpCacheKeys)
 	{
 		auto& bucket = texViewBucket[key].list;
@@ -148,15 +182,21 @@ LatteTextureView* LatteTextureViewLookupCache::lookup(MPTR physAddr, sint32 widt
 {
 	// todo - add tileMode param to this and the other lookup functions?
 	uint32 key = _getViewBucketKey(physAddr, width, height, pitch);
-	for (auto& it : texViewBucket[key].list)
-	{
-		if (it.physAddr == physAddr && it.format == format && it.dim == dim &&
+	LatteTexViewBucket& bucket = texViewBucket[key];
+	auto matches = [&](const LatteTexViewLookupDesc& it) {
+		return it.physAddr == physAddr && it.format == format && it.dim == dim &&
 			it.width == width && it.height == height && it.pitch == pitch
 			&& it.firstMip == firstMip && it.numMip == numMip
-			&& it.firstSlice == firstSlice && it.numSlice == numSlice
-			)
+			&& it.firstSlice == firstSlice && it.numSlice == numSlice;
+	};
+	if (!bucket.hasDupKeys && bucket.lastHit < bucket.list.size() && matches(bucket.list[bucket.lastHit]))
+		return bucket.list[bucket.lastHit].view;
+	for (size_t i = 0; i < bucket.list.size(); i++)
+	{
+		if (matches(bucket.list[i]))
 		{
-			return it.view;
+			bucket.lastHit = (uint32)i;
+			return bucket.list[i].view;
 		}
 	}
 	return nullptr;
@@ -166,15 +206,22 @@ LatteTextureView* LatteTextureViewLookupCache::lookupWithColorOrDepthType(MPTR p
 {
 	cemu_assert_debug(firstSlice == 0);
 	uint32 key = _getViewBucketKey(physAddr, width, height, pitch);
-	for (auto& it : texViewBucket[key].list)
-	{
-		if (it.physAddr == physAddr && it.format == format && it.dim == dim && it.width == width && it.height == height && it.pitch == pitch
+	LatteTexViewBucket& bucket = texViewBucket[key];
+	auto matches = [&](const LatteTexViewLookupDesc& it) {
+		return it.physAddr == physAddr && it.format == format && it.dim == dim && it.width == width && it.height == height && it.pitch == pitch
 			&& it.firstMip == firstMip && it.numMip == numMip
 			&& it.firstSlice == firstSlice && it.numSlice == numSlice &&
-			it.isDepth == isDepth
-			)
+			it.isDepth == isDepth;
+	};
+	// unique full keys (no duplicates in the bucket): a match at lastHit is the only match, as the scan would find
+	if (!bucket.hasDupKeys && bucket.lastHit < bucket.list.size() && matches(bucket.list[bucket.lastHit]))
+		return bucket.list[bucket.lastHit].view;
+	for (size_t i = 0; i < bucket.list.size(); i++)
+	{
+		if (matches(bucket.list[i]))
 		{
-			return it.view;
+			bucket.lastHit = (uint32)i;
+			return bucket.list[i].view;
 		}
 	}
 	return nullptr;
@@ -215,12 +262,19 @@ LatteTextureView* LatteTextureViewLookupCache::lookupSliceEx(MPTR physAddr, sint
 {
 	cemu_assert_debug(firstMip == 0);
 	uint32 key = _getViewBucketKey(physAddr, width, height, pitch);
-	for (auto& it : texViewBucket[key].list)
+	LatteTexViewBucket& bucket = texViewBucket[key];
+	auto matches = [&](const LatteTexViewLookupDesc& it) {
+		return it.physAddr == physAddr && it.width == width && it.height == height && it.pitch == pitch && it.format == format &&
+		       it.isDepth == isDepth && firstSlice == it.firstSlice && firstMip == it.firstMip;
+	};
+	if (!bucket.hasDupSliceKeys && bucket.lastHitSlice < bucket.list.size() && matches(bucket.list[bucket.lastHitSlice]))
+		return bucket.list[bucket.lastHitSlice].view;
+	for (size_t i = 0; i < bucket.list.size(); i++)
 	{
-		if (it.physAddr == physAddr && it.width == width && it.height == height && it.pitch == pitch && it.format == format && it.isDepth == isDepth)
+		if (matches(bucket.list[i]))
 		{
-			if (firstSlice == it.firstSlice && firstMip == it.firstMip)
-				return it.view;
+			bucket.lastHitSlice = (uint32)i;
+			return bucket.list[i].view;
 		}
 	}
 	return nullptr;

@@ -173,7 +173,10 @@ void LatteTexture_Invalidate(uint32 physAddr, uint32 size)
 {
 	if (size == 0xFFFFFFFF)
 		return; // full cache invalidation for all textures is too expensive, so for now lets ignore it. Most likely games don't use this anyway when they are modifying a single texture
-	std::vector<LatteTexture*> textures;
+	// BotW-Native: reused list (GPU thread only); a fresh vector here was a heap allocation per invalidation
+	// (operator new under LatteTC_LookupTexturesByPhysAddr in the Deck call stacks, b104)
+	static thread_local std::vector<LatteTexture*> textures;
+	textures.clear();
 	LatteTC_LookupTexturesByPhysAddr(physAddr, textures);
 	uint32 invalidationVal = LatteGPUState.frameCounter - 1;
 	for (LatteTexture* texture : textures)
@@ -514,6 +517,12 @@ void LatteTexture_SyncSlice(LatteTexture* srcTexture, sint32 srcSliceIndex, sint
 void LatteTexture_UpdateTextureFromDynamicChanges(LatteTexture* texture)
 {
 	// note: Currently this function assumes that only one other texture is updated per slice/mip (if multiple overlap, we should merge the one with the latest timestamp the latest of each individually)
+	// BotW-Native: the slice copies below are recorded as one batch (shared barriers) when they are independent
+	struct CopyBatch
+	{
+		CopyBatch() { g_renderer->texture_beginCopyBatch(); }
+		~CopyBatch() { g_renderer->texture_endCopyBatch(); }
+	} copyBatch;
 	for (auto& texRel : texture->list_compatibleRelations)
 	{
 		LatteTexture* baseTexture = texRel->baseTexture;
@@ -1168,7 +1177,7 @@ LatteTextureView* LatteTC_GetTextureSliceViewOrTryCreate(MPTR srcImagePtr, MPTR 
 void LatteTexture_UpdateDataToLatest(LatteTexture* texture)
 {
 	if (LatteTC_HasTextureChanged(texture))
-		LatteTexture_ReloadData(texture);
+		LatteTexture_ReloadData(texture, true);
 
 	if (texture->reloadFromDynamicTextures)
 	{

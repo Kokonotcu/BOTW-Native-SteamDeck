@@ -1,6 +1,7 @@
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
 #include "Cafe/HW/Latte/Core/Latte.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
+#include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
 
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
 
@@ -35,10 +36,71 @@ void LatteTexture_setEffectiveTextureScale(LatteConst::ShaderType shaderType, si
 }
 
 void LatteTextureLoader_UpdateTextureSliceData(LatteTexture* tex, uint32 sliceIndex, uint32 mipIndex, MPTR physImagePtr, MPTR physMipPtr, Latte::E_DIM dim, uint32 width, uint32 height, uint32 depth, uint32 mipLevels, uint32 pitch, Latte::E_HWTILEMODE tileMode, uint32 swizzle, bool dumpTex);
+void LatteTextureLoader_UpdateTextureSlices(LatteTexture* tex, const std::vector<std::pair<uint32, uint32>>& sliceMips);
 
-void LatteTexture_ReloadData(LatteTexture* tex)
+// BotW-Native: one sample per KiB of a slice's mip-0 data (the whole-texture change check samples far less)
+static uint64 LatteTexture_HashSlice(MPTR addr, uint32 size)
+{
+	const uint64* p = (const uint64*)memory_getPointerFromPhysicalOffset(addr);
+	uint64 h = 0;
+	for (uint32 i = 0; i < size / 8; i += 128)
+		h = (h ^ p[i]) * 0x9E3779B97F4A7C15ull;
+	return h;
+}
+
+// BotW-Native: which slices of a 2D array to load; empty = all. BotW streams terrain into single slices of 83-slice
+// arrays, and every change reloaded all 83 slices x 11 mips (then again a frame later, _botwLargeTexHax).
+// Changed slices are loaded once more at the next reload, as the game may still have been writing them.
+static std::vector<uint8> LatteTexture_SlicesToReload(LatteTexture* tex, bool changedSlicesOnly)
+{
+	std::vector<uint8> reload;
+	if (tex->dim != Latte::E_DIM::DIM_2D_ARRAY || tex->depth <= 1 || tex->overwriteInfo.hasFormatOverwrite || tex->overwriteInfo.hasResolutionOverwrite)
+		return reload;
+	LatteAddrLib::AddrSurfaceInfo_OUT info;
+	LatteAddrLib::GX2CalculateSurfaceInfo(tex->format, tex->width, tex->height, tex->depth, tex->dim, Latte::MakeGX2TileMode(tex->tileMode), 0, 0, &info);
+	const auto tm = info.hwTileMode;
+	const bool thick = tm == Latte::E_HWTILEMODE::TM_1D_TILED_THICK || tm == Latte::E_HWTILEMODE::TM_2D_TILED_THICK ||
+		tm == Latte::E_HWTILEMODE::TM_2B_TILED_THICK || tm == Latte::E_HWTILEMODE::TM_3D_TILED_THICK;
+	if (thick || (uint64)info.sliceSize * tex->depth != info.surfSize)
+	{
+		tex->sliceHash.clear();
+		return reload;
+	}
+	std::vector<uint64> hashes(tex->depth);
+	for (uint32 s = 0; s < tex->depth; s++)
+		hashes[s] = LatteTexture_HashSlice(tex->physAddress + s * info.sliceSize, info.sliceSize);
+	std::vector<uint32> changed;
+	if (changedSlicesOnly && tex->sliceHash.size() == hashes.size())
+	{
+		for (uint32 s = 0; s < tex->depth; s++)
+			if (hashes[s] != tex->sliceHash[s])
+				changed.push_back(s);
+		if (!changed.empty() || !tex->sliceRecheck.empty())
+		{
+			reload.assign(tex->depth, 0);
+			for (uint32 s : changed)
+				reload[s] = 1;
+			for (uint32 s : tex->sliceRecheck)
+				reload[s] = 1;
+		}
+		// else: the texture check saw a change these samples miss, load everything
+	}
+	tex->sliceHash = std::move(hashes);
+	tex->sliceRecheck = std::move(changed);
+	return reload;
+}
+
+void LatteTexture_ReloadData(LatteTexture* tex, bool changedSlicesOnly)
 {
 	tex->reloadCount++;
+	struct UploadBatch
+	{
+		UploadBatch() { g_renderer->texture_beginUploadBatch(); }
+		~UploadBatch() { g_renderer->texture_endUploadBatch(); }
+	} uploadBatch;
+	const std::vector<uint8> reloadSlice = LatteTexture_SlicesToReload(tex, changedSlicesOnly);
+	// (slice, mip) in load order; LatteTextureLoader_UpdateTextureSlices decodes them on several threads when large
+	std::vector<std::pair<uint32, uint32>> sliceMips;
 	for(sint32 mip=0; mip<tex->mipLevels; mip++)
 	{
 		if(tex->dim == Latte::E_DIM::DIM_2D_ARRAY ||
@@ -46,29 +108,32 @@ void LatteTexture_ReloadData(LatteTexture* tex)
 		{
 			sint32 numSlices = std::max(tex->depth, 1);
 			for(sint32 s=0; s<numSlices; s++)
-				LatteTextureLoader_UpdateTextureSliceData(tex, s, mip, tex->physAddress, tex->physMipAddress, tex->dim, tex->width, tex->height, tex->depth, tex->mipLevels, tex->pitch, tex->tileMode, tex->swizzle, true);
+			{
+				if (!reloadSlice.empty() && !reloadSlice[s])
+					continue;
+				sliceMips.emplace_back(s, mip);
+			}
 		}
 		else if( tex->dim == Latte::E_DIM::DIM_CUBEMAP )
 		{
 			cemu_assert_debug((tex->depth % 6) == 0);
 			sint32 numFullCubeMaps = tex->depth/6; // number of cubemaps (if numFullCubeMaps is >1 then this texture is a cubemap array)
 			for(sint32 s=0; s<numFullCubeMaps*6; s++)
-				LatteTextureLoader_UpdateTextureSliceData(tex, s, mip, tex->physAddress, tex->physMipAddress, tex->dim, tex->width, tex->height, tex->depth, tex->mipLevels, tex->pitch, tex->tileMode, tex->swizzle, true);
+				sliceMips.emplace_back(s, mip);
 		}
 		else if( tex->dim == Latte::E_DIM::DIM_3D )
 		{
 			sint32 mipDepth = std::max(tex->depth>>mip, 1);
 			for(sint32 s=0; s<mipDepth; s++)
-			{
-				LatteTextureLoader_UpdateTextureSliceData(tex, s, mip, tex->physAddress, tex->physMipAddress, tex->dim, tex->width, tex->height, tex->depth, tex->mipLevels, tex->pitch, tex->tileMode, tex->swizzle, true);
-			}
+				sliceMips.emplace_back(s, mip);
 		}
 		else
 		{
 			// load slice 0
-			LatteTextureLoader_UpdateTextureSliceData(tex, 0, mip, tex->physAddress, tex->physMipAddress, tex->dim, tex->width, tex->height, tex->depth, tex->mipLevels, tex->pitch, tex->tileMode, tex->swizzle, true);
+			sliceMips.emplace_back(0, mip);
 		}
 	}
+	LatteTextureLoader_UpdateTextureSlices(tex, sliceMips);
 	tex->lastUpdateEventCounter = LatteTexture_getNextUpdateEventCounter();
 }
 
@@ -107,6 +172,8 @@ Latte::E_GX2SURFFMT LatteTexture_ReconstructGX2Format(const Latte::LATTE_SQ_TEX_
 
 	return gx2Format;
 }
+
+extern uint32 g_texViewLookupGen;  // LatteTextureView.cpp
 
 void LatteTexture_updateTexturesForStage(LatteDecompilerShader* shaderContext, uint32 glBackendBaseTexUnit, _LatteRegisterSetTextureUnit* texRegBase)
 {
@@ -180,11 +247,25 @@ void LatteTexture_updateTexturesForStage(LatteDecompilerShader* shaderContext, u
 
 		bool isDepthSampler = shaderContext->textureUsesDepthCompare[textureIndex];
 		// look for already existing texture
-		LatteTextureView* textureView;
-		if (!isDepthSampler)
+		// BotW-Native: consecutive draws mostly bind the same texture to a unit; the view found for the same register
+		// words (everything the lookup reads: base address, words 0/1/4/5, depth compare) is reused while no view
+		// entered or left the lookup cache (g_texViewLookupGen). BOTW_TEXUNIT_CACHE=0 off.
+		struct UnitCacheEntry { uint32 w0, w1, w2, w4, w5; uint32 gen; bool depth; LatteTextureView* view; };
+		static UnitCacheEntry s_unitCache[256];
+		static const bool s_unitCacheOn = !(getenv("BOTW_TEXUNIT_CACHE") && atoi(getenv("BOTW_TEXUNIT_CACHE")) == 0);
+		UnitCacheEntry& uc = s_unitCache[(glBackendBaseTexUnit + textureIndex) & 255];
+		const uint32 rw0 = texRegister.word0.getRawValue(), rw1 = texRegister.word1.getRawValue(), rw2 = texRegister.word2.getRawValue(),
+		             rw4 = texRegister.word4.getRawValue(), rw5 = texRegister.word5.getRawValue();
+		LatteTextureView* textureView = nullptr;
+		if (s_unitCacheOn && uc.view && uc.gen == g_texViewLookupGen && uc.depth == isDepthSampler && uc.w0 == rw0 && uc.w1 == rw1 &&
+		    uc.w2 == rw2 && uc.w4 == rw4 && uc.w5 == rw5)
+			textureView = uc.view;
+		else if (!isDepthSampler)
 			textureView = LatteTextureViewLookupCache::lookup(physAddr, width, height, depth, pitch, viewFirstMip, viewNumMips, viewFirstSlice, viewNumSlices, format, dim);
 		else
 			textureView = LatteTextureViewLookupCache::lookupWithColorOrDepthType(physAddr, width, height, depth, pitch, viewFirstMip, viewNumMips, viewFirstSlice, viewNumSlices, format, dim, true);
+		if (s_unitCacheOn && textureView)
+			uc = {rw0, rw1, rw2, rw4, rw5, g_texViewLookupGen, isDepthSampler, textureView};
 		if (!textureView)
 		{
 			// view not found, create a new mapping which will also create a new texture if necessary
@@ -256,7 +337,7 @@ void LatteTexture_updateTexturesForStage(LatteDecompilerShader* shaderContext, u
 				}
 			}
 			debug_printf("Reload reason: Data-change when bound as texture (new hash 0x%08x)\n", textureView->baseTexture->texDataHash2);
-			LatteTexture_ReloadData(textureView->baseTexture);
+			LatteTexture_ReloadData(textureView->baseTexture, !swizzleChanged);
 		}
 		LatteTexture* baseTexture = textureView->baseTexture;
 		if (baseTexture->reloadFromDynamicTextures)

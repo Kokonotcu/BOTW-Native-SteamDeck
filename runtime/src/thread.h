@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "ppc.h"
+#include "telemetry.h"
 
 namespace threads {
 // OSThread field offsets (Cemu coreinit_Thread.h)
@@ -31,23 +32,37 @@ struct GuestThread {
     int suspend = 1;
     bool started = false, exited = false;
     bool is_main = false;
+    bool free_run = false;  // TEST BOTW_FREE_BG: runs without an emulated-core lock (thread.cpp run_thread)
     pthread_t host_tid{};  // for watchdog stack dumps
     void* win_handle = nullptr;  // duplicated Win32 thread handle for sampling
     uint32_t exit_value = 0;
     uint32_t entry = 0;
     int core = 1;
     int32_t prio = 16;
+    // Cafe OS priority inheritance: a thread blocked on a guest mutex lends its priority to the owner (32 = none),
+    // until the owner has released all its mutexes. Used for emulated-core scheduling (eff_prio).
+    std::atomic<int> boost_prio{32};
     int held_mutex_count = 0;
     std::condition_variable cv;  // join / resume waiters
     // what the thread is blocked on, for dump()
     std::atomic<const char*> wait_kind{nullptr};
     uint32_t wait_obj = 0, wait_lr = 0;
     uint32_t tls_block = 0;
+    // mutex address -> MutexState without g_klock; 512 slots: with 64 the busy threads still missed often enough to
+    // queue on g_klock behind every other sync call
+    static constexpr uint32_t kMutexCacheMask = 511;
     struct MutexCacheEntry {
         uint32_t key = 0;
         void* state = nullptr;
-    } mutex_cache[64]{};
+    } mutex_cache[kMutexCacheMask + 1]{};
 };
+
+inline int eff_prio(const GuestThread* t) {
+    const int b = t->boost_prio.load(std::memory_order_relaxed);
+    return b < t->prio ? b : t->prio;
+}
+// a thread blocked on a mutex `holder` owns lends it priority p (sync.cpp mutex_lock_contended, under g_klock)
+void inherit_prio(GuestThread* holder, int p);
 
 // The kernel lock guards all scheduler and synchronization-object state.
 extern std::mutex g_klock;
@@ -120,6 +135,7 @@ void diag_dump_threads();
 struct WaitMark {
     GuestThread* t;
     const char* kind;
+    bool timed = false;  // main thread with telemetry on: no clock read otherwise
     std::chrono::steady_clock::time_point t0;
     WaitMark(const char* k, uint32_t obj) : t(current()), kind(k) {
         if (!t) return;
@@ -127,14 +143,17 @@ struct WaitMark {
         t->wait_lr = t->ctx.lr;
         t->wait_kind = k;
         set_blocked(t, true);
-        if (t->is_main) t0 = std::chrono::steady_clock::now();
+        if (t->is_main && telem::on()) {
+            timed = true;
+            t0 = std::chrono::steady_clock::now();
+        }
     }
     ~WaitMark() {
         if (!t) return;
         t->wait_kind = nullptr;
         set_blocked(t, false);
         if (t->prio <= 17) reserve_high_wake(t->core);
-        if (t->is_main)
+        if (timed)
             note_main_wait(kind, t->wait_obj, t->wait_lr, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     }
 };

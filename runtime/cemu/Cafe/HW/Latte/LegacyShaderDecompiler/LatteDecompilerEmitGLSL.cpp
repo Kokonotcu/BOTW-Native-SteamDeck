@@ -3767,15 +3767,44 @@ void LatteDecompiler_emitGLSLHelperFunctions(LatteDecompilerShaderContext* shade
 	}
 
 	// clamp
-	fCStr_shaderSource->add(""
-	"int clampFI32(int v)\r\n"
-	"{\r\n"
-		"if( v == 0x7FFFFFFF )\r\n"
-		"	return floatBitsToInt(1.0);\r\n"
-		"else if( v == 0xFFFFFFFF )\r\n"
-		"	return floatBitsToInt(0.0);\r\n"
-		"return floatBitsToInt(clamp(intBitsToFloat(v), 0.0, 1.0));\r\n"
-	"}\r\n");
+	static const bool s_exactSaturate = [] { const char* e = getenv("BOTW_EXACT_SATURATE"); return e && e[0] == '1'; }();
+	if (g_renderer->GetVendor() == GfxVendor::Mesa && !s_exactSaturate)
+	{
+		// BotW-Native: a plain saturate, which ACO folds into the instruction producing the value (free clamp modifier).
+		// The 0x7FFFFFFF -> 1.0 special case below cost a compare and a select per saturate and blocked that fold:
+		// 11-23% of the instructions of BotW's heaviest pixel shaders. The Deck's GPU never produces that bit
+		// pattern from arithmetic (its NaNs are 0x7FC00000, which already become 0 below), so it could only come from
+		// memory. BOTW_EXACT_SATURATE=1 restores it.
+		fCStr_shaderSource->add(""
+		"int clampFI32(int v)\r\n"
+		"{\r\n"
+			"return floatBitsToInt(clamp(intBitsToFloat(v), 0.0, 1.0));\r\n"
+		"}\r\n");
+	}
+	else if (g_renderer->GetVendor() == GfxVendor::Mesa)
+	{
+		// BotW-Native: Mesa defines saturate as min_num(max_num(x, 0), 1), so every NaN, 0xFFFFFFFF included, already
+		// becomes 0.0 (and RADV runs DX10_CLAMP). Only the 0x7FFFFFFF -> 1.0 case needs code: 3 ops per saturate, not 6.
+		fCStr_shaderSource->add(""
+		"int clampFI32(int v)\r\n"
+		"{\r\n"
+			"if( v == 0x7FFFFFFF )\r\n"
+			"	return floatBitsToInt(1.0);\r\n"
+			"return floatBitsToInt(clamp(intBitsToFloat(v), 0.0, 1.0));\r\n"
+		"}\r\n");
+	}
+	else
+	{
+		fCStr_shaderSource->add(""
+		"int clampFI32(int v)\r\n"
+		"{\r\n"
+			"if( v == 0x7FFFFFFF )\r\n"
+			"	return floatBitsToInt(1.0);\r\n"
+			"else if( v == 0xFFFFFFFF )\r\n"
+			"	return floatBitsToInt(0.0);\r\n"
+			"return floatBitsToInt(clamp(intBitsToFloat(v), 0.0, 1.0));\r\n"
+		"}\r\n");
+	}
 	// mul non-ieee way (0*NaN/INF => 0.0)
 	if (shaderContext->options->strictMul)
 	{
@@ -3790,7 +3819,12 @@ void LatteDecompiler_emitGLSLHelperFunctions(LatteDecompilerShaderContext* shade
 		if( LatteGPUState.glVendor == GLVENDOR_NVIDIA && !ActiveSettings::DumpShadersEnabled())
 			fCStr_shaderSource->add("float mul_nonIEEE(float a, float b){return mix(0.0, a*b, (a != 0.0) && (b != 0.0));}" _CRLF); // compiles faster on Nvidia and also results in lower RAM usage (OpenGL)
 		else
-			fCStr_shaderSource->add("float mul_nonIEEE(float a, float b){ if( a == 0.0 || b == 0.0 ) return 0.0; return a*b; }" _CRLF);
+		{
+			// BotW-Native: the DXVK form. Mesa (nir_opt_algebraic "open-coded fmulz") turns exactly this into fmulz,
+			// one v_mul_legacy_f32 on AMD; the if-form stayed two compares, a multiply and a select. Same results,
+			// 0 * NaN/Inf included, except the sign of a zero result.
+			fCStr_shaderSource->add("float mul_nonIEEE(float a, float b){ return (b==0.0 ? 0.0 : a) * (a==0.0 ? 0.0 : b); }" _CRLF);
+		}
 
 		// DXKV-like: fCStr_shaderSource->add("float mul_nonIEEE(float a, float b){ return (b==0.0 ? 0.0 : a) * (a==0.0 ? 0.0 : b); }" _CRLF);
 	}

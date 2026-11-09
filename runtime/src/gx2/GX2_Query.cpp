@@ -9,6 +9,65 @@
 #define LATTE_GC_NUM_RB							2
 #define _QUERY_REG_COUNT						8 // each reg/result is 64bits, little endian
 
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
+void log_write(const char* fmt, ...);
+
+// TEST ONLY: BOTW_QPROBE=1 logs how long occlusion results take to reach the game (GX2QueryEnd -> first ready poll)
+// and how many polls see "not ready"; every ~5 s.
+namespace
+{
+	bool qprobe_on()
+	{
+		static const bool v = getenv("BOTW_QPROBE") && atoi(getenv("BOTW_QPROBE")) != 0;
+		return v;
+	}
+	std::mutex s_qlock;
+	std::unordered_map<uint32, uint64> s_qEnd;  // query -> end time (us)
+	uint64 s_qPolls, s_qNotReady, s_qZero, s_qHist[7], s_qLast;
+	uint64 qnow()
+	{
+		return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	}
+	void qprobe_end(uint32 q)
+	{
+		std::lock_guard<std::mutex> l(s_qlock);
+		s_qEnd[q] = qnow();
+	}
+	void qprobe_poll(uint32 q, bool ready, uint64 samples)
+	{
+		std::lock_guard<std::mutex> l(s_qlock);
+		const uint64 t = qnow();
+		s_qPolls++;
+		if (!ready)
+			s_qNotReady++;
+		else
+		{
+			if (samples == 0)
+				s_qZero++;
+			if (auto it = s_qEnd.find(q); it != s_qEnd.end())
+			{
+				const uint64 ms = (t - it->second) / 1000;
+				static const uint64 edges[6] = {17, 34, 50, 67, 100, 200};
+				int b = 0;
+				while (b < 6 && ms >= edges[b])
+					b++;
+				s_qHist[b]++;
+				s_qEnd.erase(it);
+			}
+		}
+		if (t - s_qLast < 5000000)
+			return;
+		s_qLast = t;
+		log_write("qprobe polls %llu notready %llu zero %llu | ready after ms <17:%llu <34:%llu <50:%llu <67:%llu <100:%llu <200:%llu more:%llu",
+			(unsigned long long)s_qPolls, (unsigned long long)s_qNotReady, (unsigned long long)s_qZero,
+			(unsigned long long)s_qHist[0], (unsigned long long)s_qHist[1], (unsigned long long)s_qHist[2], (unsigned long long)s_qHist[3],
+			(unsigned long long)s_qHist[4], (unsigned long long)s_qHist[5], (unsigned long long)s_qHist[6]);
+	}
+}
+
 namespace GX2
 {
 	struct GX2Query
@@ -80,6 +139,8 @@ namespace GX2
 			// HLE packet
 			gx2WriteGather_submitU32AsBE(pm4HeaderType3(IT_HLE_END_OCCLUSION_QUERY, 1));
 			gx2WriteGather_submitU32AsBE(MEMPTR<GX2Query>(query).GetMPTR());
+			if (qprobe_on())
+				qprobe_end(MEMPTR<GX2Query>(query).GetMPTR());
 		}
 		else
 		{
@@ -91,9 +152,12 @@ namespace GX2
 
 	uint32 GX2QueryGetOcclusionResult(GX2Query* query, uint64be* resultOut)
 	{
+		const uint32 qm = MEMPTR<GX2Query>(query).GetMPTR();
 		if (query->reg[LATTE_GC_NUM_RB * 4 + 1] == _swapEndianU32('OCPU') && query->reg[LATTE_GC_NUM_RB * 4 + 0] == 0)
 		{
 			// CPU query result not ready
+			if (qprobe_on())
+				qprobe_poll(qm, false, 0);
 			return GX2_FALSE;
 		}
 
@@ -101,9 +165,13 @@ namespace GX2
 		uint64 endValue = *(uint64*)(query->reg + 2);
 		if ((startValue & 0x8000000000000000ULL) || (endValue & 0x8000000000000000ULL))
 		{
+			if (qprobe_on())
+				qprobe_poll(qm, false, 0);
 			return GX2_FALSE;
 		}
 		*resultOut = endValue - startValue;
+		if (qprobe_on())
+			qprobe_poll(qm, true, endValue - startValue);
 		return GX2_TRUE;
 	}
 

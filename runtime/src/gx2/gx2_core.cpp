@@ -1,6 +1,8 @@
 // GX2 core: GX2Init, command buffer pool and submission, display lists, timestamps,
 // swap/vsync/flip and event callbacks. Packet layouts follow Cemu's GX2_Command.cpp / GX2.cpp.
+#include <algorithm>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -10,12 +12,14 @@
 #include "../os.h"
 #include "../thread.h"
 #include "GX2_Command.h"
+#include "telemetry.h"
 
 thread_local bool g_skip_vsync_wait = false;  // see game/hooks.h
 
 namespace GX2 {
 uint32 sGX2MainCoreIndex = 1;
 namespace {
+// (b120 tried an MWAITX spin here before the sleep, like sync.cpp spin_until: worse - this wait is mostly vsync slack)
 void wait_gpu(uint64_t ts, const char* why) {
     if (latte::retired() >= ts) return;
     threads::WaitMark w(why, (uint32_t)ts);
@@ -45,7 +49,17 @@ struct InFlight {
 std::deque<InFlight> g_inflight;
 uint32 g_init_count = 0;
 
-constexpr uint32 kMinBufferWords = 0x4000;  // 64 KB
+// Command buffer size (BOTW_GX2_CMD_KB, default 16). A buffer reaches the GPU thread only when it is full or flushed,
+// and the frame-end GX2DrawDone waits until the GPU thread has worked through what is left (BotW calls it twice a
+// frame). With 64 KB buffers (~12 per frame) the GPU thread trailed the game thread by up to a buffer of work;
+// 16 KB buffers hand commands over ~4x sooner, so less is left at the frame end. Each extra submit is a lock + push.
+static const uint32 kMinBufferWords = [] {
+    const char* e = getenv("BOTW_GX2_CMD_KB");
+    uint32 kb = e ? (uint32)atoi(e) : 16;
+    if (kb < 4) kb = 4;
+    if (kb > 256) kb = 256;
+    return kb * 256;  // words
+}();
 
 bool overlaps(uint32 a0, uint32 a1, uint32 b0, uint32 b1) { return a0 < b1 && b0 < a1; }
 
@@ -277,6 +291,7 @@ void GX2SwapScanBuffers() {
     gx2WriteGather_submit(pm4HeaderType3(IT_HLE_REQUEST_SWAP_BUFFERS, 1), 0u, pm4HeaderType3(IT_HLE_TRIGGER_SCANBUFFER_SWAP, 1), 0u);
     g_game_frames++;
     bench::on_swap();
+    if (telem::on()) telem::on_guest_frame();
     while ((sint32)(latte::flip_requests() - latte::flips_executed()) > 5) {
         threads::WaitMark w("flip (swap backlog)", 0);
         threads::CoreHandoff handoff;

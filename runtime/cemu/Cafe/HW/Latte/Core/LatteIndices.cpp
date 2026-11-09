@@ -3,6 +3,16 @@
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
 #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
 #include "Common/cpu_features.h"
+#include "Cafe/HW/Latte/Core/LatteBufferCache.h"
+#include "util/containers/robin_hood.h"
+#include "telemetry.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <map>
+#include <unordered_map>
+#include <vector>
 
 #if defined(ARCH_X86_64) && defined(__GNUC__)
 #include <immintrin.h>
@@ -30,6 +40,154 @@ struct
 	uint64 currentUsageCounter{0};
 }LatteIndexCache{};
 
+// BotW-Native: cross-frame index cache. Upstream kept the converted (byte-swapped, quad-unpacked) indices of the
+// last 8 draws and dropped them at every buffer cleanup, so with ~4500 draws a frame nearly every draw converted
+// its indices again and churned the index heap (conversion + heap alloc/free ~9% of LatteThread on the Deck).
+// Entries now live across frames and are dropped when the game flushes (DCFlush/GX2Invalidate) any byte of their
+// source range - the rule Cemu's vertex/uniform buffer cache already relies on - or on a global flush.
+// BOTW_INDEX_CACHE=0 restores the upstream behaviour.
+namespace
+{
+	struct PersistentKey
+	{
+		const void* ptr;
+		uint32 count;
+		LattePrimitiveMode mode;
+		LatteIndexType type;
+		bool operator==(const PersistentKey& o) const { return ptr == o.ptr && count == o.count && mode == o.mode && type == o.type; }
+	};
+	struct PersistentKeyHash
+	{
+		size_t operator()(const PersistentKey& k) const
+		{
+			uint64 h = (uint64)(uintptr_t)k.ptr * 0x9E3779B97F4A7C15ull;
+			h ^= ((uint64)k.count << 8 | (uint64)k.mode << 4 | (uint64)k.type) * 0xC2B2AE3D27D4EB4Full;
+			return (size_t)(h ^ (h >> 29));
+		}
+	};
+	struct PersistentEntry
+	{
+		uint64 lastUsed;
+		uint32 inputBytes;
+		uint32 outputBytes;
+		uint32 indexMax;
+		Renderer::INDEX_TYPE renderIndexType;
+		uint32 outputCount;
+		Renderer::IndexAllocation indexAllocation;
+	};
+	// converted index bytes kept (host-visible GTT memory); TEST: BOTW_INDEX_CACHE_KB=<n> to force trims
+	const uint64 kPersistentBudget = getenv("BOTW_INDEX_CACHE_KB") ? atoll(getenv("BOTW_INDEX_CACHE_KB")) * 1024ull : 32ull * 1024 * 1024;
+	// flat (entries inline): the node-based std::unordered_map lookup was 9.4% of LatteThread (PC call stacks, b76)
+	using PersistentMap = robin_hood::unordered_flat_map<PersistentKey, PersistentEntry, PersistentKeyHash>;
+	PersistentMap s_persist;
+	std::multimap<uintptr_t, PersistentKey> s_persistByAddr;  // source start -> key, for range invalidation
+	uint64 s_persistBytes = 0;
+	uint32 s_persistMaxInput = 0;  // largest cached source range: bounds the invalidation lookback
+	uintptr_t s_persistLo = UINTPTR_MAX, s_persistHi = 0;  // span of cached sources (quick reject)
+	std::atomic<bool> s_persistGlobalFlush{false};
+	uint64 s_statHits = 0, s_statMisses = 0, s_statInvalidated = 0, s_statGlobalClears = 0;
+
+	void PersistentStats()
+	{
+		if ((s_statHits + s_statMisses) % 200000 != 0)
+			return;
+		cemuLog_log(LogType::Force, "index cache: {} hits {} misses {} invalidated {} global clears, {} entries {} KB",
+		            s_statHits, s_statMisses, s_statInvalidated, s_statGlobalClears, s_persist.size(), s_persistBytes / 1024);
+	}
+
+	bool PersistentOn()
+	{
+		static const bool on = !(getenv("BOTW_INDEX_CACHE") && atoi(getenv("BOTW_INDEX_CACHE")) == 0);
+		return on;
+	}
+
+	void PersistentErase(PersistentMap::iterator it)
+	{
+		auto range = s_persistByAddr.equal_range((uintptr_t)it->first.ptr);
+		for (auto a = range.first; a != range.second; ++a)
+		{
+			if (a->second == it->first)
+			{
+				s_persistByAddr.erase(a);
+				break;
+			}
+		}
+		if (it->second.indexAllocation.rendererInternal)
+			g_renderer->indexData_releaseIndexMemory(it->second.indexAllocation);
+		s_persistBytes -= it->second.outputBytes;
+		s_persist.erase(it);
+	}
+
+	void PersistentClear()
+	{
+		for (auto& [k, e] : s_persist)
+			if (e.indexAllocation.rendererInternal)
+				g_renderer->indexData_releaseIndexMemory(e.indexAllocation);
+		s_persist.clear();
+		s_persistByAddr.clear();
+		s_persistBytes = 0;
+		s_persistMaxInput = 0;
+		s_persistLo = UINTPTR_MAX;
+		s_persistHi = 0;
+	}
+
+	void PersistentInvalidate(uintptr_t lo, uintptr_t hi)
+	{
+		if (s_persist.empty() || hi <= s_persistLo || lo >= s_persistHi)
+			return;
+		auto a = s_persistByAddr.lower_bound(lo > s_persistMaxInput ? lo - s_persistMaxInput : 0);
+		while (a != s_persistByAddr.end() && a->first < hi)
+		{
+			auto it = s_persist.find(a->second);
+			++a;
+			if (it != s_persist.end() && (uintptr_t)it->first.ptr + it->second.inputBytes > lo)
+			{
+				// PersistentErase removes the multimap node of this key; `a` already points past it
+				PersistentErase(it);
+				s_statInvalidated++;
+			}
+		}
+	}
+
+	// Over budget: drop the least recently used half (amortized; runs rarely). `keep` = the entry the current draw uses.
+	void PersistentTrim(const PersistentKey& keep)
+	{
+		if (s_persistBytes <= kPersistentBudget)
+			return;
+		std::vector<uint64> ages;
+		ages.reserve(s_persist.size());
+		for (auto& [k, e] : s_persist)
+			ages.push_back(e.lastUsed);
+		std::nth_element(ages.begin(), ages.begin() + ages.size() / 2, ages.end());
+		const uint64 cut = ages[ages.size() / 2];
+		static uint32 s_trims = 0;
+		if ((++s_trims & (s_trims - 1)) == 0)  // 1st, 2nd, 4th, 8th... trim
+			cemuLog_log(LogType::Force, "index cache: trim #{} at {} KB, {} entries", s_trims, s_persistBytes / 1024, s_persist.size());
+		// a flat map erase moves other entries: collect first, erase after
+		std::vector<PersistentKey> drop;
+		for (auto& [k, e] : s_persist)
+			if (e.lastUsed <= cut && !(k == keep))
+				drop.push_back(k);
+		for (auto& k : drop)
+			PersistentErase(s_persist.find(k));
+	}
+}
+
+// DCFlush notifications (LatteBufferCache.cpp): called on LatteThread for every flushed page, before draws use them
+void LatteIndices_invalidatePhysRange(uint32 physAddr, uint32 size)
+{
+	if (s_persist.empty())
+		return;
+	const uintptr_t lo = (uintptr_t)memory_getPointerFromVirtualOffset(physAddr);
+	PersistentInvalidate(lo, lo + size);
+}
+
+// a global flush (address 0 or size ~0) from any thread: every cached entry is dropped at the next draw
+void LatteIndices_notifyGlobalFlush()
+{
+	s_persistGlobalFlush.store(true, std::memory_order_release);
+}
+
 void LatteIndices_invalidate(const void* memPtr, uint32 size)
 {
 	for(auto& entry : LatteIndexCache.entry)
@@ -42,10 +200,14 @@ void LatteIndices_invalidate(const void* memPtr, uint32 size)
 			entry.lastCount = 0;
 		}
 	}
+	PersistentInvalidate((uintptr_t)memPtr, (uintptr_t)memPtr + size);
 }
 
+// buffer cleanup after finished command buffers: upstream dropped the cache here; persistent entries stay
 void LatteIndices_invalidateAll()
 {
+	if (PersistentOn())
+		return;
 	for(auto& entry : LatteIndexCache.entry)
 	{
 		if (entry.lastPtr != nullptr)
@@ -653,8 +815,40 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
 	// [x] decode data directly into coherent memory buffer?
 	// [ ] better cache implementation, allow to cache across frames
 
+	const bool persistent = PersistentOn();
+	if (persistent)
+	{
+		if (s_persistGlobalFlush.load(std::memory_order_relaxed) && s_persistGlobalFlush.exchange(false, std::memory_order_acq_rel))
+		{
+			PersistentClear();
+			s_statGlobalClears++;
+		}
+		// flushes the game made before submitting this draw invalidate cached indices first (upstream processed the
+		// queue only after the index decode, in LatteBufferCache_Sync)
+		LatteBufferCache_processDCFlushQueue();
+		auto hit = s_persist.find(PersistentKey{indexData, count, primitiveMode, indexType});
+		if (hit != s_persist.end())
+		{
+			indexMax = hit->second.indexMax;
+			renderIndexType = hit->second.renderIndexType;
+			outputCount = hit->second.outputCount;
+			indexAllocation = hit->second.indexAllocation;
+			hit->second.lastUsed = LatteIndices_GetNextUsageIndex();
+			if (telem::on())  // statistics: telemetry only
+			{
+				s_statHits++;
+				PersistentStats();
+			}
+			return;
+		}
+		if (telem::on())
+		{
+			s_statMisses++;
+			PersistentStats();
+		}
+	}
 	// reuse from cache if data didn't change
-	auto cacheEntry = std::find_if(LatteIndexCache.entry.begin(), LatteIndexCache.entry.end(), [indexData, count, primitiveMode, indexType](const auto& entry)
+	auto cacheEntry = persistent ? LatteIndexCache.entry.end() : std::find_if(LatteIndexCache.entry.begin(), LatteIndexCache.entry.end(), [indexData, count, primitiveMode, indexType](const auto& entry)
 	{
 		return entry.lastPtr == indexData && entry.lastCount == count && entry.lastPrimitiveMode == primitiveMode && entry.lastIndexType == indexType;
 	});
@@ -845,6 +1039,24 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
 	}
 	g_renderer->indexData_uploadIndexMemory(indexAllocation);
 	performanceMonitor.cycle[performanceMonitor.cycleIndex].indexDataUploaded += indexOutputSize;
+	if (persistent)
+	{
+		const bool hasSource = indexType != LatteIndexType::AUTO;  // AUTO: generated indices, no guest data to watch
+		const uint32 inputBytes = !hasSource ? 0 : count * (indexType == LatteIndexType::U32_BE || indexType == LatteIndexType::U32_LE ? 4 : 2);
+		const PersistentKey key{indexData, count, primitiveMode, indexType};
+		s_persist[key] = PersistentEntry{LatteIndices_GetNextUsageIndex(), inputBytes, indexOutputSize, indexMax,
+		                                 renderIndexType, outputCount, indexAllocation};
+		if (hasSource)
+		{
+			s_persistByAddr.emplace((uintptr_t)indexData, key);
+			s_persistMaxInput = std::max(s_persistMaxInput, inputBytes);
+			s_persistLo = std::min(s_persistLo, (uintptr_t)indexData);
+			s_persistHi = std::max(s_persistHi, (uintptr_t)indexData + inputBytes);
+		}
+		s_persistBytes += indexOutputSize;
+		PersistentTrim(key);
+		return;
+	}
 	// get least recently used cache entry
 	auto lruEntry = std::min_element(LatteIndexCache.entry.begin(), LatteIndexCache.entry.end(), [](const auto& a, const auto& b)
 	{

@@ -34,6 +34,45 @@ void LatteThread_HandleOSScreen();
 
 void LatteThread_Exit();
 
+// BotW-Native: the GPU thread waited for CPU-written fences in a pause loop, keeping its core at full power (most
+// of the thread's samples on the PC). On the Deck the CPU and GPU share one power limit, so AMD's MONITORX/MWAITX
+// sleeps the core until the watched cache line is written, or ~20 us pass (timers and vsync are rechecked then).
+#if defined(__x86_64__) && !defined(_MSC_VER)
+#include <cpuid.h>
+#include <x86intrin.h>
+static const bool s_cpuHasMwaitx = [] {
+	unsigned a, b, c, d;
+	return __get_cpuid(0x80000001, &a, &b, &c, &d) && (c & (1u << 29)) != 0;
+}();
+__attribute__((target("mwaitx"))) static void LatteCP_mwaitx(const void* addr, uint32 seen)
+{
+	_mm_monitorx(const_cast<void*>(addr), 0, 0);
+	if (*(const volatile uint32*)addr == seen)
+		_mm_mwaitx(2, 0, 50000);  // extension bit 1: wake after 50000 reference clocks (~20 us) at the latest
+}
+void LatteCP_idleUntilWrite(const void* addr, uint32 seen)  // also VkRecord's wait (VulkanDeferred.cpp)
+{
+	if (s_cpuHasMwaitx)
+		LatteCP_mwaitx(addr, seen);
+	else
+		_mm_pause();
+}
+#else
+void LatteCP_idleUntilWrite(const void*, uint32)
+{
+	_mm_pause();
+}
+#endif
+
+// BotW-Native: the game thread writes the command buffers on another core, so reading them missed the GPU thread's
+// cache line after line (the command word load was the hottest instruction of LatteCP_ProcessRingbuffer on the
+// Deck, b98 session 034652). Commands are read in order: touch the line 512 bytes ahead so it is in cache when the
+// parser gets there. A prefetch never faults (past the buffer end it is just unused) and changes no data.
+static inline void LatteCP_prefetchCommands(const uint32be* cmd)
+{
+	__builtin_prefetch((const char*)cmd + 512, 0, 3);
+}
+
 class DrawPassContext
 {
 	struct CmdQueuePos
@@ -227,7 +266,7 @@ LatteCMDPtr LatteCP_itSurfaceSync(LatteCMDPtr cmd)
 	uint32 pollInterval = LatteReadCMD();
 
 	// let the renderer know about colorbuffer invalidation
-	if (static_cast<uint32>(invalidationFlags & (Latte::E_COHER_CNTL::CB_ACTION_ENA | Latte::E_COHER_CNTL::CB_ALL_DEST_BASE_ENA)) != 0)
+	if (static_cast<uint32>(invalidationFlags & (Latte::E_COHER_CNTL::CB_ACTION_ENA | Latte::E_COHER_CNTL::CB_ALL_DEST_BASE_ENA | Latte::E_COHER_CNTL::DB_ACTION_ENA | Latte::E_COHER_CNTL::DB_DEST_BASE_ENA)) != 0)
 		g_renderer->SurfaceSync(invalidationFlags, addressPhys, size);
 
 	if (addressPhys == MPTR_NULL || size == 0xFFFFFFFF)
@@ -496,7 +535,8 @@ LatteCMDPtr LatteCP_itWaitRegMem(LatteCMDPtr cmd, uint32 nWords)
 		performanceMonitor.gpuTime_fenceTime.beginMeasuring();
 		while (true)
 		{
-			uint32 fenceMemValue = _swapEndianU32(*fencePtr);
+			const uint32 rawFenceValue = *fencePtr;
+			uint32 fenceMemValue = _swapEndianU32(rawFenceValue);
 			fenceMemValue &= fenceMask;
 			if (compareOp == GPU7_WAIT_MEM_OP_LESS)
 			{
@@ -549,7 +589,7 @@ LatteCMDPtr LatteCP_itWaitRegMem(LatteCMDPtr cmd, uint32 nWords)
 			LatteTiming_HandleTimedVsync();
 			LatteAsyncCommands_checkAndExecute();
 #if defined(__x86_64__) || defined(_M_X64)
-			_mm_pause();
+			LatteCP_idleUntilWrite(fencePtr, rawFenceValue);
 #endif
 		}
 		performanceMonitor.gpuTime_fenceTime.endMeasuring();
@@ -992,7 +1032,7 @@ LatteCMDPtr LatteCP_itHLEWaitForFlip(LatteCMDPtr cmd, uint32 nWords)
 	uint32 currentFlipCount = LatteGPUState.flipCounter;
 	while (true)
 	{
-		_mm_pause();
+		LatteCP_idleUntilWrite(&LatteGPUState.flipCounter, currentFlipCount);
 		if (currentFlipCount != LatteGPUState.flipCounter)
 		{
 			break;
@@ -1064,6 +1104,7 @@ void LatteCP_processCommandBuffer_continuousDrawPass(DrawPassContext& drawPassCt
 		while (cmd < cmdEnd)
 		{
 			LatteCMDPtr cmdBeforeCommand = cmd;
+			LatteCP_prefetchCommands(cmd);
 			uint32 itHeader = LatteReadCMD();
 			uint32 itHeaderType = (itHeader >> 30) & 3;
 			if (itHeaderType == 3)
@@ -1216,6 +1257,7 @@ void LatteCP_processCommandBuffer(DrawPassContext& drawPassCtx)
 		uint32 itHeader;
 		while (cmd < cmdEnd)
 		{
+			LatteCP_prefetchCommands(cmd);
 			itHeader = LatteReadCMD();
 			uint32 itHeaderType = (itHeader >> 30) & 3;
 			if (itHeaderType == 3)

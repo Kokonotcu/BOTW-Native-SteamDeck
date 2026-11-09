@@ -25,6 +25,9 @@ std::atomic_bool sLatteThreadRunning = false;
 std::atomic_bool sLatteThreadFinishedInit = false;
 
 void LatteThread_Exit();
+#ifdef ENABLE_VULKAN
+void VkDefer_SetProducerThread();  // VulkanDeferred.cpp
+#endif
 
 void Latte_LoadInitialRegisters()
 {
@@ -112,9 +115,12 @@ void LatteThread_HandleOSScreen()
 		g_renderer->SwapBuffers(swapTV, swapDRC);
 }
 
+extern "C" void botw_place_thread(int kind);  // runtime/src/thread.cpp core plan
+
 int Latte_ThreadEntry()
 {
 	SetThreadName("LatteThread");
+	botw_place_thread(1);
 #if defined(BOTWRECOMP) && defined(__APPLE__)
 	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // with the game's main thread on the performance cores
 #elif defined(_WIN32)
@@ -125,6 +131,9 @@ int Latte_ThreadEntry()
 
 	// renderer
 	g_renderer->Initialize();
+#ifdef ENABLE_VULKAN
+	VkDefer_SetProducerThread();  // this thread records; VulkanDeferred.cpp replays on its own thread
+#endif
 	RendererOutputShader::InitializeStatic();
 
 	LatteTiming_Init();

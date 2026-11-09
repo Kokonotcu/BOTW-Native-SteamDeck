@@ -2,11 +2,19 @@
 #include "util/ChunkedHeap/ChunkedHeap.h"
 #include "util/helpers/fspinlock.h"
 #include "config/ActiveSettings.h"
+#include "telemetry.h"
+
+#include <atomic>
 
 #define CACHE_PAGE_SIZE		0x400
 #define CACHE_PAGE_SIZE_M1	(CACHE_PAGE_SIZE-1)
 
 uint32 g_currentCacheChronon = 0;
+uint32 g_bufferCacheUploads = 0;
+uint32 s_nodeCacheGen = 1;  // BotW-Native: bumping it drops all of LatteBufferCache_reserveRange's page cache
+class BufferCacheNode;
+// BotW-Native: a deleted node drops only the page-cache entries that point to it (defined next to the cache)
+void LatteBufferCache_nodeCacheForget(BufferCacheNode* node, uint32 rangeBegin, uint32 rangeEnd);
 
 template<typename TRangeType, typename TNodeObject>
 class IntervalTree
@@ -903,6 +911,7 @@ private:
 std::unique_ptr<VHeap> g_gpuBufferHeap = nullptr;
 std::vector<uint8> s_pageUploadBuffer;
 std::vector<class BufferCacheNode*> s_allCacheNodes;
+std::vector<class BufferCacheNode*> s_invalidatedNodes;  // BotW-Native: nodes invalidated since the last LatteBufferCache_syncAllInvalidated
 
 void LatteBufferCache_removeSingleNodeFromTree(BufferCacheNode* node);
 
@@ -910,12 +919,16 @@ class BufferCacheNode
 {
 	static inline constexpr uint64 c_streamoutSig0 = 0xF0F0F0F0155C5B6Aull;
 	static inline constexpr uint64 c_streamoutSig1 = 0x8BE6336411814F4Full;
+	static inline constexpr sint32 kUploadGapPages = 4;  // unchanged pages bridged inside one upload
 
 public:
 	~BufferCacheNode()
 	{
+		LatteBufferCache_nodeCacheForget(this, m_rangeBegin, m_rangeEnd);
 		if (m_hasCacheAlloc)
 			g_deallocateQueue.emplace_back(m_cacheOffset); // release after current drawcall
+		if (m_inInvalidatedList)
+			std::erase(s_invalidatedNodes, this);
 		// remove from array
 		auto temp = s_allCacheNodes.back();
 		s_allCacheNodes.pop_back();
@@ -1001,6 +1014,7 @@ public:
 		sint32 numPages = getPageCountFromRangeAligned(rangeBegin, rangeEnd);
 		uint8* pagePtr = memory_getPointerFromPhysicalOffset(rangeBegin);
 		sint32 uploadPageBegin = -1;
+		sint32 uploadPageEnd = -1;  // one past the last changed page of the pending run
 		CachePageInfo* pageInfo = m_pageInfo.data() + basePageIndex;
 		for (sint32 i = 0; i < numPages; i++)
 		{
@@ -1011,7 +1025,7 @@ public:
 				{
 					// upload range
 					if (uploadData)
-						uploadPages(uploadPageBegin, basePageIndex + i);
+						uploadPages(uploadPageBegin, uploadPageEnd);
 					uploadPageBegin = -1;
 				}
 				// check if hash changed
@@ -1035,15 +1049,18 @@ public:
 			{
 				if (uploadPageBegin == -1)
 					uploadPageBegin = i + basePageIndex;
+				uploadPageEnd = i + basePageIndex + 1;
 				pageInfo->hash = pageHash;
 			}
 			else
 			{
-				if (uploadPageBegin != -1)
+				// BotW-Native: a short run of unchanged pages stays in the upload (same data as the cache holds), so
+				// scattered changes become one copy instead of one per run
+				if (uploadPageBegin != -1 && (i + basePageIndex) - uploadPageEnd >= kUploadGapPages)
 				{
 					// upload range
 					if (uploadData)
-						uploadPages(uploadPageBegin, basePageIndex + i);
+						uploadPages(uploadPageBegin, uploadPageEnd);
 					uploadPageBegin = -1;
 				}
 			}
@@ -1052,8 +1069,19 @@ public:
 		if (uploadPageBegin != -1)
 		{
 			if (uploadData)
-				uploadPages(uploadPageBegin, basePageIndex + numPages);
+				uploadPages(uploadPageBegin, uploadPageEnd);
 		}
+	}
+
+	// BotW-Native: upload this node's pending invalidation now (see LatteBufferCache_syncAllInvalidated)
+	void syncInvalidation()
+	{
+		m_inInvalidatedList = false;
+		if (!m_hasInvalidation || !m_hasCacheAlloc)
+			return;
+		if (m_invalidationRangeBegin < m_invalidationRangeEnd)
+			checkAndSyncModifications(m_invalidationRangeBegin, m_invalidationRangeEnd, true);
+		m_hasInvalidation = false;
 	}
 
 	void checkAndSyncModifications(bool uploadData)
@@ -1130,6 +1158,11 @@ public:
 		cemu_assert_debug(m_invalidationRangeBegin < m_invalidationRangeEnd);
 		m_invalidationRangeBegin = m_invalidationRangeBegin & ~CACHE_PAGE_SIZE_M1;
 		m_invalidationRangeEnd = (m_invalidationRangeEnd + CACHE_PAGE_SIZE_M1) & ~CACHE_PAGE_SIZE_M1;
+		if (!m_inInvalidatedList)
+		{
+			m_inInvalidatedList = true;
+			s_invalidatedNodes.emplace_back(this);
+		}
 	}
 
 	void flagInUse()
@@ -1178,6 +1211,7 @@ private:
 	bool m_hasStreamoutData{ false };
 	// invalidation
 	bool m_hasInvalidation{false};
+	bool m_inInvalidatedList{false};
 	MPTR m_invalidationRangeBegin;
 	MPTR m_invalidationRangeEnd;
 
@@ -1233,6 +1267,7 @@ private:
 		uint8* ram = memory_getPointerFromPhysicalOffset(rangeBegin);
 		memory_commit_span(ram, rangeEnd - rangeBegin);
 		g_renderer->bufferCache_upload(ram, rangeEnd - rangeBegin, getBufferOffset(rangeBegin));
+		g_bufferCacheUploads++;
 	}
 
 	void syncFromNode(BufferCacheNode* srcNode)
@@ -1273,6 +1308,7 @@ private:
 			m_pageInfo[firstPage + i].hash = hashPage(s_pageUploadBuffer.data() + i * CACHE_PAGE_SIZE);
 		}
 		g_renderer->bufferCache_upload(s_pageUploadBuffer.data(), uploadRangeEnd - uploadRangeBegin, getBufferOffset(uploadRangeBegin));
+		g_bufferCacheUploads++;
 	}
 
 	// upload only non-streamout data of a single page
@@ -1328,6 +1364,7 @@ private:
 		cemu_assert_debug(newRangeEnd >= m_rangeEnd);
 		cemu_assert_debug(newRangeEnd > m_rangeBegin);
 		assert_dbg(); // todo (resize page array)
+		s_nodeCacheGen++;  // BotW-Native: the page cache keeps node ranges
 		m_rangeBegin = newRangeBegin;
 		m_rangeEnd = newRangeEnd;
 	}
@@ -1532,17 +1569,86 @@ std::vector<uint32> BufferCacheNode::g_deallocateQueue;
 
 void LatteBufferCache_removeSingleNodeFromTree(BufferCacheNode* node)
 {
+	LatteBufferCache_nodeCacheForget(node, node->GetRangeBegin(), node->GetRangeEnd());  // may stay alive outside the tree
 	g_gpuBufferCache.RemoveRange(node->GetRangeBegin(), node->GetRangeEnd());
+}
+
+// BotW-Native: consecutive draws bind the same few buffers, so the node found for each 4 KB page is kept here; a hit
+// still has to contain the whole request, and any node deletion (s_nodeCacheGen) drops every entry.
+// 4096 entries (was 256: per-draw uniform/vertex data spans MBs, so most lookups missed into the interval tree) and
+// the node's range is stored in the entry, so a hit does not touch the node (that load missed cache on the Deck).
+// A node's range never changes while it lives (merges create a new node and bump s_nodeCacheGen).
+struct NodeCacheEntry
+{
+	BufferCacheNode* node;
+	uint32 begin;
+	uint32 end;
+	uint32 gen;
+};
+constexpr uint32 kNodeCacheSize = 4096;
+NodeCacheEntry s_nodeCache[kNodeCacheSize];
+uint64 s_nodeCacheHits = 0, s_nodeCacheMisses = 0;
+
+// BOTW_NODECACHE=256: the old size, for comparing hit rates
+inline NodeCacheEntry& NodeCacheSlot(MPTR physAddress)
+{
+	static const uint32 s_mask = (getenv("BOTW_NODECACHE") && atoi(getenv("BOTW_NODECACHE")) == 256) ? 255 : kNodeCacheSize - 1;
+	return s_nodeCache[(physAddress >> 12) & s_mask];
+}
+
+// the node holding this page if the page cache knows it (a valid entry whose range contains the page), else null
+inline BufferCacheNode* NodeCachePeek(MPTR physAddress)
+{
+	const NodeCacheEntry& e = NodeCacheSlot(physAddress);
+	if (e.gen == s_nodeCacheGen && e.node && physAddress >= e.begin && physAddress < e.end)
+		return e.node;
+	return nullptr;
+}
+
+// Entries for a node can only sit at the slots of the 4 KB pages inside its range (lookups are by the request's
+// page, and a hit needs the request inside the range), so clearing those slots that still point to it is exact.
+// Huge ranges (more pages than slots) still drop everything. BOTW_NODECACHE=256 keeps the old global drop.
+void LatteBufferCache_nodeCacheForget(BufferCacheNode* node, uint32 rangeBegin, uint32 rangeEnd)
+{
+	static const bool s_global = getenv("BOTW_NODECACHE") && atoi(getenv("BOTW_NODECACHE")) == 256;
+	const uint32 firstPage = rangeBegin >> 12, lastPage = (rangeEnd - 1) >> 12;
+	if (s_global || rangeEnd <= rangeBegin || lastPage - firstPage >= kNodeCacheSize)
+	{
+		s_nodeCacheGen++;
+		return;
+	}
+	for (uint32 p = firstPage; p <= lastPage; p++)
+	{
+		NodeCacheEntry& e = s_nodeCache[p & (kNodeCacheSize - 1)];
+		if (e.node == node)
+			e.node = nullptr;
+	}
 }
 
 BufferCacheNode* LatteBufferCache_reserveRange(MPTR physAddress, uint32 size)
 {
+	NodeCacheEntry& cached = NodeCacheSlot(physAddress);
+	const bool stats = telem::on();  // hit/miss statistics: telemetry only
+	if (stats && (((s_nodeCacheHits + s_nodeCacheMisses) & 0xFFFFF) == 0) && s_nodeCacheHits)
+		cemuLog_log(LogType::Force, "buffer node cache: {} hits {} misses", s_nodeCacheHits, s_nodeCacheMisses);
+	if (cached.gen == s_nodeCacheGen && cached.node && physAddress >= cached.begin && (physAddress + size) <= cached.end)
+	{
+		if (stats)
+			s_nodeCacheHits++;
+		return cached.node;
+	}
+	if (stats)
+		s_nodeCacheMisses++;
+
 	MPTR rangeStart = physAddress - (physAddress % CACHE_PAGE_SIZE);
 	MPTR rangeEnd = (physAddress + size + CACHE_PAGE_SIZE_M1) & ~CACHE_PAGE_SIZE_M1;
 
 	BufferCacheNode* range = g_gpuBufferCache.GetRange(physAddress);
 	if (range && physAddress >= range->GetRangeBegin() && (physAddress+size) <= range->GetRangeEnd())
+	{
+		cached = {range, range->GetRangeBegin(), range->GetRangeEnd(), s_nodeCacheGen};
 		return range;
+	}
 	// no containing range found, we need to create a range and potentially merge with any overlapping ranges
 	g_gpuBufferCache.GetOverlappingRanges(rangeStart, rangeEnd, s_gpuCacheQueryResult);
 	if (s_gpuCacheQueryResult.empty())
@@ -1610,7 +1716,11 @@ void LatteBufferCache_invalidate(MPTR physAddress, uint32 size)
 void LatteBufferCache_invalidatePage(MPTR physAddress)
 {
 	cemu_assert_debug((physAddress & CACHE_PAGE_SIZE_M1) == 0);
-	BufferCacheNode* node = g_gpuBufferCache.GetRange(physAddress);
+	// BotW-Native: flushed pages are mostly the dynamic buffers the draws just bound; ranges never overlap, so a
+	// cached node containing the page is the one the tree would return
+	BufferCacheNode* node = NodeCachePeek(physAddress);
+	if (!node)
+		node = g_gpuBufferCache.GetRange(physAddress);
 	if (node)
 	{
 		cemu_assert_debug(physAddress >= node->GetRangeBegin() && physAddress < node->GetRangeEnd());
@@ -1621,6 +1731,19 @@ void LatteBufferCache_invalidatePage(MPTR physAddress)
 void LatteBufferCache_processDeallocations()
 {
 	BufferCacheNode::ProcessDeallocations();
+}
+
+// BotW-Native: uploads every node's pending invalidation. Called where no render pass is open anyway (a render pass
+// switch, or a draw that already ended the pass for its own upload), so the draws that follow find their data in the
+// cache instead of each ending the pass to upload it (thousands of pass breaks in one frame while the game streams
+// an area in).
+void LatteBufferCache_syncAllInvalidated()
+{
+	// syncInvalidation never invalidates or deletes nodes, so the list stays stable while we walk it
+	for (size_t i = 0; i < s_invalidatedNodes.size(); i++)
+		s_invalidatedNodes[i]->syncInvalidation();
+	s_invalidatedNodes.clear();
+	g_bufferCacheUploads = 0;
 }
 
 void LatteBufferCache_init(size_t bufferSize)
@@ -1640,89 +1763,115 @@ void LatteBufferCache_getStats(uint32& heapSize, uint32& allocationSize, uint32&
 	g_gpuBufferHeap->getStats(heapSize, allocationSize, allocNum);
 }
 
-class SparseBitset
+// BotW-Native: flushed pages as one bit per 1 KB page of the 4 GB guest space (512 KB), plus the list of non-zero
+// words. Upstream's hashed vectors ran a linear search per page on the flushing guest thread (1% of the main thread)
+// and the GPU thread invalidated page by page, a tree lookup in both caches each (4.5% of LatteThread, b87 profile).
+// Now a flush ORs a few words, and the GPU thread invalidates each run of contiguous pages once.
+class PageBitmap
 {
-	static inline constexpr size_t TABLE_MASK = 0xFF;
-
 public:
 	bool Empty() const
 	{
-		return m_numNonEmptyVectors == 0;
+		return m_dirty.empty();
 	}
 
-	void Set(uint32 index)
+	void SetRange(uint32 first, uint32 last)
 	{
-		auto& v = m_bits[index & TABLE_MASK];
-		if (std::find(v.cbegin(), v.cend(), index) != v.end())
-			return;
-		if (v.empty())
+		for (uint32 w = first >> 6; w <= (last >> 6); w++)
 		{
-			m_nonEmptyVectors[m_numNonEmptyVectors] = &v;
-			m_numNonEmptyVectors++;
+			const uint32 lo = w == (first >> 6) ? (first & 63) : 0;
+			const uint32 hi = w == (last >> 6) ? (last & 63) : 63;
+			if (m_bits[w] == 0)
+				m_dirty.push_back(w);
+			m_bits[w] |= (~0ull >> (63 - hi)) & (~0ull << lo);
 		}
-		v.emplace_back(index);
 	}
 
+	// f(firstPage, pageCount) for each run of set pages, in address order; clears what it visits
 	template<typename TFunc>
-	void ForAllAndClear(TFunc callbackFunc)
+	void ForRunsAndClear(TFunc f)
 	{
-		auto vCurrent = m_nonEmptyVectors + 0;
-		auto vEnd = m_nonEmptyVectors + m_numNonEmptyVectors;
-		while (vCurrent < vEnd)
+		std::sort(m_dirty.begin(), m_dirty.end());
+		uint32 runStart = 0, runLen = 0;
+		for (uint32 w : m_dirty)
 		{
-			std::vector<uint32>* vec = *vCurrent;
-			vCurrent++;
-			for (const auto& it : *vec)
-				callbackFunc(it);
-			vec->clear();
+			uint64 b = m_bits[w];
+			m_bits[w] = 0;
+			while (b)
+			{
+				const uint32 bit = (uint32)std::countr_zero(b);
+				const uint32 n = (uint32)std::countr_one(b >> bit);
+				const uint32 page = w * 64 + bit;
+				if (runLen != 0 && runStart + runLen == page)
+					runLen += n;
+				else
+				{
+					if (runLen != 0)
+						f(runStart, runLen);
+					runStart = page;
+					runLen = n;
+				}
+				b = bit + n >= 64 ? 0 : b & (~0ull << (bit + n));
+			}
 		}
-		m_numNonEmptyVectors = 0;
-	}
-
-	void Clear()
-	{
-		auto vCurrent = m_nonEmptyVectors + 0;
-		auto vEnd = m_nonEmptyVectors + m_numNonEmptyVectors;
-		while (vCurrent < vEnd)
-		{
-			std::vector<uint32>* vec = *vCurrent;
-			vCurrent++;
-			vec->clear();
-		}
-		m_numNonEmptyVectors = 0;
+		if (runLen != 0)
+			f(runStart, runLen);
+		m_dirty.clear();
 	}
 
 private:
-	std::vector<uint32> m_bits[TABLE_MASK + 1];
-	std::vector<uint32>* m_nonEmptyVectors[TABLE_MASK + 1];
-	size_t m_numNonEmptyVectors{ 0 };
+	uint64 m_bits[(1ull << 32) / CACHE_PAGE_SIZE / 64] = {};
+	std::vector<uint32> m_dirty;
 };
 
 FSpinlock g_spinlockDCFlushQueue;
-SparseBitset* s_DCFlushQueue = new SparseBitset();
-SparseBitset* s_DCFlushQueueAlternate = new SparseBitset();
+PageBitmap* s_DCFlushQueue = new PageBitmap();
+PageBitmap* s_DCFlushQueueAlternate = new PageBitmap();
+// BotW-Native: the GPU thread checks the queue several times per draw (buffer sync, index decode, pass start). The
+// empty check read the dirty list's end pointer, which the game thread moves on every flush, so nearly every check
+// missed its cache (processDCFlushQueue entry + empty check were most of its 2% of the GPU thread, b99). This flag is
+// written only when the queue goes from empty to non-empty (and back by the consumer), so checks mostly hit.
+alignas(64) std::atomic<bool> s_DCFlushPending{false};
+
+void LatteIndices_notifyGlobalFlush();  // LatteIndices.cpp cross-frame index cache
+void LatteIndices_invalidatePhysRange(uint32 physAddr, uint32 size);
 
 void LatteBufferCache_notifyDCFlush(MPTR address, uint32 size)
 {
 	if (address == 0 || size == 0xFFFFFFFF)
-		return; // global flushes are ignored for now
+	{
+		LatteIndices_notifyGlobalFlush();
+		return; // global flushes are ignored for now (the buffer cache); the index cache drops everything
+	}
 
 	uint32 firstPage = address / CACHE_PAGE_SIZE;
 	uint32 lastPage = (address + size - 1) / CACHE_PAGE_SIZE;
+	if (lastPage < firstPage)  // size 0 or wrapping past 4 GB: the old per-page loop did nothing either
+		return;
 	g_spinlockDCFlushQueue.lock();
-	for (uint32 i = firstPage; i <= lastPage; i++)
-		s_DCFlushQueue->Set(i);
+	s_DCFlushQueue->SetRange(firstPage, lastPage);
+	if (!s_DCFlushPending.load(std::memory_order_relaxed))
+		s_DCFlushPending.store(true, std::memory_order_relaxed);  // the spinlock release publishes it with the range
 	g_spinlockDCFlushQueue.unlock();
 }
 
 void LatteBufferCache_processDCFlushQueue()
 {
-	if (s_DCFlushQueue->Empty()) // quick check to avoid locking if there is no work to do
+	if (!s_DCFlushPending.load(std::memory_order_acquire)) // quick check to avoid locking if there is no work to do
 		return;
 	g_spinlockDCFlushQueue.lock();
 	std::swap(s_DCFlushQueue, s_DCFlushQueueAlternate);
+	s_DCFlushPending.store(false, std::memory_order_relaxed);
 	g_spinlockDCFlushQueue.unlock();
-	s_DCFlushQueueAlternate->ForAllAndClear([](uint32 index) {LatteBufferCache_invalidatePage(index * CACHE_PAGE_SIZE); });
+	s_DCFlushQueueAlternate->ForRunsAndClear([](uint32 firstPage, uint32 count) {
+		// a node's invalidation is one union range, so a run = the same result as its pages one by one
+		const uint32 addr = firstPage * CACHE_PAGE_SIZE, size = count * CACHE_PAGE_SIZE;
+		if (count == 1)
+			LatteBufferCache_invalidatePage(addr);
+		else
+			LatteBufferCache_invalidate(addr, size);
+		LatteIndices_invalidatePhysRange(addr, size);
+	});
 }
 
 void LatteBufferCache_notifyDrawDone()
@@ -1772,6 +1921,6 @@ void LatteBufferCache_incrementalCleanup()
 	if (range->GetFrameAge() >= evictionFrameAge)
 	{
 		g_gpuBufferCache.RemoveRange(range->GetRangeBegin(), range->GetRangeEnd());
-		delete range;
+		delete range;  // the destructor drops its page-cache entries
 	}
 }

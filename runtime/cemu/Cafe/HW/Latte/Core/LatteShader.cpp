@@ -26,6 +26,7 @@
 #include "util/Zir/Core/ZpIRDebug.h"
 #include "Cafe/HW/Latte/Transcompiler/LatteTC.h"
 #include "Cafe/HW/Latte/ShaderInfo/ShaderInfo.h"
+#include "telemetry.h"
 
 struct _ShaderHashCache
 {
@@ -967,7 +968,11 @@ LatteDecompilerShader* LatteSHRC_GetOrCreateVertexShader(uint8* vertexShaderPtr,
 		vertexShader = LatteSHRC_GetFromChain(itBaseShader->second, _shaderBaseHash_vs, vsAuxHash);
 	}
 	if (!vertexShader)
+	{
+		telem::Scope timed(telem::ShaderNs);
+		telem::add(telem::ShaderNew, 1);
 		vertexShader = LatteShader_CompileSeparableVertexShader(_shaderBaseHash_vs, vsAuxHash, vertexShaderPtr, vertexShaderSize, usesGeometryShader, fetchShader);
+	}
 	if (vertexShader->hasError)
 		LatteGPUState.activeShaderHasError = true;
 	return vertexShader;
@@ -992,7 +997,9 @@ LatteDecompilerShader* LatteSHRC_GetOrCreateGeometryShader(bool usesGeometryShad
 	else
 	{
 		// decompile geometry shader
-		geometryShader = LatteShader_CompileSeparableGeometryShader(_shaderBaseHash_gs, geometryShaderPtr, geometryShaderSize, geometryCopyShader, geometryCopyShaderSize, vertexShader);
+		telem::Scope timed(telem::ShaderNs);
+		telem::add(telem::ShaderNew, 1);
+		geometryShader =LatteShader_CompileSeparableGeometryShader(_shaderBaseHash_gs, geometryShaderPtr, geometryShaderSize, geometryCopyShader, geometryCopyShaderSize, vertexShader);
 	}
 	if (geometryShader->hasError)
 		LatteGPUState.activeShaderHasError = true;
@@ -1011,7 +1018,11 @@ LatteDecompilerShader* LatteSHRC_GetOrCreatePixelShader(uint8* pixelShaderPtr, u
 		pixelShader = LatteSHRC_GetFromChain(itBaseShader->second, _shaderBaseHash_ps, psAuxHash);
 	}
 	if (!pixelShader)
+	{
+		telem::Scope timed(telem::ShaderNs);
+		telem::add(telem::ShaderNew, 1);
 		pixelShader = LatteShader_CompileSeparablePixelShader(_shaderBaseHash_ps, psAuxHash, pixelShaderPtr, pixelShaderSize, usesGeometryShader);
+	}
 	if (pixelShader->hasError)
 		LatteGPUState.activeShaderHasError = true;
 	return pixelShader;

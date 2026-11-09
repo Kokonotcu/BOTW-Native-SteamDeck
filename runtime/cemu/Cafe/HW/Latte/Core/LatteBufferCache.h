@@ -10,6 +10,10 @@ void LatteBufferCache_invalidate(MPTR physAddress, uint32 size);
 void LatteBufferCache_notifyDCFlush(MPTR address, uint32 size);
 void LatteBufferCache_processDCFlushQueue();
 
+// BotW-Native: uploads issued since the last LatteBufferCache_syncAllInvalidated (each one ends the render pass)
+extern uint32 g_bufferCacheUploads;
+void LatteBufferCache_syncAllInvalidated();
+
 void LatteBufferCache_processDeallocations();
 void LatteBufferCache_incrementalCleanup();
 

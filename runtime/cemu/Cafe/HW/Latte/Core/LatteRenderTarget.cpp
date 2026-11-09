@@ -1032,6 +1032,10 @@ static void LatteRenderTarget_copyToBackbufferImpl(LatteTextureView* textureView
 	}
 	g_renderer->DrawBackbufferQuad(textureView, shader, filter==LatteTextureView::MagFilter::kLinear, imageX, imageY, imageWidth, imageHeight, isPadView, clearBackground);
 	g_renderer->HandleScreenshotRequest(textureView, isPadView);
+	// BotW-Native: no ImGui frame (and no extra pass on the swapchain image) when the overlay has nothing to draw;
+	// swkbd/erreula are stubs in this port
+	if (!LatteOverlay_hasContent(isPadView))
+		return;
 	if (!g_renderer->ImguiBegin(!isPadView))
 		return;
 	swkbd_render(!isPadView);
@@ -1107,7 +1111,7 @@ void LatteRenderTarget_finishGamepadView()
 {
 	if (sGamepadViewDrawn)
 	{
-		if (g_renderer->ImguiBegin(true))
+		if (LatteOverlay_hasContent(false) && g_renderer->ImguiBegin(true))
 		{
 			swkbd_render(true);
 			nn::erreula::render(true);

@@ -198,6 +198,7 @@ private:
 	const class VKRMemoryManager* m_vkrMemMgr;
 	const VKR_BUFFER_TYPE m_bufferType;
 	const uint32 m_minimumBufferAllocSize;
+	static constexpr size_t kStagingKeepBuffers = 12;  // x 32 MiB
 
 	std::vector<AllocatorBuffer_t> m_buffers;
 
@@ -297,6 +298,7 @@ public:
 	}
 
 	bool FindMemoryType(uint32 typeFilter, VkMemoryPropertyFlags properties, uint32& memoryIndex) const; // searches for exact properties. Can gracefully fail without throwing exception (returns false)
+	bool VramWouldOverflow(uint32 memoryType, size_t size) const; // BotW-Native: allocation would overflow the APU's VRAM carve-out
 	std::vector<uint32> FindMemoryTypes(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
 
 	// image memory allocation

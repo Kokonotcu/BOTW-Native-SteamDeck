@@ -1,3 +1,4 @@
+#include <set>
 #include "Cafe/HW/Latte/Renderer/Vulkan/LatteTextureViewVk.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
@@ -70,6 +71,13 @@ LatteTextureViewVk::LatteTextureViewVk(VkDevice device, LatteTextureVk* texture,
 	}
 	else
 		m_format = texture->GetFormat();
+	if (m_format != texture->GetFormat() && !texture->isDepth)
+	{
+		// outside the image's format list (LatteTextureVk.cpp): may read DCC-compressed data wrong, try BOTW_DCC=0
+		static std::set<uint64> s_seen;
+		if (s_seen.insert(((uint64)texture->GetFormat() << 32) | (uint64)m_format).second)
+			cemuLog_log(LogType::Force, "Vulkan: view format {} of a format {} image is outside its format list", (int)m_format, (int)texture->GetFormat());
+	}
 	m_uniqueId = VulkanRenderer::GetInstance()->GenUniqueId();
 }
 

@@ -50,12 +50,24 @@ bool LatteQueryObjectVk::getResult(uint64& numSamplesPassed)
 	return true;
 }
 
+// BotW-Native: fragments run inside render passes only (all draws are there), so beginning or ending a query no longer
+// splits a render pass: a fragment ends with its pass, and the next pass begins a new one
 void LatteQueryObjectVk::beginFragment()
 {
-	m_rendererVk->draw_endRenderPass();
+	if (!m_rendererVk->m_state.activeRenderpassFBO)
+		return;  // occlusionQuery_notifyBeginRenderPass
+	auto& resetIndices = m_rendererVk->m_occlusionQueries.list_resetIndices;
+	if (resetIndices.empty())
+	{
+		// No reset query left (resets happen outside render passes, see occlusionQuery_outsideRenderPass). Ending the
+		// pass here would leave the draw that is being set up outside any render pass: this pass goes uncounted and
+		// the next pass begins the fragment.
+		return;
+	}
 
 	handleFinishedFragments();
-	uint32 newQueryIndex = acquireQueryIndex();
+	uint32 newQueryIndex = resetIndices.back();
+	resetIndices.pop_back();
 
 	queryFragment qf{};
 	qf.queryIndex = newQueryIndex;
@@ -64,7 +76,6 @@ void LatteQueryObjectVk::beginFragment()
 	list_queryFragments.emplace_back(qf);
 
 
-	vkCmdResetQueryPool(m_rendererVk->m_state.currentCommandBuffer, m_rendererVk->m_occlusionQueries.queryPool, newQueryIndex, 1);
 	vkCmdBeginQuery(m_rendererVk->m_state.currentCommandBuffer, m_rendererVk->m_occlusionQueries.queryPool, newQueryIndex, VK_QUERY_CONTROL_PRECISE_BIT);
 	// todo - we already synchronize with command buffers, should we also set wait bits?
 
@@ -80,13 +91,11 @@ void LatteQueryObjectVk::begin()
 
 void LatteQueryObjectVk::endFragment()
 {
-	m_rendererVk->draw_endRenderPass();
-
 	cemu_assert_debug(m_hasActiveFragment);
 	uint32 queryIndex = list_queryFragments.back().queryIndex;
 	vkCmdEndQuery(m_rendererVk->m_state.currentCommandBuffer, m_rendererVk->m_occlusionQueries.queryPool, queryIndex);
-
-	vkCmdCopyQueryPoolResults(m_rendererVk->m_state.currentCommandBuffer, m_rendererVk->m_occlusionQueries.queryPool, queryIndex, 1, m_rendererVk->m_occlusionQueries.bufferQueryResults, queryIndex * sizeof(uint64), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+	// the result copy follows outside the render pass, still in this command buffer (occlusionQuery_outsideRenderPass)
+	m_rendererVk->m_occlusionQueries.list_pendingResultCopies.push_back(queryIndex);
 	list_queryFragments.back().m_finishCommandBuffer = m_rendererVk->GetCurrentCommandBufferId();
 	list_queryFragments.back().isFinished = true;
 	m_hasActiveFragment = false;
@@ -134,7 +143,10 @@ void LatteQueryObjectVk::end()
 	m_hasActiveQuery = false;
 	m_finishCommandBuffer = m_rendererVk->GetCurrentCommandBufferId();
 	m_rendererVk->m_occlusionQueries.m_lastCommandBuffer = m_finishCommandBuffer;
-	m_rendererVk->RequestSubmitSoon(); // make sure the current command buffer gets submitted soon
+	// BotW-Native: no RequestSubmitSoon. Every query end cut the command buffer within 10 draws, and every submit
+	// ends with the GPU drained (RADV waits for its query writes at command buffer end). The result still arrives
+	// with the submit at idle, the draw threshold or the present; a guest waiting on it submits at once
+	// (WaitCommandBufferFinished).
 	m_rendererVk->RequestSubmitOnIdle();
 }
 
@@ -200,13 +212,46 @@ void VulkanRenderer::occlusionQuery_updateState()
 void VulkanRenderer::occlusionQuery_notifyEndCommandBuffer()
 {
 	for (auto& it : m_occlusionQueries.list_currentlyActiveQueries)
-		if(it->m_hasActiveQuery)
+		if(it->m_hasActiveFragment)
 			it->endFragment();
+	occlusionQuery_outsideRenderPass();
 }
 
 void VulkanRenderer::occlusionQuery_notifyBeginCommandBuffer()
 {
+	occlusionQuery_outsideRenderPass();
+}
+
+void VulkanRenderer::occlusionQuery_notifyBeginRenderPass()
+{
 	for (auto& it : m_occlusionQueries.list_currentlyActiveQueries)
-		if (it->m_hasActiveQuery)
+		if (it->m_hasActiveQuery && !it->m_hasActiveFragment)
 			it->beginFragment();
+}
+
+// called before the render pass ends: a query begun inside a render pass must end inside it
+void VulkanRenderer::occlusionQuery_notifyEndRenderPass()
+{
+	for (auto& it : m_occlusionQueries.list_currentlyActiveQueries)
+		if (it->m_hasActiveFragment)
+			it->endFragment();
+}
+
+void VulkanRenderer::occlusionQuery_outsideRenderPass()
+{
+	auto& oq = m_occlusionQueries;
+	if (oq.queryPool == VK_NULL_HANDLE)
+		return;
+	for (uint16 i : oq.list_pendingResultCopies)
+		vkCmdCopyQueryPoolResults(m_state.currentCommandBuffer, oq.queryPool, i, 1, oq.bufferQueryResults, i * sizeof(uint64), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+	oq.list_pendingResultCopies.clear();
+	if (oq.list_resetIndices.size() >= 24)
+		return;
+	while (oq.list_resetIndices.size() < 64 && !oq.list_availableQueryIndices.empty())
+	{
+		const uint16 i = oq.list_availableQueryIndices.back();
+		oq.list_availableQueryIndices.pop_back();
+		vkCmdResetQueryPool(m_state.currentCommandBuffer, oq.queryPool, i, 1);
+		oq.list_resetIndices.push_back(i);
+	}
 }

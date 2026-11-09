@@ -10,6 +10,7 @@
 
 #include "../log.h"
 #include "../os.h"
+#include "telemetry.h"
 
 extern bool g_mute;
 
@@ -65,10 +66,12 @@ void push_tv(const int16_t* in, int frames, int channels) {
         }
         g_stereo[i * 2] = (int16_t)std::clamp((int)(l * vol), -32768, 32767);
         g_stereo[i * 2 + 1] = (int16_t)std::clamp((int)(r * vol), -32768, 32767);
-        g_sum_sq += (double)l * l;
     }
     g_frames_total += frames;
-    g_level_frames += frames;
+    if (telem::on()) {  // the level line is telemetry: no per-sample sum while it is off (and the mix loop stays vectorizable)
+        for (int i = 0; i < frames; i++) g_sum_sq += (double)g_stereo[i * 2] * g_stereo[i * 2];
+        g_level_frames += frames;
+    }
     if (g_level_frames >= 48000 * 10) {
         double rms = sqrt(g_sum_sq / g_level_frames) / 32768.0;
         LOG("audio: %.1f dBFS over the last 10 s", rms > 0 ? 20 * log10(rms) : -120.0);

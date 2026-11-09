@@ -33,6 +33,43 @@ class Image:
         self.import_at = {i.addr: i for i in r.imports}
         # relocation index: address being patched -> Reloc
         self.reloc_at = {x.offset: x for x in r.relocs}
+        # graphic pack (tools/gfxpack.py): code cave, its data ranges and its import calls
+        self.cave_lo = self.cave_hi = 0
+        self.data_ranges: list[tuple[int, int]] = []
+        self.extra_entries: set[int] = set()
+        self.cave_imports: dict[int, rpx.Import] = {}
+
+    def apply_pack(self, pack) -> None:
+        """Patch the game words and add the pack's code cave as code right after .text."""
+        cave = bytearray(pack.cave_hi - pack.cave_lo)
+        for a, w in pack.words.items():
+            if pack.cave_lo <= a < pack.cave_hi:
+                struct.pack_into(">I", cave, a - pack.cave_lo, w)
+                continue
+            buf, o = self._loc(a)
+            if buf is None:
+                raise ValueError(f"pack patch outside the image: {a:08x}")
+            struct.pack_into(">I", buf, o, w)
+            self.reloc_at.pop(a, None)  # the patched word no longer carries the original relocation
+        if pack.cave_hi > self.text_lo and pack.cave_lo < self.text_hi:
+            raise ValueError("pack cave overlaps .text")
+        self.secs[pack.cave_lo] = cave
+        self.starts = sorted(self.secs)
+        self.cave_lo, self.cave_hi = pack.cave_lo, pack.cave_hi
+        self.data_ranges = sorted(pack.data_ranges)
+        self.extra_entries = set(pack.entries)
+        by_name = {(i.lib, i.name): i for i in self.rpx.imports if not i.is_data}
+        for a, (lib, name) in pack.import_calls.items():
+            imp = by_name.get((lib, name)) or rpx.Import(lib, name, 0, False, -1)
+            self.cave_imports[a] = imp
+            # a REL24 marker, so analysis treats the bl like any other import call
+            self.reloc_at[a] = rpx.Reloc(a, 10, -1, 0, 0)
+
+    def is_data(self, addr: int) -> bool:
+        # called once per instruction in the analysis scans: everything below the cave is code
+        if not self.data_ranges or addr < self.data_ranges[0][0] or addr >= self.cave_hi:
+            return False
+        return any(lo <= addr < hi for lo, hi in self.data_ranges)
 
     def _loc(self, addr: int):
         i = bisect.bisect_right(self.starts, addr) - 1
@@ -51,7 +88,14 @@ class Image:
         return struct.unpack_from(">I", buf, o)[0]
 
     def is_text(self, addr: int) -> bool:
-        return self.text_lo <= addr < self.text_hi
+        return self.text_lo <= addr < self.text_hi or self.cave_lo <= addr < self.cave_hi
+
+    def code_ranges(self) -> list[tuple[int, int]]:
+        """.text, plus a graphic pack's code cave (Cemu's cave area, below .text) when one is applied."""
+        r = [(self.text_lo, self.text_hi)]
+        if self.cave_hi > self.cave_lo:
+            r.insert(0, (self.cave_lo, self.cave_hi))
+        return r
 
     def reloc_target(self, at: int) -> int | None:
         """S + A of the relocation patching address `at` (any type)."""
@@ -62,6 +106,8 @@ class Image:
         return (self.data_import_addr.get(r.sym, sym.value) + r.addend) & 0xFFFFFFFF
 
     def reloc_import(self, at: int):
+        if at in self.cave_imports:
+            return self.cave_imports[at]
         r = self.reloc_at.get(at)
         if r is None:
             return None

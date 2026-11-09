@@ -3,6 +3,8 @@
 #include "config/ActiveSettings.h"
 #include "Cafe/CafeSystem.h"
 
+extern "C" void botw_place_thread(int kind);  // runtime/src/thread.cpp core plan
+
 //#define BENCHMARK_TEXTURE_DECODING		// if defined, time it takes to decode textures will be measured and logged to log.txt
 
 #ifdef BENCHMARK_TEXTURE_DECODING
@@ -672,7 +674,9 @@ void LatteTextureLoader_UpdateTextureSliceData(LatteTexture* tex, uint32 sliceIn
 
 	// update texture data offsets and hashes
 	// this has to be done before the texture data is decoded & uploaded to prevent a race condition where updates during upload are missed
-	if (mipIndex == 0 || (tex->texDataPtrLow == 0 && tex->texDataPtrHigh == 0))
+	// BotW-Native: once per reload (slice 0 comes first): every slice gives the same range, and each reset hashed
+	// the whole texture again (an 83-slice terrain array was hashed 83 times per load)
+	if ((mipIndex == 0 && sliceIndex == 0) || (tex->texDataPtrLow == 0 && tex->texDataPtrHigh == 0))
 	{
 		tex->texDataPtrLow = physImagePtr + textureLoader.minOffsetOutdated; // always zero
 		tex->texDataPtrHigh = physImagePtr + textureLoader.maxOffsetOutdated; // currently set to surface size
@@ -691,6 +695,135 @@ void LatteTextureLoader_UpdateTextureSliceData(LatteTexture* tex, uint32 sliceIn
 	}
 	// clean up
 	g_renderer->texture_releaseTextureUploadBuffer(pixelData);
+	catchOpenGLError();
+}
+
+namespace
+{
+	// BotW-Native: helper threads for texture decoding, the calling (Latte) thread works along
+	class TextureDecodeTeam
+	{
+	public:
+		void run(size_t count, const std::function<void(size_t)>& fn)
+		{
+			{
+				std::lock_guard lock(m_mutex);
+				if (m_threads.empty())
+					for (int i = 0; i < kHelpers; i++)
+						m_threads.emplace_back([this] { helperLoop(); }).detach();
+				m_fn = &fn;
+				m_count = count;
+				m_next = 0;
+				m_busy = kHelpers;
+				m_generation++;
+			}
+			m_wake.notify_all();
+			work();
+			std::unique_lock lock(m_mutex);
+			m_idle.wait(lock, [this] { return m_busy == 0; });
+		}
+
+	private:
+		static constexpr int kHelpers = 3;  // Steam Deck: 4 cores, the game's own threads are mostly waiting during loads
+
+		void work()
+		{
+			for (size_t i; (i = m_next.fetch_add(1)) < m_count;)
+				(*m_fn)(i);
+		}
+
+		void helperLoop()
+		{
+#if defined(__linux__)
+			pthread_setname_np(pthread_self(), "TexDecode");
+			botw_place_thread(0);  // created by LatteThread: off the GPU pair's core (runtime/src/thread.cpp)
+#endif
+			uint64 seen = 0;
+			std::unique_lock lock(m_mutex);
+			while (true)
+			{
+				m_wake.wait(lock, [&] { return m_generation != seen; });
+				seen = m_generation;
+				lock.unlock();
+				work();
+				lock.lock();
+				if (--m_busy == 0)
+					m_idle.notify_one();
+			}
+		}
+
+		std::mutex m_mutex;
+		std::condition_variable m_wake, m_idle;
+		std::vector<std::thread> m_threads;
+		const std::function<void(size_t)>* m_fn{};
+		size_t m_count{};
+		std::atomic<size_t> m_next{};
+		int m_busy{};
+		uint64 m_generation{};
+	};
+	TextureDecodeTeam* s_textureDecodeTeam = new TextureDecodeTeam();  // never destroyed: the helpers run until exit
+}
+
+// BotW-Native: LatteTextureLoader_UpdateTextureSliceData for the (slice, mip) list of one texture load. Large loads
+// (BotW streams 83-slice terrain arrays, ~900 slices and mips each) are decoded on several threads into one buffer,
+// then handed to the renderer in the original order; anything unusual takes the one-by-one path.
+void LatteTextureLoader_UpdateTextureSlices(LatteTexture* tex, const std::vector<std::pair<uint32, uint32>>& sliceMips)
+{
+	auto oneByOne = [&] {
+		for (auto [s, mip] : sliceMips)
+			LatteTextureLoader_UpdateTextureSliceData(tex, s, mip, tex->physAddress, tex->physMipAddress, tex->dim, tex->width, tex->height, tex->depth, tex->mipLevels, tex->pitch, tex->tileMode, tex->swizzle, true);
+	};
+	TextureDecoder* texDecoder = g_renderer->texture_chooseDecodedFormat(tex->format, tex->isDepth, tex->dim, tex->width, tex->height);
+	if (sliceMips.size() < 4 || !texDecoder || ActiveSettings::DumpTexturesEnabled() || tex->overwriteInfo.hasFormatOverwrite || tex->overwriteInfo.hasResolutionOverwrite)
+	{
+		oneByOne();
+		return;
+	}
+	std::vector<LatteTextureLoaderCtx> ctx(sliceMips.size());
+	std::vector<size_t> offset(sliceMips.size() + 1);
+	std::vector<uint32> imageSize(sliceMips.size());
+	for (size_t i = 0; i < sliceMips.size(); i++)
+	{
+		LatteTextureLoaderCtx& c = ctx[i];
+		c = {};
+		LatteTextureLoader_begin(&c, sliceMips[i].first, sliceMips[i].second, tex->physAddress, tex->physMipAddress, tex->format, tex->dim, tex->width, tex->height, tex->depth, tex->mipLevels, tex->pitch, tex->tileMode, tex->swizzle);
+		c.decodedTexelCountX = texDecoder->getTexelCountX(&c);
+		c.decodedTexelCountY = texDecoder->getTexelCountY(&c);
+		imageSize[i] = texDecoder->calculateImageSize(&c);
+		offset[i + 1] = offset[i] + ((imageSize[i] + 63) & ~(size_t)63);
+	}
+	if (offset.back() < 256 * 1024)
+	{
+		oneByOne();
+		return;
+	}
+	if (tex->isDataDefined == false)
+	{
+		tex->AllocateOnHost();
+		tex->isDataDefined = true;
+	}
+	// change tracking is reset before decoding, as in LatteTextureLoader_UpdateTextureSliceData
+	for (size_t i = 0; i < sliceMips.size(); i++)
+	{
+		if ((sliceMips[i] == std::pair<uint32, uint32>(0, 0)) || (tex->texDataPtrLow == 0 && tex->texDataPtrHigh == 0))
+		{
+			tex->texDataPtrLow = tex->physAddress + ctx[i].minOffsetOutdated;
+			tex->texDataPtrHigh = tex->physAddress + ctx[i].maxOffsetOutdated;
+			LatteTC_ResetTextureChangeTracker(tex, true);
+			break;
+		}
+	}
+	static std::unique_ptr<uint8[]> s_buffer;  // Latte thread only
+	static size_t s_bufferSize = 0;
+	if (s_bufferSize < offset.back())
+	{
+		s_bufferSize = offset.back();
+		s_buffer.reset(new uint8[s_bufferSize]);
+	}
+	uint8* buffer = s_buffer.get();
+	s_textureDecodeTeam->run(sliceMips.size(), [&](size_t i) { texDecoder->decode(&ctx[i], buffer + offset[i]); });
+	for (size_t i = 0; i < sliceMips.size(); i++)
+		LatteTextureLoader_loadTextureDataIntoSlice(tex, ctx[i].width, ctx[i].height, tex->depth, tex->mipLevels, buffer + offset[i], sliceMips[i].first, sliceMips[i].second, imageSize[i]);
 	catchOpenGLError();
 }
 

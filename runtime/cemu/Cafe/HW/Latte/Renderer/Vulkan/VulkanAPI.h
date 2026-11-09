@@ -202,6 +202,8 @@ VKFUNC_DEVICE(vkCmdResetQueryPool);
 VKFUNC_DEVICE(vkCmdBeginQuery);
 VKFUNC_DEVICE(vkCmdEndQuery);
 VKFUNC_DEVICE(vkCmdCopyQueryPoolResults);
+VKFUNC_DEVICE(vkCmdWriteTimestamp);    // telemetry: GPU time per command buffer
+VKFUNC_DEVICE(vkGetQueryPoolResults);
 
 // event
 VKFUNC_DEVICE(vkCreateEvent);

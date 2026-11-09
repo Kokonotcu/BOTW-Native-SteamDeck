@@ -133,7 +133,9 @@ public:
 		if (m_threadsActive.exchange(true))
 			return;
 		// create thread pool
-		const uint32 threadCount = 2;
+		// BotW-Native: physical cores - 1 (2..4) instead of 2: a cold shader cache (a new build, a new device) compiles
+		// thousands of shaders behind the loading screen; at run time the pool only works when a new shader appears
+		const uint32 threadCount = std::clamp<uint32>(GetPhysicalCoreCount(), 3u, 5u) - 1;
 		for (uint32 i = 0; i < threadCount; ++i)
 			s_threads.emplace_back(&_ShaderVkThreadPool::CompilerThreadFunc, this);
 	}

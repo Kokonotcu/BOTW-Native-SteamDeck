@@ -31,3 +31,6 @@ ios/assets/Assets.xcassets/AppIcon.appiconset/*.png
 *.sbfres
 *.bfres
 keys.txt
+
+# old generated-code snapshots
+generated_*/

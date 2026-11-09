@@ -25,6 +25,7 @@
 #include "loader.h"
 #include "os.h"
 #include "settings.h"
+#include "telemetry.h"
 #include "thread.h"
 #include "host/window.h"
 #include "latte/latte.h"
@@ -56,6 +57,10 @@ static std::string default_user_root() {
 #if defined(__linux__) && defined(ENABLE_VULKAN)
 int BreathOfTheWildChildProcessMain();
 #endif
+#if defined(__linux__)
+void hugetext_init();
+#endif
+void install_sleeper_calc();  // thread.cpp
 
 extern "C" PPC_NORETURN void rt_fatal_exit(void) {
     fflush(stderr);
@@ -134,7 +139,10 @@ int main(int argc, char** argv) {
     else g_user_root = default_user_root();
     std::error_code ec;
     std::filesystem::create_directories(g_user_root, ec);
-    log_set_file((g_user_root + "/runtime.log").c_str());
+    if (log_enabled()) {
+        std::filesystem::rename(g_user_root + "/runtime.log", g_user_root + "/runtime.prev.log", ec);  // keep the last run's log
+        log_set_file((g_user_root + "/runtime.log").c_str());
+    }
 #if defined(_WIN32)
     LOG("BotW Recompiled for Windows (Vulkan)");
 #elif defined(__APPLE__)
@@ -213,6 +221,9 @@ int main(int argc, char** argv) {
     });
 #endif
 
+#if defined(__linux__)
+    hugetext_init();
+#endif
     mem::init();
     dispatch::init();
     // The renderer does not need the game. Bring the device and swapchain up first so a machine
@@ -246,6 +257,7 @@ int main(int argc, char** argv) {
         []() { dispatch::restore_fn_overrides(); },
     });
     mods::apply_patches();
+    install_sleeper_calc();  // thread.cpp: the Sleeper thread's 250 us poll
     os::init();
     if (g_render_scale <= 0) {  // render at the display's native resolution, so fullscreen is 1:1
         int dw, dh;
@@ -258,6 +270,8 @@ int main(int argc, char** argv) {
     if (capture_every) latte::set_capture(capture_every, (g_user_root + "/captures").c_str());
 
     bench::start();
+    telem::set_root(g_user_root.c_str());  // the menu switch can start a session at any time
+    if (settings::get().telemetry) telem::start();  // menu: Graphics > Telemetry
     uint32_t argv_g = os::build_argv("U-King.rpx");
     threads::start_main(loader::main_module().entry, 1, argv_g, loader::main_module().stack_size);
     os::host_main_loop();  // returns when the game exits or the time limit is reached

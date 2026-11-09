@@ -76,6 +76,7 @@
 #include "WindowSystem.h"
 #include "config/CemuConfig.h"
 #include "../src/latte/latte.h"
+#include "telemetry.h"
 
 #ifdef ENABLE_METAL
 #include "Cafe/HW/Latte/Renderer/Metal/LatteTextureMtl.h"
@@ -191,7 +192,7 @@ void __GX2NotifyEvent(GX2CallbackEventType e) {
         uint64 f = ++g_frames;
         window::on_frame(f);
         if (g_capture_every && f % g_capture_every == 0) g_capture_pending = f;
-        if (f % 300 == 0) log_write("frame %llu", (unsigned long long)f);
+        if (telem::on() && f % 300 == 0) log_write("frame %llu", (unsigned long long)f);  // progress line: telemetry
         std::lock_guard<std::mutex> l(g_sync_lock);
         g_flip_cv.notify_all();
     }

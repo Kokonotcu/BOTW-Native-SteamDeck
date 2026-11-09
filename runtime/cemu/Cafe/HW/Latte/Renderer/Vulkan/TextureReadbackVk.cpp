@@ -50,6 +50,25 @@ void LatteTextureReadbackInfoVk::StartTransfer()
 	const auto renderer = VulkanRenderer::GetInstance();
 	renderer->draw_endRenderPass();
 
+	VkImageSubresource sub{region.imageSubresource.aspectMask, region.imageSubresource.mipLevel, region.imageSubresource.baseArrayLayer};
+	if (baseTexture->GetImageLayout(sub) == VK_IMAGE_LAYOUT_GENERAL)
+	{
+		// BotW-Native: copy in GENERAL like the other image copies, with one barrier before (every earlier write,
+		// transfers included) and one after (the image's next writes and the host read), instead of five barriers
+		// and two layout changes
+		VkCommandBuffer cmd = renderer->getCurrentCommandBuffer();
+		VkMemoryBarrier pre{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &pre, 0, nullptr, 0, nullptr);
+		vkCmdCopyImageToBuffer(cmd, baseTexture->GetImageObj()->m_image, VK_IMAGE_LAYOUT_GENERAL, m_buffer, 1, &region);
+		VkMemoryBarrier post{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &post, 0, nullptr, 0, nullptr);
+		m_associatedCommandBufferId = renderer->GetCurrentCommandBufferId();
+		m_textureView = nullptr;
+		renderer->RequestSubmitSoon();
+		renderer->RequestSubmitOnIdle();
+		return;
+	}
+
 	renderer->barrier_image<VulkanRenderer::ANY_TRANSFER | VulkanRenderer::IMAGE_WRITE, VulkanRenderer::TRANSFER_READ>(baseTexture, region.imageSubresource, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
 	renderer->barrier_sequentializeTransfer();

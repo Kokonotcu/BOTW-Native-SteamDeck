@@ -96,14 +96,16 @@ class Analyzer:
         img = self.img
         lo, hi = img.text_lo, img.text_hi
         self.entries.add(img.rpx.entry)
+        self.entries.update(img.extra_entries)  # graphic pack cave functions (bla/ba targets from game code)
+        code = [a for r_lo, r_hi in img.code_ranges() for a in range(r_lo, r_hi, 4) if not img.is_data(a)]
         # switch tables first so their bases are not mistaken for functions
-        for a in range(lo, hi, 4):
+        for a in code:
             i = self.insn(a)
             if i.op == "bcctr" and not i.LK:
                 sw = self.find_switch(a)
                 if sw:
                     self.switch_bases.add(sw.table)
-        for a in range(lo, hi, 4):
+        for a in code:
             i = self.insn(a)
             if i.op == "b" and i.LK and not i.AA:
                 if img.reloc_at.get(a) is not None:
@@ -218,17 +220,18 @@ class Analyzer:
         covered = set()
         for f in self.functions.values():
             covered.update(f.insns)
-        a, hi = self.img.text_lo, self.img.text_hi
         self.gap_functions = 0
-        while a < hi:
-            if a not in covered and a not in self.switch_bases:
-                i = self.insn(a)
-                if self.img.u32(a) != 0 and i.op != "illegal":
-                    self.entries.add(a)
-                    f = self.walk(a)
-                    self.functions[a] = f
-                    covered.update(f.insns)
-                    self.gap_functions += 1
-            a += 4
+        for lo, hi in self.img.code_ranges():
+            a = lo
+            while a < hi:
+                if a not in covered and a not in self.switch_bases and not self.img.is_data(a):
+                    i = self.insn(a)
+                    if self.img.u32(a) != 0 and i.op != "illegal":
+                        self.entries.add(a)
+                        f = self.walk(a)
+                        self.functions[a] = f
+                        covered.update(f.insns)
+                        self.gap_functions += 1
+                a += 4
         if progress:
             print(f"[recomp 2/4] Analyzed {len(self.functions)} PowerPC functions ({self.n_discovered} discovered, {self.gap_functions} gap)", flush=True)

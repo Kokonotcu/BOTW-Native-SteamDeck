@@ -9,6 +9,10 @@
 #include "guest_table.h"
 #include "hle.h"
 
+// generated/gfxpack_data.cpp (empty table without a pack; runtime/src/guest_stub.cpp builds have none)
+extern "C" const unsigned g_gfxpack_cave_lo, g_gfxpack_cave_hi, g_gfxpack_word_count;
+extern "C" const unsigned g_gfxpack_words[][2];
+
 namespace loader {
 namespace {
 Module g_main;
@@ -204,6 +208,12 @@ bool load_main(const std::string& path) {
         path.c_str(), g_main.entry, g_main.text_start, g_main.text_end, g_main.data_end, g_main.sda_base,
         g_main.sda2_base, g_main.stack_size, g_main.tls_module, g_main.tls_size, nrel,
         missing_data ? " (missing data imports!)" : "");
+    // graphic pack (tools/gfxpack.py, generated/gfxpack_data.cpp): the same words the recompiled code was built
+    // with, after relocation so they win - data patches and the code cave's variables live in guest memory
+    if (g_gfxpack_cave_hi > g_gfxpack_cave_lo) mem::commit(g_gfxpack_cave_lo, g_gfxpack_cave_hi - g_gfxpack_cave_lo, true);
+    for (uint32_t i = 0; i < g_gfxpack_word_count; i++) mem::w32(g_gfxpack_words[i][0], g_gfxpack_words[i][1]);
+    if (g_gfxpack_word_count)
+        LOG("loader: graphic pack %u words, cave %08x-%08x", g_gfxpack_word_count, g_gfxpack_cave_lo, g_gfxpack_cave_hi);
     return true;
 }
 }  // namespace loader

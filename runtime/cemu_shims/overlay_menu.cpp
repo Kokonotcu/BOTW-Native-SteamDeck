@@ -4,6 +4,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <pthread.h>
 
 #include <atomic>
@@ -13,8 +14,10 @@
 #include "../src/host/touch_draw.h"
 #include "../src/bench/bench.h"
 #include "../src/settings.h"
+#include "../include/swkbd_host.h"
 #include "Cafe/HW/Latte/Core/LatteOverlay.h"
 #include "title_diag.h"
+#include "telemetry.h"
 
 void log_write(const char* fmt, ...);
 namespace threads {
@@ -35,10 +38,20 @@ void LatteOverlay_updateStats(double fps, sint32 drawcalls, sint32 fastDrawcalls
     g_draws = drawcalls;
     bench::on_stats(drawcalls);
     static int n = 0;
-    if (fps > 0 && (n++ % 5) == 0)
+    if (telem::on() && fps > 0 && (n++ % 5) == 0)  // a telemetry line: off with the menu switch
         log_write("[gpu] %.1f fps, %d draws/frame (%d fast); main thread waits: %s", fps, drawcalls, fastDrawcalls,
                   threads::main_wait_report().c_str());
     title_diag_log();
+}
+
+// BotW-Native: false when LatteOverlay_render would draw nothing (no FPS counter, menu closed, no touch buttons):
+// the caller then skips the whole ImGui frame and its render pass on the swapchain image (a full-screen load +
+// store every frame, plus ImGui::NewFrame on the GPU thread). BOTW_IMGUI_ALWAYS=1 keeps the old every-frame pass.
+bool LatteOverlay_hasContent(bool padView) {
+    static const bool always = getenv("BOTW_IMGUI_ALWAYS") && atoi(getenv("BOTW_IMGUI_ALWAYS")) != 0;
+    if (always) return true;
+    if (padView) return false;
+    return settings::get().show_fps || menu::is_open() || touch::draw_state().visible || swkbd::active();
 }
 
 void LatteOverlay_render(bool padView) {
@@ -72,6 +85,22 @@ void LatteOverlay_render(bool padView) {
         if (ImGui::Begin("##fps", nullptr, overlay | ImGuiWindowFlags_NoInputs)) {
             ImGui::SetWindowFontScale(ui);
             ImGui::Text("%.0f fps  %d draws", (double)g_fps, (int)g_draws);
+        }
+        ImGui::End();
+    }
+
+    // the game's text entry (swkbd.rpl): its text box; the typing comes from the Steam Deck keyboard (window.cpp)
+    if (swkbd::active()) {
+        ImGui::SetNextWindowPos({io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.1f}, ImGuiCond_Always, {0.5f, 0.0f});
+        ImGui::SetNextWindowSizeConstraints({io.DisplaySize.x * 0.5f, 0}, {io.DisplaySize.x * 0.9f, io.DisplaySize.y});
+        ImGui::SetNextWindowBgAlpha(0.9f);
+        if (ImGui::Begin("##swkbd", nullptr, overlay | ImGuiWindowFlags_NoInputs)) {
+            ImGui::SetWindowFontScale(ui * 1.8f);
+            const bool caret = (int)(ImGui::GetTime() * 2.0) % 2 == 0;
+            const std::string t = swkbd::text() + (caret ? "|" : " ");
+            ImGui::TextUnformatted(t.c_str());
+            ImGui::SetWindowFontScale(ui * 0.95f);
+            ImGui::TextDisabled("Type with the Steam keyboard   Start / Enter: OK   B: delete   Y: show the keyboard again");
         }
         ImGui::End();
     }

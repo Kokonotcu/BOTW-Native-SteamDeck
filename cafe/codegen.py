@@ -5,9 +5,179 @@ are emitted in address order with a `#line <address>` marker each (host crash ba
 symbolize to guest addresses), labels only where something branches. Semantics follow the Cemu
 interpreter (src/Cafe/HW/Espresso/Interpreter), including its paired-single rounding rules.
 """
+import bisect
+import os
+import re
+
 from . import ppc
 from .analyze import Function, bo_always
 from .image import Image
+from .regctx import ALL_HELD, Sync
+
+# Condition register in locals. A function keeps the CR bits it uses in `cr_` (registers, after clang's SROA),
+# so a compare feeding a branch is a compare and a jump instead of four byte stores to the context. c->cr is
+# synced wherever code outside the function can see it: the bits the function writes are stored before calls,
+# returns, tail calls, traps, hooks and probes; the bits it uses are reloaded after calls, hooks and probes.
+_RE_TAIL = re.compile(r"\[\[clang::musttail\]\] return f_[0-9a-f]{8}\(c\);")
+_RE_CALL = re.compile(r"(?<!return )\bf_[0-9a-f]{8}\(c\);")
+_RE_HLE_CALL = re.compile(r"HLE_CALL\([^;]*\);")
+_RE_RT_CALL = re.compile(r"rt_call\(c, [^;]*\);")
+_RE_HOST = re.compile(r"(?:hook_0x[0-9a-f]{8}|rt_probe)\(c[^;]*\);")
+_RE_LEAVE = re.compile(r"HLE_TAIL\([^;]*\);|RETURN\(\);|rt_trap\(c, [^;]*\);|rt_bad_switch\(c, [^;]*\);")
+_RE_CR_WRITE_FIELD = re.compile(r"crl_[suf]\(cr_, c, (\d+),")
+_RE_CR_WRITE_BIT = re.compile(r"cr_\[(\d+)\] = ")
+_RE_CR_BIT = re.compile(r"cr_\[(\d+)\]")
+
+
+def local_cr(prologue: list[str], body: list[str]) -> list[str]:
+    """Rewrites one function's body (lines after the prologue) to keep CR bits in locals; see above."""
+    if os.environ.get("BOTW_LOCAL_CR", "1") == "0":
+        return prologue + body
+    text = "\n".join(body)
+    text = (text.replace("c->cr[", "cr_[").replace("set_cr_s(c, ", "crl_s(cr_, c, ")
+            .replace("set_cr_u(c, ", "crl_u(cr_, c, ").replace("set_cr_f(c, ", "crl_f(cr_, c, ")
+            .replace("CR0(", "CRL0(").replace("ppc_stwcx(c, ", "ppc_stwcx_cr(cr_, c, "))
+    written: set[int] = set()
+    for f in _RE_CR_WRITE_FIELD.findall(text):
+        written.update(range(4 * int(f), 4 * int(f) + 4))
+    if "CRL0(" in text or "ppc_stwcx_cr(" in text:
+        written.update(range(4))
+    written.update(int(b) for b in _RE_CR_WRITE_BIT.findall(text))
+    used = written | {int(b) for b in _RE_CR_BIT.findall(text)}
+    if not used:
+        return prologue + body
+    store = " ".join(f"c->cr[{b}] = cr_[{b}];" for b in sorted(written))
+    load = " ".join(f"cr_[{b}] = c->cr[{b}];" for b in sorted(used))
+    # A called guest function never reads the volatile fields cr0 and cr5-cr7 (EABI: scratch, set before use), so
+    # calls skip storing them; cr1 (bit 6 flags float varargs) and the saved fields cr2-cr4 are still stored.
+    # Tail calls, HLE calls, hooks and returns keep the full store. BOTW_CALL_CR_ALL=1 stores every bit.
+    # Returns skip them too: the caller does not read cr0/cr5-cr7 after a call before setting them.
+    store_call = store
+    if os.environ.get("BOTW_CALL_CR_ALL", "0") != "1":
+        store_call = " ".join(f"c->cr[{b}] = cr_[{b}];" for b in sorted(written) if 4 <= b < 20)
+    text = _RE_TAIL.sub(lambda m: f"{{ {store} {m.group(0)} }}", text)
+    text = _RE_CALL.sub(lambda m: f"{{ {store_call} {m.group(0)} {load} }}", text)
+    text = _RE_HLE_CALL.sub(lambda m: f"{{ {store} {m.group(0)} {load} }}", text)
+    text = _RE_RT_CALL.sub(lambda m: f"{store_call} {m.group(0)} {load}", text)
+    text = _RE_HOST.sub(lambda m: f"{{ {store} {m.group(0)} {load} }}", text)
+    text = _RE_LEAVE.sub(lambda m: f"{{ {store_call if m.group(0) == 'RETURN();' else store} {m.group(0)} }}", text)
+    return prologue + [f"  uint8_t cr_[32]; {load}"] + text.split("\n")
+
+
+# Registers in locals. By the PowerPC EABI a callee never reads the caller's r0/r11/r12/f0/f9-f13/ctr (scratch,
+# not arguments) and preserves r1 and r14-r31/f14-f31 (cafe/../scratch abi_audit.py checks the first over every
+# function). So a function keeps those in C locals: clang holds them in host registers across calls instead of
+# storing every change to c before a call and reloading after it. r1 is written through (see local_regs). Hooks, probes and traps see
+# (and hooks/probes may change) every register: all written locals are stored before them and reloaded after.
+# Argument/return registers r3-r10/f1-f8 and r2/r13 stay in c. BOTW_LOCAL_REGS=0 = everything in c.
+_LOCAL_GPR = frozenset([0, 1, 11, 12] + list(range(14, 32)))
+_LOCAL_FPR = frozenset([0] + list(range(9, 32)))
+_GPR_NV = frozenset(f"r{n}" for n in range(14, 32))
+_RE_GPR = re.compile(r"c->r\[(\d+)\]")
+_RE_FPR = re.compile(r"c->(f|ps1)\[(\d+)\]")
+_RE_LOCAL_WRITE = re.compile(r"\b(r|f|p)(\d+)_ (?:=|\|=)(?!=)|\b(ctr)_(?: =(?!=)|--)")
+
+
+def local_regs(prologue: list[str], body: list[str], keep=frozenset(), sync=None,
+               exp=frozenset()) -> tuple[list[str], list[str]]:
+    """Rewrites one function to keep the registers above in locals; returns (prologue, body). keep: registers
+    ("r0", "f12", "ctr"...) this function keeps in the context. Registers exchanged with a caller or callee outside
+    the EABI (cafe/regctx.py) are synced at the exchange: sync {callee entry: Sync} (before a call or tail call the
+    callee's li|exp are stored, after a call its exp reloaded), exp: what this function delivers (stored at exits)."""
+    if os.environ.get("BOTW_LOCAL_REGS", "1") == "0":
+        return prologue, body
+    text = "\n".join(body)
+    sync = sync or {}
+    callees = {int(t, 16) for t in _RE_CALLEE.findall(text)}
+    carried = set(exp)  # registers this function passes on: a local even when its own code never names it
+    for t in callees:
+        s = sync.get(t)
+        if s is not None:
+            carried |= s.li | s.exp
+    local_gpr = {n for n in _LOCAL_GPR if f"r{n}" not in keep}
+    local_fpr = {n for n in _LOCAL_FPR if f"f{n}" not in keep}
+    gprs = sorted(({int(n) for n in _RE_GPR.findall(text)} | {int(x[1:]) for x in carried if x[0] == "r"})
+                  & local_gpr)
+    fprs = sorted(({int(n) for _, n in _RE_FPR.findall(text)} | {int(x[1:]) for x in carried if x[0] == "f"})
+                  & local_fpr)
+    ctr = ("c->ctr" in text or "ctr" in carried) and "ctr" not in keep
+    if not gprs and not fprs and not ctr:
+        return prologue, body
+    text = _RE_GPR.sub(lambda m: f"r{m.group(1)}_" if int(m.group(1)) in local_gpr else m.group(0), text)
+    text = _RE_FPR.sub(lambda m: (("f" if m.group(1) == "f" else "p") + f"{m.group(2)}_")
+                       if int(m.group(2)) in local_fpr else m.group(0), text)
+    if ctr:
+        text = text.replace("c->ctr", "ctr_")
+    written = set()
+    for m in _RE_LOCAL_WRITE.finditer(text):
+        written.add("ctr" if m.group(3) else f"{'f' if m.group(1) == 'p' else m.group(1)}{m.group(2)}")
+    written.update(f"f{n}" for n in re.findall(r"psq_load(?:_f32)?r\(f(\d+)_,", text))  # by reference
+    decl = []
+    store_all, load_all = [], []
+    for n in gprs:
+        decl.append(f"uint32_t r{n}_ = c->r[{n}];")
+        load_all.append(f"r{n}_ = c->r[{n}];")
+        store_all.append(f"c->r[{n}] = r{n}_;")
+    for n in fprs:
+        decl.append(f"double f{n}_ = c->f[{n}], p{n}_ = c->ps1[{n}];")
+        load_all.append(f"f{n}_ = c->f[{n}]; p{n}_ = c->ps1[{n}];")
+        store_all.append(f"c->f[{n}] = f{n}_; c->ps1[{n}] = p{n}_;")
+    if ctr:
+        decl.append("uint32_t ctr_ = c->ctr;")
+        load_all.append("ctr_ = c->ctr;")
+        store_all.append("c->ctr = ctr_;")
+    # every local, written or not: since the entry load a callee may have stored another value to c
+    sa, la = " ".join(store_all), " ".join(load_all)
+    # r1 is written through to c (a few writes per function: prologue, epilogue), so calls need no store and
+    # direct calls no reload: a callee restores r1 and writes it through too. The GHS prologue helpers that return
+    # with r1 moved are only called from functions that keep every register in c (cafe/regctx.py ALL_HELD).
+    # HLE and indirect calls still reload it (cheap there, and an HLE longjmp may set it).
+    if 1 in gprs:
+        text = re.sub(r"\br1_ (?:=|\|=)(?!=)[^;]*;", lambda m: m.group(0) + " c->r[1] = r1_;", text)
+    sp_load = "r1_ = c->r[1];" if 1 in gprs else ""
+
+    def wrap(m: re.Match, before: str, after: str = "") -> str:
+        if not before and not after:
+            return m.group(0)
+        return "{ " + " ".join(x for x in (before, m.group(0), after) if x) + " }"
+
+    def st(names) -> str:  # store the locals among names to c
+        out = [f"c->r[{x[1:]}] = {x}_;" for x in sorted(names) if x[0] == "r" and int(x[1:]) in gprs]
+        out += [f"c->f[{x[1:]}] = {x}_; c->ps1[{x[1:]}] = p{x[1:]}_;" for x in sorted(names)
+                if x[0] == "f" and int(x[1:]) in fprs]
+        if ctr and "ctr" in names:
+            out.append("c->ctr = ctr_;")
+        return " ".join(out)
+
+    def ld(names) -> str:  # reload the locals among names from c
+        out = [f"{x}_ = c->r[{x[1:]}];" for x in sorted(names) if x[0] == "r" and int(x[1:]) in gprs]
+        out += [f"{x}_ = c->f[{x[1:]}]; p{x[1:]}_ = c->ps1[{x[1:]}];" for x in sorted(names)
+                if x[0] == "f" and int(x[1:]) in fprs]
+        if ctr and "ctr" in names:
+            out.append("ctr_ = c->ctr;")
+        return " ".join(out)
+
+    _none = Sync(False, frozenset(), frozenset())
+
+    def callee(m: re.Match):
+        return sync.get(int(_RE_CALLEE.search(m.group(0)).group(1), 16), _none)
+
+    st_exp = st(exp)
+    # an indirect call's target is unknown: it gets the scratch registers this function wrote, in case it reads one
+    sp_ind = st(written & {"r0", "r11", "r12", "f0", "f9", "f10", "f11", "f12", "f13", "ctr"})
+    text = _RE_HOST.sub(lambda m: wrap(m, sa, la), text)
+    text = _RE_TRAP.sub(lambda m: wrap(m, sa), text)
+    text = _RE_HLE_CALL.sub(lambda m: wrap(m, "", sp_load), text)
+    text = _RE_RT_CALL.sub(lambda m: wrap(m, sp_ind, sp_load), text)
+    text = _RE_TAIL.sub(lambda m: wrap(m, st(callee(m).li | callee(m).exp | exp)), text)
+    text = _RE_CALL.sub(lambda m: wrap(m, st(callee(m).li | callee(m).exp), ld(callee(m).exp)), text)
+    text = _RE_RETURN.sub(lambda m: wrap(m, st_exp), text)
+    return prologue + ["  " + " ".join(decl)], text.split("\n")
+
+
+_RE_CALLEE = re.compile(r"\bf_([0-9a-f]{8})\(c\);")
+_RE_TRAP = re.compile(r"rt_trap\(c, [^;]*\);|rt_bad_switch\(c, [^;]*\);")
+_RE_RETURN = re.compile(r"HLE_TAIL\([^;]*\);|RETURN\(\);|RETURN_TAIL\(\);")
 
 
 def R(n: int) -> str:
@@ -42,7 +212,17 @@ class Generator:
         self.imports_used: dict[str, tuple[str, str]] = {}  # hle symbol -> (lib, name)
         self.probes: set[int] = set()
         self.hooks: set[int] = set()  # host hook_0xADDR(c) runs after the (non-branch) instruction at ADDR
+        self.natives: set[int] = set()  # host f_ADDR replaces the function; the recompiled one is emitted as f_ADDR_guest
         self.check_returns = True
+        self.outer_back_edges: set[tuple[int, int]] = set()  # of the function being generated
+        self.spin_back_edges: set[tuple[int, int]] = set()  # of the function being generated
+        self.regctx: dict[int, Sync] = {}  # cafe/regctx.py: registers exchanged at entry/exit, or all in c
+        self.keep: frozenset = frozenset()  # of the function being generated
+        # TEST: registers every function keeps in the context (BOTW_KEEP_REGS="r0,r11,ctr,..."), for bisecting
+        self.keep_all = frozenset(x for x in os.environ.get("BOTW_KEEP_REGS", "").split(",") if x)
+        self.prologue_saves: set[int] = set()  # of the function being generated (find_prologue_saves)
+        rng = os.environ.get("BOTW_LOCAL_RANGE", "")  # TEST: "lo:hi" hex
+        self.local_range = tuple(int(x, 16) for x in rng.split(":")) if rng else None
 
     # ---- branch conditions --------------------------------------------------------------
     def cond(self, i: ppc.Insn, pre: list[str]) -> str | None:
@@ -71,15 +251,79 @@ class Generator:
     def ret(self) -> str:
         return "RETURN();"
 
+    def jump(self, a: int, t: int) -> str:
+        # The back-edge of an outermost loop is where a background thread hands its emulated core to a
+        # waiting higher-priority thread (the console preempts anywhere; the runtime only at these points).
+        # Inner loops skip the check: they are the hot ones and end within one outer iteration.
+        # A loop that stores nothing to guest memory may be a spin-wait on a word another thread changes. Guest
+        # loads are plain C loads, so clang may keep such a word in a register across iterations (a racing
+        # non-atomic read may be assumed unchanged) and spin forever: a compiler barrier at its back-edge makes
+        # every iteration read memory again (no instruction emitted).
+        bar = "PPC_MEM_BARRIER(); " if (t, a) in self.spin_back_edges else ""
+        pre = "PREEMPT_POINT(); " if (t, a) in self.outer_back_edges else ""
+        return f"{bar}{pre}goto L_{t:08x};"
+
+    @staticmethod
+    def find_spin_back_edges(fn: Function) -> set[tuple[int, int]]:
+        """Back-edges (head t, branch at a) whose loop body t..a has no store to guest memory."""
+        backs = [(i.target, a) for a, i in fn.insns.items()
+                 if i.op in ("b", "bc") and not i.LK and i.target is not None and i.target <= a and i.target in fn.insns]
+        stores = sorted(x for x, i in fn.insns.items() if i.op.startswith(("st", "psq_st")) or i.op in ("dcbz", "dcbz_l"))
+        out = set()
+        for t, a in backs:
+            k = bisect.bisect_left(stores, t)
+            if k == len(stores) or stores[k] > a:
+                out.add((t, a))
+        return out
+
+    @staticmethod
+    def find_outer_back_edges(fn: Function) -> set[tuple[int, int]]:
+        backs = [(i.target, a) for a, i in fn.insns.items()
+                 if i.op in ("b", "bc") and not i.LK and i.target is not None and i.target <= a and i.target in fn.insns]
+        # a loop (head t, back-edge at a) is enclosed when another loop starts before it and ends at or after it
+        return {(t, a) for t, a in backs if not any(t2 < t and a2 >= a for t2, a2 in backs)}
+
+    def find_prologue_saves(self, fn: Function) -> set[int]:
+        """stmw rN,d(r1) (N >= 14) in the straight-line entry block before any write of rN..r31: the save of the
+        caller's registers, droppable when all of them are locals. Empty with BOTW_LOCAL_REGS=0/BOTW_KEEP_SAVES=1."""
+        if os.environ.get("BOTW_LOCAL_REGS", "1") == "0" or os.environ.get("BOTW_KEEP_SAVES", "0") == "1":
+            return set()
+        written: set[int] = set()
+        a = fn.entry
+        while a in fn.insns:
+            i = fn.insns[a]
+            if a != fn.entry and a in fn.labels:
+                break
+            if i.op == "stmw" and i.rA == 1 and i.rD >= 14:
+                regs = range(i.rD, 32)
+                if not any(n in written for n in regs) and not any(f"r{n}" in self.keep for n in regs):
+                    return {a}
+                return set()
+            if i.op in ("b", "bc", "bclr", "bcctr", "tw", "twi", "sc"):
+                break
+            code, _ = self.insn(fn, i, set(), set())
+            written.update(int(n) for n in re.findall(r"c->r\[(\d+)\] (?:\|)?=(?!=)", " ".join(code)))
+            a += 4
+        return set()
+
     # ---- function ---------------------------------------------------------------------------
     def gen_function(self, fn: Function) -> tuple[str, set[str]]:
         callees: set[str] = set()
-        out = [f'extern "C" void f_{fn.entry:08x}(PPCContext* __restrict c) {{',
-               "  uint8_t* const M = g_mem; (void)M;"]
+        me = self.regctx.get(fn.entry)
+        self.keep = (ALL_HELD if me is not None and me.all else frozenset()) | self.keep_all
+        if self.local_range and not self.local_range[0] <= fn.entry < self.local_range[1]:
+            self.keep |= _GPR_NV  # TEST bisect: r14-r31 locals only inside BOTW_LOCAL_RANGE
+        self.prologue_saves = self.find_prologue_saves(fn)
+        guest = "_guest" if fn.entry in self.natives else ""
+        prologue = [f'extern "C" void f_{fn.entry:08x}{guest}(PPCContext* __restrict c) {{',
+                    "  uint8_t* const M = g_mem; (void)M; PPC_SEPARATE(M, c);"]
         if self.check_returns:
-            out.append("  const uint32_t lr0 = c->lr; (void)lr0;")
+            prologue.append("  const uint32_t lr0 = c->lr; (void)lr0;")
+        out: list[str] = []
         addrs = sorted(fn.insns)
         labels = set(fn.labels)
+        self.outer_back_edges = self.find_outer_back_edges(fn)
+        self.spin_back_edges = self.find_spin_back_edges(fn)
         if addrs and addrs[0] != fn.entry:
             # the body includes code below the entry (shared tails): start at the entry
             labels.add(fn.entry)
@@ -110,7 +354,8 @@ class Generator:
                 out.append(f"  hook_0x{a:08x}(c);")
                 callees.add(f"hook_0x{a:08x}")
         out.append("}")
-        return "\n".join(out), callees
+        prologue, out = local_regs(prologue, out, self.keep, self.regctx, me.exp if me is not None else frozenset())
+        return "\n".join(local_cr(prologue, out)), callees
 
     def unsup(self, i: ppc.Insn) -> list[str]:
         self.unsupported[i.op] = self.unsupported.get(i.op, 0) + 1
@@ -154,7 +399,7 @@ class Generator:
             if t in fn.tail_targets:
                 return [self.tail(t, callees)], False
             labels.add(t)
-            return [f"goto L_{t:08x};"], False
+            return [self.jump(a, t)], False
 
         if op == "bc":
             pre: list[str] = []
@@ -170,7 +415,7 @@ class Generator:
                 act = self.tail(t, callees)
             else:
                 labels.add(t)
-                act = f"goto L_{t:08x};"
+                act = self.jump(a, t)
             if cnd is None:
                 return pre + [act], False
             return pre + [f"if ({cnd}) {{ {act} }}"], True
@@ -423,6 +668,11 @@ class Generator:
                 L.append(f"{R(ra)} = ea_;")
             L.append("}")
             return L
+        if op == "stmw" and a in self.prologue_saves:
+            # prologue save of the caller's r14-r31: those are this function's own locals (local_regs), the
+            # caller's values are never needed. Only the entry block's stmw before any write of those registers:
+            # GHS also copies blocks with lmw/stmw. The epilogue lmw stays: its loads are dead and clang drops them.
+            return ["/* stmw prologue save of r14-r31: locals */"]
         if op == "lmw":
             L.append(f"{{ uint32_t ea_ = {RA0(ra)} + (uint32_t){imm};")
             for k in range(d, 32):
@@ -495,8 +745,15 @@ class Generator:
                 ea = f"({R(ra) if upd else RA0(ra)} + (uint32_t){imm})"
             else:
                 ea = f"({R(ra) if upd else RA0(ra)} + {R(rb)})"
-            fnn = "psq_load" if "_l" in op else "psq_store"
-            L.append(f"{{ uint32_t ea_ = {ea}; {fnn}(c, M, ea_, {i.W}, c->gqr[{i.I}], {d});")
+            # register halves passed by reference (they may be locals, see local_regs)
+            if i.I == 0:
+                # GQR0 stays 0 (plain floats, no scale): the OS sets it so and BotW never writes it, so skip
+                # the per-access type switch (99.5% of BotW's paired-single loads and stores)
+                fnn = "psq_load_f32r" if "_l" in op else "psq_store_f32r"
+                L.append(f"{{ uint32_t ea_ = {ea}; {fnn}({F(d)}, {P(d)}, M, ea_, {i.W});")
+            else:
+                fnn = "psq_loadr" if "_l" in op else "psq_storer"
+                L.append(f"{{ uint32_t ea_ = {ea}; {fnn}({F(d)}, {P(d)}, M, ea_, {i.W}, c->gqr[{i.I}]);")
             if upd:
                 L.append(f"{R(ra)} = ea_;")
             L.append("}")
@@ -607,21 +864,25 @@ class Generator:
             # result rounded to single; ps1 mirrors ps0 (HID2[PSE] set on Cafe)
             return [f"{{ double t_ = round_single({expr}); {F(d)} = t_; {P(d)} = t_; }}"]
 
+        # Float semantics are Cemu's recompiler (PPCRecompilerImlGenFPU.cpp + BackendX64FPU.cpp), op for op:
+        # multiply-adds are an unfused mulsd + addsd/subsd (the guest is built with -ffp-contract=off), single forms
+        # round once at the end (cvtsd2ss + cvtss2sd) with no 25-bit rounding of frC. fnmadd/fnmadds are not taken
+        # by Cemu's recompiler, so they follow its interpreter (PPCInterpreterFPU.cpp).
         dbl = {"fadd": f"{fa} + {fb}", "fsub": f"{fa} - {fb}", "fmul": f"{fa} * {fc}", "fdiv": f"{fa} / {fb}",
-               "fmadd": f"fma({fa}, {fc}, {fb})", "fmsub": f"fma({fa}, {fc}, -{fb})",
-               "fnmadd": f"-fma({fa}, {fc}, {fb})", "fnmsub": f"-fma({fa}, {fc}, -{fb})", "fsqrt": f"sqrt({fb})"}
-        sgl = {"fadds": f"{fa} + {fb}", "fsubs": f"{fa} - {fb}", "fmuls": f"{fa} * round25({fc})",
-               "fdivs": f"{fa} / {fb}", "fmadds": f"fma({fa}, round25({fc}), {fb})",
-               "fmsubs": f"fma({fa}, round25({fc}), -{fb})", "fnmadds": f"-fma({fa}, round25({fc}), {fb})",
-               "fnmsubs": f"-fma({fa}, round25({fc}), -{fb})", "fsqrts": f"sqrt({fb})"}
+               "fmadd": f"{fa} * {fc} + {fb}", "fmsub": f"{fa} * {fc} - {fb}",
+               "fnmadd": f"-({fa} * {fc} + {fb})", "fnmsub": f"-({fa} * {fc} - {fb})", "fsqrt": f"sqrt({fb})"}
+        sgl = {"fadds": f"{fa} + {fb}", "fsubs": f"{fa} - {fb}", "fmuls": f"{fa} * {fc}",
+               "fdivs": f"{fa} / {fb}", "fmadds": f"{fa} * {fc} + {fb}",
+               "fmsubs": f"{fa} * {fc} - {fb}", "fnmadds": f"-({fa} * round25({fc}) + {fb})",
+               "fnmsubs": f"-({fa} * {fc} - {fb})", "fsqrts": f"sqrt({fb})"}
         if op in dbl:
             L.append(f"{F(d)} = {dbl[op]};")
         elif op in sgl:
             L += single(sgl[op])
         elif op == "fres":
-            L.append(f"{{ double t_ = ppc_fres({fb}); {F(d)} = t_; {P(d)} = t_; }}")
+            L.append(f"{{ double t_ = round_single(ppc_fres({fb})); {F(d)} = t_; {P(d)} = t_; }}")
         elif op == "frsqrte":
-            L.append(f"{F(d)} = ppc_frsqrte({fb});")
+            L.append(f"{F(d)} = round_single(ppc_frsqrte({fb}));")
         elif op == "frsp":
             L += single(fb)
         elif op == "fsel":
@@ -667,26 +928,28 @@ class Generator:
             L += self.ps2(d, f"{fa} + {fb}", f"{pa} + {pb}")
         elif op == "ps_sub":
             L += self.ps2(d, f"{fa} - {fb}", f"{pa} - {pb}")
+        # paired singles as Cemu's recompiler does them: double math, one cvtsd2ss/cvtss2sd rounding per slot, no
+        # 25-bit frC rounding, no flush-to-zero; ps_nmadd is not rounded at all there
         elif op == "ps_mul":
-            L += self.ps2(d, f"{fa} * round25({fc})", f"{pa} * round25({pc})", ftz=True)
+            L += self.ps2(d, f"{fa} * {fc}", f"{pa} * {pc}")
         elif op == "ps_div":
             L += self.ps2(d, f"{fa} / {fb}", f"{pa} / {pb}")
         elif op == "ps_madd":
-            L += self.ps2(d, f"(double)(float)({fa} * round25({fc})) + {fb}", f"(double)(float)({pa} * round25({pc})) + {pb}", ftz=True)
+            L += self.ps2(d, f"{fa} * {fc} + {fb}", f"{pa} * {pc} + {pb}")
         elif op == "ps_msub":
-            L += self.ps2(d, f"{fa} * round25({fc}) - {fb}", f"{pa} * round25({pc}) - {pb}")
+            L += self.ps2(d, f"{fa} * {fc} - {fb}", f"{pa} * {pc} - {pb}")
         elif op == "ps_nmadd":
-            L += self.ps2(d, f"-({fa} * round25({fc}) + {fb})", f"-({pa} * round25({pc}) + {pb})")
+            L.append(f"{{ double x_ = -({fa} * {fc} + {fb}), y_ = -({pa} * {pc} + {pb}); {F(d)} = x_; {P(d)} = y_; }}")
         elif op == "ps_nmsub":
-            L += self.ps2(d, f"-({fa} * round25({fc}) - {fb})", f"-({pa} * round25({pc}) - {pb})")
+            L += self.ps2(d, f"-({fa} * {fc} - {fb})", f"-({pa} * {pc} - {pb})")
         elif op == "ps_madds0":
-            L.append(f"{{ double k_ = round25({fc}); double x_ = (float)({fa} * k_ + {fb}), y_ = (float)({pa} * k_ + {pb}); {F(d)} = x_; {P(d)} = y_; }}")
+            L.append(f"{{ double k_ = {fc}; double x_ = (float)({fa} * k_ + {fb}), y_ = (float)({pa} * k_ + {pb}); {F(d)} = x_; {P(d)} = y_; }}")
         elif op == "ps_madds1":
-            L.append(f"{{ double k_ = round25({pc}); double x_ = (float)({fa} * k_ + {fb}), y_ = (float)({pa} * k_ + {pb}); {F(d)} = x_; {P(d)} = y_; }}")
+            L.append(f"{{ double k_ = {pc}; double x_ = (float)({fa} * k_ + {fb}), y_ = (float)({pa} * k_ + {pb}); {F(d)} = x_; {P(d)} = y_; }}")
         elif op == "ps_muls0":
-            L.append(f"{{ double k_ = round25({fc}); double x_ = (float)({fa} * k_), y_ = (float)({pa} * k_); {F(d)} = x_; {P(d)} = y_; }}")
+            L.append(f"{{ double k_ = {fc}; double x_ = (float)({fa} * k_), y_ = (float)({pa} * k_); {F(d)} = x_; {P(d)} = y_; }}")
         elif op == "ps_muls1":
-            L.append(f"{{ double k_ = round25({pc}); double x_ = (float)({fa} * k_), y_ = (float)({pa} * k_); {F(d)} = x_; {P(d)} = y_; }}")
+            L.append(f"{{ double k_ = {pc}; double x_ = (float)({fa} * k_), y_ = (float)({pa} * k_); {F(d)} = x_; {P(d)} = y_; }}")
         elif op == "ps_sum0":
             L.append(f"{{ double x_ = (float)({fa} + {pb}), y_ = (float)({pc}); {F(d)} = x_; {P(d)} = y_; }}")
         elif op == "ps_sum1":

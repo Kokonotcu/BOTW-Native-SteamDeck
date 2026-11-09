@@ -31,6 +31,13 @@ if(BOTW_USE_LLD AND NOT MSVC)
     add_link_options(-fuse-ld=lld)
   endif()
 endif()
+# Hot functions first (tools/deck/symbol-order.txt: Deck profile samples, hottest first, scratch hot_order.py): the
+# code that runs packs into ~20 of 222 MB instead of being spread among cold functions. Needs one section per function.
+set(BOTW_SYMBOL_ORDER "" CACHE FILEPATH "lld --symbol-ordering-file for the program's functions (empty = linker order)")
+if(BOTW_SYMBOL_ORDER AND BOTW_HAVE_LLD)
+  add_compile_options(-ffunction-sections)
+  add_link_options("-Wl,--symbol-ordering-file=${BOTW_SYMBOL_ORDER}" -Wl,--no-warn-symbol-ordering)
+endif()
 
 # Keep local folder names out of shipped binaries: source and build paths in __FILE__ and
 # debug info are rewritten to relative ones. Each flag is used only if the compiler accepts it.
@@ -155,7 +162,8 @@ file(GLOB GUEST_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/generated/big_*.cpp
   ${CMAKE_SOURCE_DIR}/generated/huge_*.cpp
   ${CMAKE_SOURCE_DIR}/generated/table.cpp
-  ${CMAKE_SOURCE_DIR}/generated/hle_stubs.cpp)
+  ${CMAKE_SOURCE_DIR}/generated/hle_stubs.cpp
+  ${CMAKE_SOURCE_DIR}/generated/gfxpack_data.cpp)
 if(NOT GUEST_SOURCES)
   set(GUEST_SOURCES ${CMAKE_SOURCE_DIR}/runtime/src/guest_stub.cpp)
   message(STATUS "generated/ is empty: linking a guest stub (graphics init only; the game will not run)")
@@ -169,6 +177,11 @@ if(APPLE)
     -ffp-contract=off)
 else()
   target_compile_options(guest PRIVATE ${BOTW_GUEST_OPT} -g1 -w -fwrapv -fno-strict-aliasing -ffp-contract=off)
+endif()
+# Per-call-site cache for indirect guest calls (ppc.h rt_call). Needs the __ehdr_start image base: Linux only.
+option(BOTW_INLINE_RT_CALL "Per-call-site cache for indirect guest calls" ON)
+if(BOTW_INLINE_RT_CALL AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_compile_definitions(guest PRIVATE BOTW_INLINE_RT_CALL)
 endif()
 file(GLOB BIG_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/generated/big_*.cpp)
 file(GLOB HUGE_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/generated/huge_*.cpp)
@@ -248,6 +261,14 @@ if(BOTW_ENABLE_VULKAN)
   endif()
 endif()
 target_compile_options(cemu_gpu PRIVATE -w -O3 -g1 "SHELL:-include Common/precompiled.h")
+# ThinLTO across the Cemu GPU layer only (not the recompiled game code): its GPU thread limits the frame rate on the
+# Deck, and its per-draw helpers live in many small files. BOTW_CEMU_LTO=OFF builds it without.
+option(BOTW_CEMU_LTO "ThinLTO for the Cemu GPU layer" ON)
+set(_botw_cemu_lto OFF)
+if(BOTW_CEMU_LTO AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  set(_botw_cemu_lto ON)
+  target_compile_options(cemu_gpu PRIVATE -flto=thin)
+endif()
 
 file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/runtime/src/*.cpp
@@ -255,6 +276,10 @@ file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/guest_stub\\.cpp$")
 if(NOT APPLE)
   list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "\\.mm$")
+endif()
+# Linux file systems are case-sensitive like iOS; reuse its case-insensitive game folder lookup.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  list(APPEND RUNTIME_SOURCES ${CMAKE_SOURCE_DIR}/ios/src/fs_case_ios.cpp)
 endif()
 
 if(BOTW_PREBUILT_GUEST_DIR)
@@ -269,6 +294,9 @@ if(APPLE)
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 else()
   target_compile_options(BotWRecomp PRIVATE -O3 -g1 -Wall -Wno-unused-function -Wno-unused-variable -fwrapv)
+endif()
+if(_botw_cemu_lto)
+  target_link_options(BotWRecomp PRIVATE -flto=thin -O3 "-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache")
 endif()
 if(BOTW_ENABLE_VULKAN)
   target_compile_definitions(BotWRecomp PRIVATE ENABLE_VULKAN)
@@ -344,6 +372,16 @@ if(BOTW_ENABLE_VULKAN)
 endif()
 if(UNIX AND NOT APPLE)
   target_link_libraries(BotWRecomp PRIVATE ${CMAKE_DL_LIBS} X11::X11)
+  # Movies (h264.rpl): Windows decodes with Media Foundation; Linux needs a static FFmpeg built by
+  # tools/deck/ffmpeg.sh. Without it the movies play as black frames.
+  set(BOTW_FFMPEG_DIR "" CACHE PATH "Prefix of a static FFmpeg (libavcodec + libavutil) for H.264 movies")
+  if(BOTW_FFMPEG_DIR)
+    target_include_directories(BotWRecomp PRIVATE ${BOTW_FFMPEG_DIR}/include)
+    target_compile_definitions(BotWRecomp PRIVATE BOTW_HAVE_FFMPEG)
+    target_link_libraries(BotWRecomp PRIVATE ${BOTW_FFMPEG_DIR}/lib/libavcodec.a ${BOTW_FFMPEG_DIR}/lib/libavutil.a m)
+  else()
+    message(WARNING "BOTW_FFMPEG_DIR is not set: game movies will play as black frames on Linux")
+  endif()
 endif()
 if(WIN32)
   # psapi: GetProcessMemoryInfo (shader-cache log).

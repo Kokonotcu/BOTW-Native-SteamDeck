@@ -8,10 +8,12 @@
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/Core/FetchShader.h"
 #include "Cafe/HW/Latte/Core/LatteIndices.h"
+#include "Cafe/HW/Latte/Core/LatteBufferCache.h"
 #include "Cafe/OS/libs/gx2/GX2.h"
 #include "imgui/imgui_impl_vulkan.h"
 #include "Cafe/GameProfile/GameProfile.h"
 #include "util/helpers/helpers.h"
+#include "telemetry.h"
 
 extern bool hasValidFramebufferAttached;
 
@@ -145,10 +147,6 @@ PipelineInfo* VulkanRenderer::draw_getCachedPipeline()
 	// todo - optimize m_pipeline_info_cache away and store directly in vk vertex shader
 	const auto fetchShader = LatteSHRC_GetActiveFetchShader();
 	const auto vertexShader = LatteSHRC_GetActiveVertexShader();
-	const auto it = m_pipeline_info_cache.find(vertexShader->baseHash);
-	if (it == m_pipeline_info_cache.cend())
-		return nullptr;
-
 	const auto geometryShader = LatteSHRC_GetActiveGeometryShader();
 	const auto pixelShader = LatteSHRC_GetActivePixelShader();
 	auto cachedFboVk = (CachedFBOVk*)m_state.activeFBO;
@@ -156,12 +154,17 @@ PipelineInfo* VulkanRenderer::draw_getCachedPipeline()
 	const uint64 vsBaseHash = vertexShader->baseHash;
 	const uint64 stateHash = draw_calculateGraphicsPipelineHash(fetchShader, vertexShader, geometryShader, pixelShader, cachedFboVk->GetRenderPassObj(), LatteGPUState.contextNew);
 
+	// BotW-Native: the MRU check first. An MRU entry is a registered pipeline (unregisterGraphicsPipeline clears it),
+	// so a hit skips both hash-map lookups; the outer one (by vertex shader) missed cache on the Deck.
 	for (uint32 i = 0; i < 4; ++i)
 	{
 		if (m_pipeline_mru[i].info && m_pipeline_mru[i].stateHash == stateHash && m_pipeline_mru[i].vsBaseHash == vsBaseHash)
 			return m_pipeline_mru[i].info;
 	}
 
+	const auto it = m_pipeline_info_cache.find(vsBaseHash);
+	if (it == m_pipeline_info_cache.cend())
+		return nullptr;
 	const auto innerit = it->second.find(stateHash);
 	if (innerit == it->second.cend())
 		return nullptr;
@@ -259,12 +262,15 @@ PipelineInfo* VulkanRenderer::draw_createGraphicsPipeline(uint32 indexCount)
 	if (GetConfig().async_compile)
 		allowAsyncCompile = IsAsyncPipelineAllowed(indexCount);
 
+	telem::add(telem::PipeNew, 1);
+	telem::Scope compileTimed(telem::PipeNs);
 	if (allowAsyncCompile)
 	{
 		// even when async is allowed, attempt synchronous creation first (which will immediately fail if the pipeline is not cached)
 		if (pipelineCompiler->Compile(false, true, true) == false)
 		{
 			// shaders or pipeline not cached -> asynchronous compilation
+			telem::add(telem::PipeAsync, 1);
 			PipelineCompiler::CompileThreadPool_QueueCompilation(pipelineCompiler);
 		}
 		else
@@ -833,6 +839,14 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
 
 			if (baseTexture->overwriteInfo.anisotropicLevel >= 0)
 				maxAniso = baseTexture->overwriteInfo.anisotropicLevel;
+			// BotW-Native: anisotropic filtering capped at 4x (texture bandwidth at 8 W); BOTW_ANISO=1/2/4/8/16 sets the cap
+			static const uint32 s_anisoCapLog2 = [] {
+				const char* e = getenv("BOTW_ANISO");
+				const int x = e ? atoi(e) : 4;
+				return x >= 16 ? 4u : x >= 8 ? 3u : x >= 4 ? 2u : x >= 2 ? 1u : 0u;
+			}();
+			if ((uint32)maxAniso > s_anisoCapLog2)
+				maxAniso = s_anisoCapLog2;
 
 			if (maxAniso > 0)
 			{
@@ -1027,41 +1041,31 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
 
 void VulkanRenderer::SurfaceSync(Latte::E_COHER_CNTL coher, MPTR address, uint32 size)
 {
-	if (static_cast<uint32>(coher & Latte::E_COHER_CNTL::CB_ALL_DEST_BASE_ENA) != 0)
-		m_state.colorBufferSyncPending = true;
+	if (static_cast<uint32>(coher & (Latte::E_COHER_CNTL::CB_ACTION_ENA | Latte::E_COHER_CNTL::CB_ALL_DEST_BASE_ENA | Latte::E_COHER_CNTL::DB_ACTION_ENA | Latte::E_COHER_CNTL::DB_DEST_BASE_ENA)) != 0)
+		m_state.colorBufferSyncPending = true;  // color or depth
 }
 
 void VulkanRenderer::sync_inputTexturesChanged(bool withinFeedbackLoopRenderPass)
 {
 	bool writeFlushRequired = withinFeedbackLoopRenderPass; // feedback loop still requires us to emit a barrier
 
-	if (m_state.activeVertexDS)
-	{
-		for (auto& tex : m_state.activeVertexDS->list_fboCandidates)
+	// BotW-Native: inside a render pass with no guest color/depth sync since the last draw, sampling the pass's own
+	// attachments needs no barrier: the guest GPU does not make those writes visible without a sync either
+	std::vector<LatteTexture*>* relaxedAttachments = (m_state.activeRenderpassFBO && !m_state.colorBufferSyncPending) ? &m_state.activeRenderpassFBO->GetTextures() : nullptr;
+	auto checkHazards = [&](VkDescriptorSetInfo* ds) {
+		if (!ds)
+			return;
+		for (auto& tex : ds->list_fboCandidates)
 		{
 			tex->m_vkFlushIndex_read = m_state.currentFlushIndex;
-			if (tex->m_vkFlushIndex_write == m_state.currentFlushIndex)
+			if (tex->m_vkFlushIndex_write == m_state.currentFlushIndex &&
+				!(relaxedAttachments && std::find(relaxedAttachments->begin(), relaxedAttachments->end(), tex) != relaxedAttachments->end()))
 				writeFlushRequired = true;
 		}
-	}
-	if (m_state.activeGeometryDS)
-	{
-		for (auto& tex : m_state.activeGeometryDS->list_fboCandidates)
-		{
-			tex->m_vkFlushIndex_read = m_state.currentFlushIndex;
-			if (tex->m_vkFlushIndex_write == m_state.currentFlushIndex)
-				writeFlushRequired = true;
-		}
-	}
-	if (m_state.activePixelDS)
-	{
-		for (auto& tex : m_state.activePixelDS->list_fboCandidates)
-		{
-			tex->m_vkFlushIndex_read = m_state.currentFlushIndex;
-			if (tex->m_vkFlushIndex_write == m_state.currentFlushIndex)
-				writeFlushRequired = true;
-		}
-	}
+	};
+	checkHazards(m_state.activeVertexDS);
+	checkHazards(m_state.activeGeometryDS);
+	checkHazards(m_state.activePixelDS);
 	// barrier here
 	if (writeFlushRequired)
 	{
@@ -1105,6 +1109,16 @@ void VulkanRenderer::sync_inputTexturesChanged(bool withinFeedbackLoopRenderPass
 			memoryBarrier.dstAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
 		}
 
+		if (m_transferBarrierPending && !withinFeedbackLoopRenderPass)
+		{
+			// BotW-Native: the barrier owed by buffer cache copies, in the same call (see barrier_flushPendingTransfer)
+			srcStage |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+			dstStage |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+			memoryBarrier.srcAccessMask |= VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+			memoryBarrier.dstAccessMask |= VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+			m_transferBarrierPending = false;
+		}
+
 		VkDependencyFlags dependencyFlags = withinFeedbackLoopRenderPass ? VK_DEPENDENCY_BY_REGION_BIT : 0;
 		vkCmdPipelineBarrier(m_state.currentCommandBuffer, srcStage, dstStage, dependencyFlags, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
 
@@ -1121,11 +1135,10 @@ void VulkanRenderer::sync_RenderPassLoadTextures(CachedFBOVk* fboVk)
 	for (auto& tex : fboVk->GetTextures())
 	{
 		LatteTextureVk* texVk = (LatteTextureVk*)tex;
-		// write-before-write
-		if (texVk->m_vkFlushIndex_write == m_state.currentFlushIndex)
-			readFlushRequired = true;
-
-
+		// BotW-Native: no barrier for write-after-write. m_vkFlushIndex_write is only set by attachment writes, and
+		// attachment writes to one image stay in submission order across render passes (same layout, the render
+		// back ends work in order). This was the most frequent barrier (~90 a frame, each a full GPU drain): every
+		// pass break (copy, query, streamout) followed by drawing on into the same targets.
 		texVk->m_vkFlushIndex_write = m_state.currentFlushIndex;
 		// todo - also check for write-before-write ?
 		if (texVk->m_vkFlushIndex_read == m_state.currentFlushIndex)
@@ -1155,6 +1168,16 @@ void VulkanRenderer::sync_RenderPassLoadTextures(CachedFBOVk* fboVk)
 
 		dstStage |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
 		memoryBarrier.dstAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+
+		if (m_transferBarrierPending)
+		{
+			// BotW-Native: the barrier owed by buffer cache copies, in the same call (see barrier_flushPendingTransfer)
+			srcStage |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+			dstStage |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+			memoryBarrier.srcAccessMask |= VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+			memoryBarrier.dstAccessMask |= VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+			m_transferBarrierPending = false;
+		}
 
 		vkCmdPipelineBarrier(m_state.currentCommandBuffer, srcStage, dstStage, 0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
 
@@ -1242,7 +1265,12 @@ void VulkanRenderer::draw_setRenderPass()
 
 	bool feedbackLoopHandlesSelfDependency = UseAttachmentFeedbackLoop() && currentSelfDependencyInfo.HasSelfDependency() && !currentSelfDependencyInfo.HasVertexOrGeometrySelfDependency();
 	bool selfDependencyNeedsPassSplit = currentSelfDependencyInfo.HasSelfDependency() && !feedbackLoopHandlesSelfDependency;
-	bool overridePassReuse = selfDependencyNeedsPassSplit && (GetConfig().vk_accurate_barriers || m_state.activePipelineInfo->neverSkipAccurateBarrier);
+	// BotW-Native: without the feedback loop layout, a new render pass (its load sync) stands in for the barrier the
+	// feedback loop path issued, but only after a guest color/depth sync since the last draw: without one the guest
+	// GPU gives no visibility either (relaxed there too, see sync_inputTexturesChanged). Vertex/geometry ones never split.
+	const bool relaxedFeedback = !m_state.colorBufferSyncPending;
+	bool overridePassReuse = selfDependencyNeedsPassSplit && !relaxedFeedback &&
+		(!currentSelfDependencyInfo.HasVertexOrGeometrySelfDependency() || GetConfig().vk_accurate_barriers || m_state.activePipelineInfo->neverSkipAccurateBarrier);
 
 	if (!overridePassReuse && m_state.activeRenderpassFBO == fboVk)
 	{
@@ -1256,10 +1284,30 @@ void VulkanRenderer::draw_setRenderPass()
 		return;
 	}
 	draw_endRenderPass();
+	// BotW-Native: no render pass is open here anyway, so upload the buffer data the game changed since the last
+	// pass now; the draws of the new pass then find it in the cache instead of each ending the pass to upload it
+	LatteBufferCache_processDCFlushQueue();
+	LatteBufferCache_syncAllInvalidated();
 	if (m_state.descriptorSetsChanged)
 		sync_inputTexturesChanged();
 
 	sync_RenderPassLoadTextures(fboVk);
+	barrier_flushPendingTransfer();  // unless the sync above already carried it
+	upload_closeGroup();  // draws follow: the next upload must wait for their reads again
+
+	if (g_telemGpu) TelemPassBegin(m_state.currentCommandBuffer, fboVk->key, [fboVk] {
+		int colors = 0, first = -1;
+		for (int i = 0; i < 8; i++)
+			if (fboVk->colorBuffer[i].texture)
+				colors++, first = first < 0 ? i : first;
+		LatteDecompilerShader* vs = LatteSHRC_GetActiveVertexShader();
+		LatteDecompilerShader* ps = LatteSHRC_GetActivePixelShader();
+		char buf[192];
+		snprintf(buf, sizeof(buf), "%dx%d c%d%s fmt%03x vs%016llx ps%016llx", fboVk->m_size.x, fboVk->m_size.y, colors,
+			fboVk->depthBuffer.texture ? " depth" : "", first >= 0 ? (unsigned)fboVk->colorBuffer[first].texture->format : 0u,
+			(unsigned long long)(vs ? vs->baseHash : 0), (unsigned long long)(ps ? ps->baseHash : 0));
+		return std::string(buf);
+	});
 
 	if (m_featureControl.deviceExtensions.dynamic_rendering)
 	{
@@ -1282,6 +1330,7 @@ void VulkanRenderer::draw_setRenderPass()
 	}
 
 	m_state.activeRenderpassFBO = fboVk;
+	occlusionQuery_notifyBeginRenderPass();
 	if (UseAttachmentFeedbackLoop() && currentSelfDependencyInfo.GetAspectMask() != m_state.feedbackLoopImageAspect)
 	{
 		m_state.feedbackLoopImageAspect = currentSelfDependencyInfo.GetAspectMask();
@@ -1297,13 +1346,20 @@ void VulkanRenderer::draw_setRenderPass()
 void VulkanRenderer::draw_endRenderPass()
 {
 	if (!m_state.activeRenderpassFBO)
+	{
+		streamout_flushCopies();
 		return;
+	}
+	occlusionQuery_notifyEndRenderPass();
 	if (m_featureControl.deviceExtensions.dynamic_rendering)
 		vkCmdEndRenderingKHR(m_state.currentCommandBuffer);
 	else
 		vkCmdEndRenderPass(m_state.currentCommandBuffer);
+	if (g_telemGpu) TelemPassEnd(m_state.currentCommandBuffer);
 	sync_RenderPassStoreTextures(m_state.activeRenderpassFBO);
 	m_state.activeRenderpassFBO = nullptr;
+	occlusionQuery_outsideRenderPass();
+	streamout_flushCopies();
 }
 
 // Defined in the Common renderer
@@ -1432,14 +1488,17 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance, 
 	LatteIndices_decode(memory_getPointerFromVirtualOffset(indexDataMPTR), indexType, count, primitiveMode, indexMax, hostIndexType, hostIndexCount, indexAllocation);
 	VKRSynchronizedHeapAllocator::AllocatorReservation* indexReservation = (VKRSynchronizedHeapAllocator::AllocatorReservation*)indexAllocation.rendererInternal;
 	// update index binding
+	// BotW-Native: the buffer is bound at offset 0 and each draw's offset goes into firstIndex (allocations are
+	// 32-byte aligned). Every draw gets fresh index memory, so binding at the offset rebound on ~55% of draws.
+	uint32 firstIndex = 0;
 	if (hostIndexType != INDEX_TYPE::NONE)
 	{
 		uint32 indexBufferIndex = indexReservation->bufferIndex;
-		uint32 indexBufferOffset = indexReservation->bufferOffset;
-		if (m_state.activeIndexBufferOffset != indexBufferOffset || m_state.activeIndexBufferIndex != indexBufferIndex || m_state.activeIndexType != hostIndexType)
+		firstIndex = indexReservation->bufferOffset / (hostIndexType == INDEX_TYPE::U16 ? 2 : 4);
+		if (m_state.activeIndexBufferIndex != indexBufferIndex || m_state.activeIndexType != hostIndexType)
 		{
 			m_state.activeIndexType = hostIndexType;
-			m_state.activeIndexBufferOffset = indexBufferOffset;
+			m_state.activeIndexBufferOffset = 0;
 			m_state.activeIndexBufferIndex = indexBufferIndex;
 			VkIndexType vkType;
 			if (hostIndexType == INDEX_TYPE::U16)
@@ -1448,7 +1507,7 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance, 
 				vkType = VK_INDEX_TYPE_UINT32;
 			else
 				cemu_assert(false);
-			vkCmdBindIndexBuffer(m_state.currentCommandBuffer, indexReservation->vkBuffer, indexBufferOffset, vkType);
+			vkCmdBindIndexBuffer(m_state.currentCommandBuffer, indexReservation->vkBuffer, 0, vkType);
 		}
 	}
 
@@ -1491,6 +1550,8 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance, 
 	m_state.activeGeometryDS = geometryDS;
 	m_state.descriptorSetsChanged = true;
 
+	if (!m_streamoutCopies.empty() && streamout_copiesOverlapBindings())
+		draw_endRenderPass(); // a waiting streamout copy writes data this draw reads
 	draw_setRenderPass();
 
 	if (m_state.currentPipeline != vkObjPipeline->GetPipeline())
@@ -1546,7 +1607,7 @@ void VulkanRenderer::draw_execute_first(uint32 baseVertex, uint32 baseInstance, 
 	}
 	// draw
 	if (hostIndexType != INDEX_TYPE::NONE)
-		vkCmdDrawIndexed(m_state.currentCommandBuffer, hostIndexCount, instanceCount, 0, baseVertex, baseInstance);
+		vkCmdDrawIndexed(m_state.currentCommandBuffer, hostIndexCount, instanceCount, firstIndex, baseVertex, baseInstance);
 	else
 		vkCmdDraw(m_state.currentCommandBuffer, count, instanceCount, baseVertex, baseInstance);
 	LatteStreamout_FinishDrawcall(m_useHostMemoryForCache);
@@ -1600,14 +1661,17 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
 	LatteIndices_decode(memory_getPointerFromVirtualOffset(indexDataMPTR), indexType, count, primitiveMode, indexMax, hostIndexType, hostIndexCount, indexAllocation);
 	VKRSynchronizedHeapAllocator::AllocatorReservation* indexReservation = (VKRSynchronizedHeapAllocator::AllocatorReservation*)indexAllocation.rendererInternal;
 	// update index binding
+	// BotW-Native: the buffer is bound at offset 0 and each draw's offset goes into firstIndex (allocations are
+	// 32-byte aligned). Every draw gets fresh index memory, so binding at the offset rebound on ~55% of draws.
+	uint32 firstIndex = 0;
 	if (hostIndexType != INDEX_TYPE::NONE)
 	{
 		uint32 indexBufferIndex = indexReservation->bufferIndex;
-		uint32 indexBufferOffset = indexReservation->bufferOffset;
-		if (m_state.activeIndexBufferOffset != indexBufferOffset || m_state.activeIndexBufferIndex != indexBufferIndex || m_state.activeIndexType != hostIndexType)
+		firstIndex = indexReservation->bufferOffset / (hostIndexType == INDEX_TYPE::U16 ? 2 : 4);
+		if (m_state.activeIndexBufferIndex != indexBufferIndex || m_state.activeIndexType != hostIndexType)
 		{
 			m_state.activeIndexType = hostIndexType;
-			m_state.activeIndexBufferOffset = indexBufferOffset;
+			m_state.activeIndexBufferOffset = 0;
 			m_state.activeIndexBufferIndex = indexBufferIndex;
 			VkIndexType vkType;
 			if (hostIndexType == INDEX_TYPE::U16)
@@ -1616,7 +1680,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
 				vkType = VK_INDEX_TYPE_UINT32;
 			else
 				cemu_assert(false);
-			vkCmdBindIndexBuffer(m_state.currentCommandBuffer, indexReservation->vkBuffer, indexBufferOffset, vkType);
+			vkCmdBindIndexBuffer(m_state.currentCommandBuffer, indexReservation->vkBuffer, 0, vkType);
 		}
 	}
 
@@ -1672,6 +1736,12 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
 		//m_state.activeVertexDS = nullptr;
 		return;
 	}
+	// BotW-Native: the first draw of this sequence was skipped while its pipeline was still compiling, so the
+	// sequence has no descriptor sets. When the async compile finishes mid-sequence the pipeline is valid
+	// here but the descriptor sets are not: skip the rest of the sequence like its first draw (this was an
+	// assert followed by a null dereference, depending on compile timing).
+	if (!m_state.activeVertexDS)
+		return;
 
 	VkDescriptorSetInfo *vertexDS = nullptr, *pixelDS = nullptr, *geometryDS = nullptr;
 	if (m_state.activeVertexDS)
@@ -1685,6 +1755,8 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
 		cemu_assert(false); // should never happen unless draw_prepareDescriptorSets can fail?
 	}
 
+	if (!m_streamoutCopies.empty() && streamout_copiesOverlapBindings())
+		draw_endRenderPass(); // a waiting streamout copy writes data this draw reads
 	draw_setRenderPass();
 
 	if (m_state.currentPipeline != vkObjPipeline->GetPipeline())
@@ -1769,7 +1841,7 @@ void VulkanRenderer::draw_execute_continued(uint32 baseVertex, uint32 baseInstan
 
 	// draw
 	if (hostIndexType != INDEX_TYPE::NONE)
-		vkCmdDrawIndexed(m_state.currentCommandBuffer, hostIndexCount, instanceCount, 0, baseVertex, baseInstance);
+		vkCmdDrawIndexed(m_state.currentCommandBuffer, hostIndexCount, instanceCount, firstIndex, baseVertex, baseInstance);
 	else
 		vkCmdDraw(m_state.currentCommandBuffer, count, instanceCount, baseVertex, baseInstance);
 
@@ -1784,6 +1856,7 @@ void VulkanRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32
 		draw_execute_continued(baseVertex, baseInstance, instanceCount, count, indexDataMPTR, indexType, drawcallContext);
 	m_state.colorBufferSyncPending = false;
 	LatteGPUState.drawCallCounter++;
+	if (g_telemGpu) TelemPassDraw();
 }
 
 // used in place of vertex/uniform caching when direct memory access is possible
@@ -1864,6 +1937,16 @@ void VulkanRenderer::draw_endSequence()
 	if (m_recordedDrawcalls >= m_submitThreshold || hasReadback)
 	{
 		SubmitCommandBuffer();
+		return;
+	}
+	// BotW-Native: with fixed 1000/2500-draw chunks the GPU idles while this thread records the rest of a chunk
+	// (8 W: 4.75 ms idle in frames that miss vsync with 15.3 ms of GPU work). Every 64 draws past 256, one fence
+	// poll; if the GPU has nothing left, hand it what is recorded. Off in frames where this thread had no time to spare.
+	if (m_submitWhenGpuDry && m_recordedDrawcalls >= 256 && (m_recordedDrawcalls & 63) == 0)
+	{
+		ProcessFinishedCommandBuffers();
+		if (m_commandBufferSyncIndex == m_commandBufferIndex)
+			SubmitCommandBuffer();
 	}
 }
 

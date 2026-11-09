@@ -15,6 +15,7 @@ struct Settings {
     int display = 0;       // 0 fit (letterbox), 1 stretch, 2 fill (crop)
     int filter = 1;        // output scaling: 0 bilinear, 1 bicubic, 2 hermite, 3 nearest
     bool gyro = true;      // controller gyro -> GamePad motion
+    bool gyro_world = true;  // left/right turns measured around the real vertical, not the controller's axis
     bool rumble = true;
     int layout = -1;       // -1 automatic per controller, 0 Nintendo positions, 1 Xbox/PlayStation labels
     bool show_fps = false;
@@ -26,6 +27,7 @@ struct Settings {
     int touch = 0;         // on-screen controls: 0 auto (while no controller), 1 on, 2 off
 #endif
     bool touch_hidden = false;  // collapsed to the show/hide button (that button toggles it)
+    bool telemetry = false;  // telemetry/*.csv + profiler; off stops it at once, back on applies at the next launch
 };
 
 namespace settings {

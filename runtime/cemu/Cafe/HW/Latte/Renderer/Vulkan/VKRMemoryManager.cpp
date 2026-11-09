@@ -55,6 +55,16 @@ VKRSynchronizedRingAllocator::AllocatorReservation_t VKRSynchronizedRingAllocato
 		alignment = 128;
 	size = (size + 127) & ~127;
 
+	if (m_bufferType == VKR_BUFFER_TYPE::STAGING && m_buffers.empty())
+	{
+		// BotW-Native: the kept staging memory up front (during boot), written once so its pages are mapped
+		for (uint32 i = 0; i < kStagingKeepBuffers; i++)
+		{
+			allocateAdditionalUploadBuffer(m_minimumBufferAllocSize);
+			memset(m_buffers.back().basePtr, 0, m_buffers.back().size);
+		}
+	}
+
 	for (auto& itr : m_buffers)
 	{
 		// align pointer
@@ -135,7 +145,9 @@ void VKRSynchronizedRingAllocator::CleanupBuffer(uint64 latestFinishedCommandBuf
 	}
 
 	// check if last buffer is available for deletion
-	if (m_buffers.size() >= 2)
+	// BotW-Native: staging keeps kStagingKeepBuffers: BotW's area loads need ~300-400 MB at once, and freeing it ~2 s
+	// later made every load allocate, clear and fault in that memory again inside the load hitch
+	if (m_buffers.size() > (m_bufferType == VKR_BUFFER_TYPE::STAGING ? kStagingKeepBuffers : 1))
 	{
 		auto& lastBuffer = m_buffers.back();
 		if (lastBuffer.cleanupCounter >= 1000)
@@ -306,6 +318,12 @@ uint32 VkTextureChunkedHeap::allocateNewChunk(uint32 chunkIndex, uint32 minimumA
 		return std::find(deviceLocalMemoryTypeIndices.begin(), deviceLocalMemoryTypeIndices.end(), v) != deviceLocalMemoryTypeIndices.end();
 	};
 	hostLocalMemoryTypeIndices.erase(std::remove_if(hostLocalMemoryTypeIndices.begin(), hostLocalMemoryTypeIndices.end(), pred), hostLocalMemoryTypeIndices.end());
+	// BotW-Native: keep VRAM under its budget. On the Deck "VRAM" is a 1 GB carve-out of the same RAM as system memory;
+	// RADV lets allocations exceed it and the kernel then moves buffers between VRAM and system memory during
+	// submissions, which stalled the GPU in bursts (frames at half speed with the same work, VRAM at 990 of 1024 MB).
+	// Texture chunks that would not fit go to system memory up front instead. BOTW_VRAM_SPILL=0 off.
+	if (!hostLocalMemoryTypeIndices.empty() && !deviceLocalMemoryTypeIndices.empty() && m_vkrMemoryManager->VramWouldOverflow(deviceLocalMemoryTypeIndices[0], allocationSize))
+		std::swap(deviceLocalMemoryTypeIndices, hostLocalMemoryTypeIndices);
 	// allocate chunk memory
 	for (sint32 t = 0; t < 3; t++)
 	{
@@ -410,6 +428,66 @@ uint32 VkBufferChunkedHeap::allocateNewChunk(uint32 chunkIndex, uint32 minimumAl
 	m_chunkBuffers.emplace_back(buffer);
 	// todo - VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT might be worth it?
 	return allocationSize;
+}
+
+// Kernel view of the APU's VRAM carve-out (bytes), read from amdgpu's sysfs. RADV does not expose it: on APUs it
+// reports a fake device-local heap of 2/3 of all memory, so VK_EXT_memory_budget never sees the carve-out fill up.
+// Also used by the texture cache's cleanup (LatteTextureCache.cpp).
+bool BotW_ReadVramCarveout(uint64& used, uint64& total)
+{
+#if BOOST_OS_LINUX
+	static const std::string s_dir = [] {
+		for (int i = 0; i < 8; i++)
+		{
+			std::string d = fmt::format("/sys/class/drm/card{}/device/", i);
+			if (FILE* f = fopen((d + "mem_info_vram_total").c_str(), "r"))
+			{
+				fclose(f);
+				return d;
+			}
+		}
+		return std::string();
+	}();
+	if (s_dir.empty())
+		return false;
+	auto read = [](const std::string& path, uint64& v) {
+		FILE* f = fopen(path.c_str(), "r");
+		if (!f)
+			return false;
+		unsigned long long x = 0;
+		const bool ok = fscanf(f, "%llu", &x) == 1;
+		fclose(f);
+		v = x;
+		return ok;
+	};
+	return read(s_dir + "mem_info_vram_used", used) && read(s_dir + "mem_info_vram_total", total);
+#else
+	return false;
+#endif
+}
+
+bool VKRMemoryManager::VramWouldOverflow(uint32 memoryType, size_t size) const
+{
+	static const bool s_on = [] { const char* e = getenv("BOTW_VRAM_SPILL"); return !(e && e[0] == '0'); }();
+	if (!s_on)
+		return false;
+	VkPhysicalDeviceMemoryProperties memProperties;
+	vkGetPhysicalDeviceMemoryProperties(m_vkr->GetPhysicalDevice(), &memProperties);
+	if (!(memProperties.memoryTypes[memoryType].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+		return false;
+	uint64 used, total;
+	if (!BotW_ReadVramCarveout(used, total) || total == 0 || total > (4ull << 30))
+		return false;  // no sysfs, or a carve-out big enough not to need this
+	// headroom for render targets and buffers that are not allocated through the texture heaps
+	constexpr uint64 kReserve = 96ull << 20;
+	const bool over = used + size + kReserve > total;
+	static bool s_logged = false;
+	if (over && !s_logged)
+	{
+		s_logged = true;
+		cemuLog_log(LogType::Force, "Vulkan: VRAM carve-out at {} of {} MB, further texture memory goes to system memory", used >> 20, total >> 20);
+	}
+	return over;
 }
 
 bool VKRMemoryManager::FindMemoryType(uint32 typeFilter, VkMemoryPropertyFlags properties, uint32& memoryIndex) const

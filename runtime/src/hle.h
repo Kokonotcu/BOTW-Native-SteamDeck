@@ -43,6 +43,7 @@ bool is_function_entry(uint32_t addr);
 void override_fn_nop(uint32_t addr);
 void override_fn_ret_imm(uint32_t addr, uint32_t imm);
 bool redirect_fn(uint32_t addr, uint32_t target);
+void replace_fn_native(uint32_t addr, GuestFn fn);  // port-owned, survives restore_fn_overrides
 void restore_fn_overrides();
 }  // namespace dispatch
 

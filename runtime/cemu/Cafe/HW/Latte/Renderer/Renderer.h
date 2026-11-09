@@ -121,6 +121,13 @@ public:
 
 	virtual void texture_setLatteTexture(LatteTextureView* textureView, uint32 textureUnit) = 0;
 	virtual void texture_copyImageSubData(LatteTexture* src, sint32 srcMip, sint32 effectiveSrcX, sint32 effectiveSrcY, sint32 srcSlice, LatteTexture* dst, sint32 dstMip, sint32 effectiveDstX, sint32 effectiveDstY, sint32 dstSlice, sint32 effectiveCopyWidth, sint32 effectiveCopyHeight, sint32 srcDepth) = 0;
+	// BotW-Native: texture_copyImageSubData calls between these may be recorded together (one barrier before and
+	// one after all of them, see VulkanRenderer). Nesting is allowed; other renderers copy immediately.
+	virtual void texture_beginCopyBatch() {}
+	virtual void texture_endCopyBatch() {}
+	// texture_loadSlice calls in between may be recorded together at the end (LatteTexture_ReloadData)
+	virtual void texture_beginUploadBatch() {}
+	virtual void texture_endUploadBatch() {}
 
 	virtual LatteTextureReadbackInfo* texture_createReadback(LatteTextureView* textureView) = 0;
 

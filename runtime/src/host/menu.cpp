@@ -25,10 +25,12 @@ enum RowId {
     kFilter,
     kGamepadView,
     kGyro,
+    kGyroTurn,
     kRumble,
     kLayout,
     kTouch,
     kShowFps,
+    kTelemetry,
     kMods,
     kVolume,
     kModReload,
@@ -43,8 +45,8 @@ enum TabId { kTabGraphics, kTabControls, kTabAudio, kTabMods, kTabAbout, kTabs }
 const char* kTabNames[kTabs] = {"Graphics", "Controls", "Audio", "Mods", "About"};
 constexpr int kModRowBase = 1000;
 const std::vector<int>& tab_rows(int t) {
-    static const std::vector<int> graphics = {kFps, kScale, kDisplay, kFilter, kGamepadView, kShowFps, kMods};
-    static const std::vector<int> controls = {kGyro, kRumble, kLayout, kTouch};
+    static const std::vector<int> graphics = {kFps, kScale, kDisplay, kFilter, kGamepadView, kShowFps, kTelemetry, kMods};
+    static const std::vector<int> controls = {kGyro, kGyroTurn, kRumble, kLayout, kTouch};
     static const std::vector<int> audio = {kVolume};
     static const std::vector<int> about;
     switch (t) {
@@ -101,6 +103,7 @@ void step(Settings& s, int row, int dir) {
         case kGamepadView: s.gamepad_view = !s.gamepad_view; break;
         case kMods: break;
         case kGyro: s.gyro = !s.gyro; break;
+        case kGyroTurn: s.gyro_world = !s.gyro_world; break;
         case kRumble: s.rumble = !s.rumble; break;
         case kLayout: {
             // -1 auto, 0 Nintendo positions, 1 Xbox/PlayStation labels.
@@ -111,7 +114,7 @@ void step(Settings& s, int row, int dir) {
         }
         case kTouch: s.touch = wrap(s.touch + dir, 3), s.touch_hidden = false; break;
         case kShowFps: s.show_fps = !s.show_fps; break;
-        case kVolume: s.volume = std::clamp(s.volume + dir * 10, 0, 100); break;
+        case kTelemetry: s.telemetry = !s.telemetry; break;        case kVolume: s.volume = std::clamp(s.volume + dir * 10, 0, 100); break;
     }
 }
 
@@ -320,6 +323,7 @@ View view() {
     all[kDisplay] = {"Aspect", kDisplays[std::clamp(s.display, 0, 2)]};
     all[kFilter] = {"Upscale filter", kFilters[std::clamp(s.filter, 0, 3)]};
     all[kGyro] = {"Gyro aiming", s.gyro ? "On" : "Off"};
+    all[kGyroTurn] = {"Gyro turning", s.gyro_world ? "World (any holding angle)" : "Controller axes"};
     all[kRumble] = {"Rumble", s.rumble ? "On" : "Off"};
     all[kLayout] = {"Buttons", s.layout < 0 ? "Auto (per controller)"
                                      : s.layout > 0 ? "A = bottom (Cross / Xbox A)"
@@ -327,7 +331,7 @@ View view() {
     all[kTouch] = {"Touch controls", s.touch == 1 ? "On" : s.touch == 2 ? "Off" : "Auto (no controller)"};
     all[kGamepadView] = {"GamePad screen", s.gamepad_view ? "On (F2 / Guide)" : "Off (F2 / Guide)"};
     all[kShowFps] = {"FPS counter", s.show_fps ? "On" : "Off"};
-    all[kMods] = {"Mods", mods::summary(), false, true};
+    all[kTelemetry] = {"Telemetry", s.telemetry ? "On (logs + profiler)" : "Off (no cost)"};    all[kMods] = {"Mods", mods::summary(), false, true};
     snprintf(b, sizeof b, "%d%%", s.volume);
     all[kVolume] = {"Volume", b};
     all[kModReload] = {"Apply / Reload Overlay (R)", "", true};
@@ -395,8 +399,7 @@ View view() {
         snprintf(b, sizeof b, "Rendering at %gx now; resolution changes apply after a restart.", g_render_scale);
         v.note = b;
     } else if (tab_now == kTabControls) {
-        v.note = "Controls changes apply at once and are saved to settings.ini.";
-    } else if (tab_now == kTabMods) {
+        v.note = "Controls changes apply at once and are saved to settings.ini.";    } else if (tab_now == kTabMods) {
         v.note = mods::pending_restart()
                      ? "Enter/A: Toggle ON/OFF | Left/Right: Preset | U/D (X/Y): Order | R: Reload (boot packs need restart)"
                      : "Enter/A: Toggle ON/OFF | Left/Right: Preset | U/D (X/Y): Order | R: Apply / Reload overlay now";

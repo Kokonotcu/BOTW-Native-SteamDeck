@@ -114,6 +114,8 @@ typedef struct tagTHREADNAME_INFO
 #pragma pack(pop)
 #endif
 
+extern "C" void botw_place_thread(int kind);  // runtime/src/thread.cpp
+
 void SetThreadName(const char* name)
 {
 #if BOOST_OS_WINDOWS
@@ -155,6 +157,7 @@ void SetThreadName(const char* name)
 	if(std::strlen(name) > 15)
 		cemuLog_log(LogType::Force, "Truncating thread name {} because it was longer than 15 characters", name);
 	pthread_setname_np(pthread_self(), std::string{name}.substr(0,15).c_str());
+	botw_place_thread(0);  // BotW-Native core plan (runtime/src/thread.cpp)
 #endif
 }
 

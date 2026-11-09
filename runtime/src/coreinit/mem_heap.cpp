@@ -394,8 +394,17 @@ HLE_EXPORT(coreinit, DCZeroRange) {
 }
 HLE_EXPORT(coreinit, OSIsAddressValid) { RET(ARG(0) >= 0x01000000); }
 HLE_EXPORT(coreinit, OSIsAddressRangeDCValid) { RET(1); }
-HLE_EXPORT(coreinit, OSCoherencyBarrier) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
-HLE_EXPORT(coreinit, OSMemoryBarrier) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+// Full barrier. On x86-64 a locked no-op RMW orders like MFENCE for ordinary memory and is cheaper (MFENCE is
+// microcoded on Zen 2; this is what Linux uses for smp_mb()). OSMemoryBarrier was 0.45% of the main thread.
+static inline void full_barrier() {
+#if defined(__x86_64__)
+    __asm__ volatile("lock orl $0, (%%rsp)" ::: "memory", "cc");
+#else
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+HLE_EXPORT(coreinit, OSCoherencyBarrier) { full_barrier(); }
+HLE_EXPORT(coreinit, OSMemoryBarrier) { full_barrier(); }
 HLE_EXPORT(coreinit, OSEnableOverlayArena) { RET(0); }
 HLE_EXPORT(coreinit, OSIsEnabledOverlayArena) { RET(0); }
 

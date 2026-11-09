@@ -86,6 +86,7 @@ public:
 
 	uint32 m_selfDependencyCheckIndex{}; // used to track if texture is being both sampled and output to during drawcall
 	VkImageAspectFlags m_selfDependencyCheckAspectMask{};
+	const class LatteTextureView* m_selfDependencyCheckView{}; // attachment view; nullptr if attached more than once
 
 	bool m_isAlternateFormat{}; // true if host pixel format does not 1:1 match the emulated guest texture pixel format
 private:

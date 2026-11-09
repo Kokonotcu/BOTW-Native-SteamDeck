@@ -12,6 +12,15 @@
 #include "util/helpers/Semaphore.h"
 #include "util/containers/flat_hash_map.hpp"
 #include "util/containers/robin_hood.h"
+#include <functional>
+#include <string>
+
+// BotW-Native telemetry: GPU time per render pass (VulkanRenderer.cpp). Call sites test g_telemGpu first, so with
+// telemetry off not even the call (or its describe lambda) happens.
+extern bool g_telemGpu;
+void TelemPassBegin(VkCommandBuffer cmd, uint64 key, const std::function<std::string()>& describe);
+void TelemPassEnd(VkCommandBuffer cmd);
+void TelemPassDraw();
 
 struct VkSupportedFormatInfo_t
 {
@@ -326,7 +335,32 @@ public:
 	void texture_setLatteTexture(LatteTextureView* textureView, uint32 textureUnit) override;
 
 	void texture_copyImageSubData(LatteTexture* src, sint32 srcMip, sint32 effectiveSrcX, sint32 effectiveSrcY, sint32 srcSlice, LatteTexture* dst, sint32 dstMip, sint32 effectiveDstX, sint32 effectiveDstY, sint32 dstSlice, sint32 effectiveCopyWidth, sint32 effectiveCopyHeight, sint32 srcDepth) override;
+	void texture_beginCopyBatch() override;
+	void texture_endCopyBatch() override;
 	LatteTextureReadbackInfo* texture_createReadback(LatteTextureView* textureView) override;
+
+	struct PendingImageCopy
+	{
+		LatteTextureVk* src;
+		LatteTextureVk* dst;
+		VkImageCopy region;
+	};
+	std::vector<PendingImageCopy> m_copyBatch;
+	int m_copyBatchDepth = 0;
+
+	void texture_beginUploadBatch() override;
+	void texture_endUploadBatch() override;
+	struct PendingUpload
+	{
+		LatteTextureVk* tex;
+		VkBuffer buffer;
+		VkImageSubresourceRange range;  // what the barriers transition (3D: the whole mip level)
+		VkBufferImageCopy regions[2];
+		uint32 regionCount;
+	};
+	std::vector<PendingUpload> m_uploadBatch;
+	int m_uploadBatchDepth = 0;
+	void texture_copyImageNow(LatteTextureVk* srcVk, LatteTextureVk* dstVk, VkImageCopy& region);
 
 	// surface copy
 	void surfaceCopy_copySurfaceWithFormatConversion(LatteTexture* sourceTexture, sint32 srcMip, sint32 srcSlice, LatteTexture* destinationTexture, sint32 dstMip, sint32 dstSlice, sint32 width, sint32 height) override;
@@ -608,6 +642,9 @@ private:
 	void occlusionQuery_updateState() override;
 	void occlusionQuery_notifyEndCommandBuffer();
 	void occlusionQuery_notifyBeginCommandBuffer();
+	void occlusionQuery_notifyBeginRenderPass();
+	void occlusionQuery_notifyEndRenderPass();
+	void occlusionQuery_outsideRenderPass();
 
 private:
 	std::vector<const char*> m_layerNames;
@@ -698,6 +735,10 @@ private:
 	uint32 m_recordedDrawcalls{}; // number of drawcalls recorded into current command buffer
 	uint32 m_submitThreshold{}; // submit current buffer if recordedDrawcalls exceeds this number
 	bool m_submitOnIdle{}; // submit current buffer if Latte command processor goes into idle state (no more commands or waiting for externally signaled condition)
+	// BotW-Native: submit as soon as the GPU has finished all submitted work, in frames after one where this thread
+	// waited 1 ms or more (it has time for the extra submits); m_frameWaitNs sums this frame's waits
+	bool m_submitWhenGpuDry{};
+	uint64 m_frameWaitNs{};
 
 	// drawcall handling
 	void draw_execute_first(uint32 baseVertex, uint32 baseInstance, uint32 instanceCount, uint32 count, MPTR indexDataMPTR, Latte::LATTE_VGT_DMA_INDEX_TYPE::E_INDEX_TYPE indexType, const LatteDrawcallContext& drawcallContext);
@@ -736,6 +777,10 @@ private:
 		VkDeviceMemory memoryQueryResults;
 		uint64* ptrQueryResults;
 		std::vector<uint16> list_availableQueryIndices;
+		// BotW-Native: indices already reset in the command stream (resets can't be inside a render pass) and
+		// results still to copy to bufferQueryResults (same), both done at the next render pass end
+		std::vector<uint16> list_resetIndices;
+		std::vector<uint16> list_pendingResultCopies;
 	}m_occlusionQueries;
 
 	// barrier
@@ -900,6 +945,73 @@ private:
 		vkCmdPipelineBarrier(m_state.currentCommandBuffer, srcStagesA|srcStagesB, dstStagesA|dstStagesB, 0, 0, nullptr, 2, bufMemBarrier, 0, nullptr);
 	}
 
+	// BotW-Native: copies into the buffer cache owe a "transfer before everything later" barrier. Instead of
+	// one full pipeline drain after every copy, it is folded into the next barrier that is issued anyway (the
+	// next copy's, or the render-pass start sync) or issued once before the next render pass (every draw that
+	// could read the copied data starts a render pass: the copies end the current one).
+	bool m_transferBarrierPending = false;
+	void barrier_flushPendingTransfer()
+	{
+		if (!m_transferBarrierPending)
+			return;
+		m_transferBarrierPending = false;
+		barrier_sequentializeTransfer();
+	}
+	// Uploads since the last render pass start: the first one's barrier already orders every later copy after
+	// all earlier shader reads, so later ones in the group need a barrier only if they overlap a copied range.
+	bool m_uploadGroupOpen = false;
+	std::vector<std::pair<uint32, uint32>> m_uploadGroupRanges;  // offset, size
+	void upload_closeGroup()
+	{
+		m_uploadGroupOpen = false;
+		m_uploadGroupRanges.clear();
+		m_copyGroupRanges.clear();
+	}
+	// Buffer cache copies since the last transfer barrier (src and dst ranges): a copy touching none of them needs
+	// no barrier of its own (a new cache node absorbing many old ones issued one per copy).
+	std::vector<std::pair<uint32, uint32>> m_copyGroupRanges;  // offset, size
+	// streamout ring -> buffer cache copies waiting for the end of the render pass (bufferCache_copyStreamoutToMainBuffer)
+	struct StreamoutCopy { uint32 src, dst, size; };
+	std::vector<StreamoutCopy> m_streamoutCopies;
+	uint32 m_streamoutLastRingOffset = 0;
+	uint32 m_vertexBindSize[Latte::GPU_LIMITS::NUM_VERTEX_BUFFERS]{};
+	uint32 m_uniformBindSize[VulkanRendererConst::SHADER_STAGE_INDEX_COUNT][LATTE_NUM_MAX_UNIFORM_BUFFERS]{};
+	void streamout_flushCopies();
+	bool streamout_copiesOverlapBindings() const;
+	// barrier_bufferRange with the owed transfer barrier (if any) in the same call
+	template<uint32 TSrcSyncOpA, uint32 TDstSyncOpA, uint32 TSrcSyncOpB, uint32 TDstSyncOpB>
+	void barrier_bufferRangeAfterTransfers(VkBuffer bufferA, VkDeviceSize offsetA, VkDeviceSize sizeA,
+		VkBuffer bufferB, VkDeviceSize offsetB, VkDeviceSize sizeB, bool alwaysAfterTransfers)
+	{
+		VkPipelineStageFlags stages[4] = {};
+		VkBufferMemoryBarrier b[2]{};
+		for (int i = 0; i < 2; i++)
+		{
+			b[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+			b[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			b[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		}
+		barrier_calcStageAndMask<TSrcSyncOpA>(stages[0], b[0].srcAccessMask);
+		barrier_calcStageAndMask<TDstSyncOpA>(stages[1], b[0].dstAccessMask);
+		barrier_calcStageAndMask<TSrcSyncOpB>(stages[2], b[1].srcAccessMask);
+		barrier_calcStageAndMask<TDstSyncOpB>(stages[3], b[1].dstAccessMask);
+		b[0].buffer = bufferA, b[0].offset = offsetA, b[0].size = sizeA;
+		b[1].buffer = bufferB, b[1].offset = offsetB, b[1].size = sizeB;
+		VkPipelineStageFlags srcStages = stages[0] | stages[2], dstStages = stages[1] | stages[3];
+		VkMemoryBarrier mem{};
+		mem.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		const bool afterTransfers = alwaysAfterTransfers || m_transferBarrierPending;
+		if (afterTransfers)
+		{
+			// what barrier_sequentializeTransfer would have done before this copy
+			srcStages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+			dstStages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+			mem.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+			mem.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+		}
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer, srcStages, dstStages, 0, afterTransfers ? 1 : 0, &mem, 2, b, 0, nullptr);
+	}
+
 	void barrier_sequentializeTransfer()
 	{
 		VkMemoryBarrier memBarrier{};
@@ -968,6 +1080,43 @@ private:
 		barrier_image<TSrcSyncOp, TDstSyncOp>(imageVk, subresourceRange, vkTexture->GetImageLayout(subresourceRange), newLayout);
 
 		vkTexture->SetImageLayout(subresourceRange, newLayout);
+	}
+
+	// BotW-Native: the two barrier_image calls around a copy (source and destination) as one vkCmdPipelineBarrier
+	// with two image barriers and the union of their stages. Every barrier call drains the GPU pipeline once;
+	// texture copies (~100 a frame in BotW) issued four, now two. The two subresources must not overlap.
+	template<uint32 TSrcA, uint32 TDstA, uint32 TSrcB, uint32 TDstB>
+	void barrier_image2(LatteTextureVk* texA, VkImageSubresourceLayers& layersA, VkImageLayout newLayoutA,
+		LatteTextureVk* texB, VkImageSubresourceLayers& layersB, VkImageLayout newLayoutB)
+	{
+		LatteTextureVk* tex[2] = { texA, texB };
+		const VkImageSubresourceLayers* layers[2] = { &layersA, &layersB };
+		const VkImageLayout newLayout[2] = { newLayoutA, newLayoutB };
+		VkImageSubresourceRange range[2];
+		VkImageMemoryBarrier b[2]{};
+		VkPipelineStageFlags stages[4] = {};
+		for (int i = 0; i < 2; i++)
+		{
+			range[i].aspectMask = layers[i]->aspectMask;
+			range[i].baseMipLevel = layers[i]->mipLevel;
+			range[i].levelCount = 1;
+			range[i].baseArrayLayer = layers[i]->baseArrayLayer;
+			range[i].layerCount = layers[i]->layerCount;
+			b[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			b[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			b[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			b[i].image = tex[i]->GetImageObj()->m_image;
+			b[i].subresourceRange = range[i];
+			b[i].oldLayout = tex[i]->GetImageLayout(range[i]);
+			b[i].newLayout = newLayout[i];
+		}
+		barrier_calcStageAndMask<TSrcA>(stages[0], b[0].srcAccessMask);
+		barrier_calcStageAndMask<TDstA>(stages[1], b[0].dstAccessMask);
+		barrier_calcStageAndMask<TSrcB>(stages[2], b[1].srcAccessMask);
+		barrier_calcStageAndMask<TDstB>(stages[3], b[1].dstAccessMask);
+		vkCmdPipelineBarrier(m_state.currentCommandBuffer, stages[0] | stages[2], stages[1] | stages[3], 0, 0, nullptr, 0, nullptr, 2, b);
+		for (int i = 0; i < 2; i++)
+			tex[i]->SetImageLayout(range[i], newLayout[i]);
 	}
 
 

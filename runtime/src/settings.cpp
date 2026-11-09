@@ -8,9 +8,11 @@
 #include "audio/output.h"
 #include "host/touch.h"
 #include "host/window.h"
+#include "input/input.h"
 #include "latte/latte.h"
 #include "log.h"
 #include "os.h"
+#include "telemetry.h"
 
 namespace settings {
 namespace {
@@ -23,9 +25,9 @@ void save_locked() {
     FILE* f = fopen(g_path.c_str(), "w");
     if (!f) return;
     fprintf(f, "# BotWRecomp settings (also editable from the in-game menu: touchpad, L3+R3 or F1)\n");
-    fprintf(f, "fps=%d\nscale=%g\ndisplay=%d\nfilter=%d\ngyro=%d\nrumble=%d\nlayout=%d\nshow_fps=%d\nvolume=%d\ntouch=%d\ntouch_hidden=%d\ngamepad_view=%d\n", g_s.fps,
-            g_s.scale, g_s.display, g_s.filter, g_s.gyro, g_s.rumble, g_s.layout, g_s.show_fps, g_s.volume, g_s.touch, g_s.touch_hidden,
-            g_s.gamepad_view);
+    fprintf(f, "fps=%d\nscale=%g\ndisplay=%d\nfilter=%d\ngyro=%d\ngyro_world=%d\nrumble=%d\nlayout=%d\nshow_fps=%d\nvolume=%d\ntouch=%d\ntouch_hidden=%d\ngamepad_view=%d\ntelemetry=%d\n",
+            g_s.fps, g_s.scale, g_s.display, g_s.filter, g_s.gyro, g_s.gyro_world, g_s.rumble, g_s.layout, g_s.show_fps, g_s.volume,
+            g_s.touch, g_s.touch_hidden, g_s.gamepad_view, g_s.telemetry);
     fclose(f);
 }
 }  // namespace
@@ -42,11 +44,15 @@ void apply() {
     latte::set_output_filter(s.filter);
     latte::set_gamepad_view(s.gamepad_view);
     window::set_gyro(s.gyro);
+    input::set_motion_world_turn(s.gyro_world);
     window::set_rumble(s.rumble);
     window::set_layout(s.layout);
     audio::set_volume(s.volume / 100.0f);
     touch::set_mode(s.touch);
     touch::set_hidden(s.touch_hidden);
+    // live in both directions; start() does nothing before boot has set the session root (main.cpp)
+    if (s.telemetry) telem::start();
+    else telem::stop();
 }
 
 void set(const Settings& s, bool save) {
@@ -74,6 +80,7 @@ void load(const std::string& path) {
                 else if (!strcmp(line, "display")) g_s.display = atoi(v);
                 else if (!strcmp(line, "filter")) g_s.filter = atoi(v);
                 else if (!strcmp(line, "gyro")) g_s.gyro = atoi(v) != 0;
+                else if (!strcmp(line, "gyro_world")) g_s.gyro_world = atoi(v) != 0;
                 else if (!strcmp(line, "rumble")) g_s.rumble = atoi(v) != 0;
                 else if (!strcmp(line, "layout")) {
                     int n = atoi(v);
@@ -84,6 +91,7 @@ void load(const std::string& path) {
                 else if (!strcmp(line, "touch")) g_s.touch = atoi(v);
                 else if (!strcmp(line, "touch_hidden")) g_s.touch_hidden = atoi(v) != 0;
                 else if (!strcmp(line, "gamepad_view")) g_s.gamepad_view = atoi(v) != 0;
+                else if (!strcmp(line, "telemetry")) g_s.telemetry = atoi(v) != 0;
             }
             fclose(f);
             LOG("settings: %s", path.c_str());

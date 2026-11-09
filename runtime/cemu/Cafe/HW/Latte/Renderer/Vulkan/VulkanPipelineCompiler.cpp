@@ -1118,6 +1118,11 @@ static std::vector<std::thread> s_compileThreads;
 static std::atomic_bool s_compileThreadsShutdownSignal{};
 static ConcurrentQueue<PipelineCompiler*> s_pipelineCompileRequests;
 
+#if BOOST_OS_LINUX
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
+
 static void compilePipeline_thread(sint32 threadIndex)
 {
 	SetThreadName("compilePl");
@@ -1126,6 +1131,10 @@ static void compilePipeline_thread(sint32 threadIndex)
 	// except for one thread which we always run at normal priority to prevent the opposite scenario where all compile threads are starved
 	if(threadIndex != 0)
 		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif BOOST_OS_LINUX
+	// BotWRecomp: same on Linux, where a nice value is per thread. Raising it needs no privileges.
+	if(threadIndex != 0)
+		setpriority(PRIO_PROCESS, (id_t)gettid(), 5);
 #endif
 	while (!s_compileThreadsShutdownSignal)
 	{

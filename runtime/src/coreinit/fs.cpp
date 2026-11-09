@@ -20,11 +20,18 @@
 #include "diag.h"
 #include "hle.h"
 #include "os.h"
+#include "telemetry.h"
+#include "thread.h"
 
 #include "botw_target.h"
-#if TARGET_OS_IOS  // iOS port: case-insensitive lookup in the game folder (ios/src/fs_case_ios.cpp)
+// iOS and Linux: case-insensitive lookup in the game folder (ios/src/fs_case_ios.cpp). Without mods
+// installed, content reads come straight through host_path, so this is the only case fix they get.
+#if TARGET_OS_IOS || defined(__linux__)
+#define BOTW_FIX_CASE 1
 std::string botw_ios_fix_case(const std::string& host);
 #endif
+
+void LatteBufferCache_notifyDCFlush(uint32_t address, uint32_t size);  // vendored Cemu GPU
 
 namespace {
 enum : int32_t {
@@ -85,7 +92,7 @@ HostInfo host_info(const std::string& hp) {
     return info;
 }
 
-#if TARGET_OS_IOS
+#if BOTW_FIX_CASE
 std::string host_path_exact(std::string p);
 std::string host_path(std::string p) { return botw_ios_fix_case(host_path_exact(std::move(p))); }
 #define host_path host_path_exact
@@ -143,7 +150,7 @@ std::string host_path(std::string p) {
     }
     return native_path(g_user_root + "/unknown_volume" + n);
 }
-#if TARGET_OS_IOS
+#if BOTW_FIX_CASE
 #undef host_path
 #endif
 
@@ -181,8 +188,22 @@ Handle* get(uint32_t h) { return h && h < g_handles.size() ? &g_handles[h] : nul
 // Kernel ReadFile/WriteFile does not fault reserved pages in. Commit first; if a page in the span
 // is already committed but not writable (BOTW_WATCH), copy through a host buffer so the watch
 // still sees the user-mode store.
+size_t read_guest_raw(FILE* f, uint32_t dst, size_t want);
+
+// File data lands in guest memory like a DMA write: the GPU-side caches (Cemu's buffer cache, the cross-frame index
+// cache) learn about it the way they learn about DCFlushRange. Without this, memory reused for a new file could
+// keep serving the previous file's vertex/index data.
 size_t read_guest(FILE* f, uint32_t dst, size_t want) {
+    const size_t got = read_guest_raw(f, dst, want);
+    if (got) LatteBufferCache_notifyDCFlush(dst, (uint32_t)got);
+    return got;
+}
+
+size_t read_guest_raw(FILE* f, uint32_t dst, size_t want) {
     if (!want) return 0;
+    telem::Scope timed(telem::FsNs);
+    telem::add(telem::FsReads, 1);
+    telem::add(telem::FsBytes, want);
     if (mem::commit(dst, want, true)) return fread(mem::host(dst), 1, want, f);
     size_t got = 0;
     std::vector<uint8_t> tmp(std::min(want, (size_t)1 << 20));
@@ -254,7 +275,7 @@ int32_t open_file(PPCContext* c, const std::string& raw, const char* mode, uint3
         info.ok = true;
         info.size = q.size;
         overlay = q.overlay;
-#if TARGET_OS_IOS
+#if BOTW_FIX_CASE
         hp = botw_ios_fix_case(hp);
 #endif
     } else {
@@ -412,7 +433,14 @@ HLE_EXPORT(coreinit, FSReadFile) {
         return;
     }
     size_t want = (size_t)size * count;
-    size_t n = read_guest(f, dst, want);
+    size_t n;
+    {
+        // Cafe OS sleeps the caller during file I/O. Holding the core here stalled the job workers sharing it
+        // for the whole disk read (Deck: up to 900 ms/s behind Resource_Loading while it used 3% CPU).
+        threads::CoreHandoff handoff;
+        handoff.yield();
+        n = read_guest(f, dst, want);
+    }
     if (diag_on()) {
         bool text = host.find("Region") != std::string::npos || host.find(".txt") != std::string::npos;
         if (text || n != want || want <= 4096) {

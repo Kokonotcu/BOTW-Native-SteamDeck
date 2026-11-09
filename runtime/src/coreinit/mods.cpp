@@ -1373,7 +1373,7 @@ bool parse_and_encode_patch_rhs(uint32_t addr, std::string_view rhs_raw,
     if (low.starts_with("b ") || low.starts_with("b\t") ||
         low.starts_with("bl ") || low.starts_with("bl\t")) {
         bool is_bl = low.starts_with("bl");
-        std::string_view arg = trim(std::string_view(rhs).substr(is_bl ? 2 : 1));
+        std::string arg = trim(std::string_view(rhs).substr(is_bl ? 2 : 1));  // trim returns a temporary
         double target_d = 0.0;
         if (!eval_num(arg, target_d)) return false;
         uint32_t target = static_cast<uint32_t>(std::llround(target_d));
@@ -2635,8 +2635,32 @@ void init(const std::string& game_root, const std::string& user_root, bool enabl
     rebuild_state_locked();
 }
 
+// BotW-Native: archives (*.pack), the resource size table and map units are read when the game boots or an area
+// loads and stay open or cached. Swapping them under a running game mixed old and new data (2026-11-03: a camp
+// with its props gone and invisible items). A reload that would switch such a mod on or off waits for the next
+// launch; mods.ini already holds the choice.
+static bool has_boot_files(const std::string& root) {
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(utf8_to_path(root), ec), end; it != end && !ec; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        const std::string ext = lower_ascii(path_to_utf8(it->path().extension()));
+        if (ext == ".pack" || ext == ".srsizetable" || ext == ".smubin") return true;
+    }
+    return false;
+}
+
 void reload() {
     std::lock_guard<std::recursive_mutex> lk(g_mods_mtx);
+    {
+        std::lock_guard<std::mutex> lock(g_disc_mu);
+        for (const auto& d : g_discovered) {
+            if (d.enabled != d.loaded_now && has_boot_files(d.root_path)) {
+                g_pending_restart = true;
+                LOG("mods: %s has packs, the size table or map files: it applies at the next launch", d.folder.c_str());
+                return;
+            }
+        }
+    }
     rebuild_state_locked();
 }
 

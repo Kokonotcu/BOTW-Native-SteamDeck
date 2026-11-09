@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <array>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
@@ -28,6 +29,14 @@ std::string key(const char* lib, const char* name) { return std::string(lib) + "
 
 #if defined(_WIN32)
 extern "C" char __ImageBase[];
+#define BOTW_IMAGE_BASE __ImageBase
+#elif defined(__linux__)
+// ELF header of the executable, defined by ld and lld: the image base, PIE or not.
+extern "C" char __ehdr_start[] __attribute__((visibility("hidden")));
+#define BOTW_IMAGE_BASE __ehdr_start
+#endif
+#if defined(BOTW_IMAGE_BASE)
+#define BOTW_RVA_TABLE 1
 // Static 32-bit RVA table in BSS (38.7 MB vs 76.6 MB 64-bit pointer table): halves L3/DTLB footprint
 // and uses RIP-relative indexing on the hot indirect-call path.
 constexpr uint32_t kMaxTextSpan = 0x02500000u;
@@ -95,6 +104,8 @@ __attribute__((noinline)) GuestFn lookup_slow(uint32_t addr) {
 }
 }  // namespace
 
+static void ic_bump_epoch();  // per-call-site cache, below
+
 HleRegistration::HleRegistration(const char* lib, const char* name, GuestFn fn) { registry()[key(lib, name)] = fn; }
 
 GuestFn hle::find(const char* lib, const char* name) {
@@ -117,12 +128,15 @@ void init() {
     size_t n = g_text_span >> 2;
     g_text_table = (GuestFn*)calloc(n, sizeof(GuestFn));
     for (uint32_t i = 0; i < g_guest_function_count; i++) {
+        // a graphic pack's code cave (Cemu's cave area, 0x01800000) sits below the game's code: its functions are
+        // only reached by direct calls from recompiled code, never through this table
+        if (g_guest_functions[i].addr < mem::kText) continue;
         uint32_t idx = (g_guest_functions[i].addr - mem::kText) >> 2;
         GuestFn fn = g_guest_functions[i].fn;
         g_text_table[idx] = fn;
-#if defined(_WIN32)
+#if BOTW_RVA_TABLE
         if ((idx << 2) < kMaxTextSpan && fn) {
-            uintptr_t diff = (uintptr_t)fn - (uintptr_t)__ImageBase;
+            uintptr_t diff = (uintptr_t)fn - (uintptr_t)BOTW_IMAGE_BASE;
             if (diff <= 0xFFFFFFFFu) g_text_rva[idx] = (uint32_t)diff;
         }
 #endif
@@ -133,10 +147,10 @@ void init() {
 GuestFn lookup(uint32_t addr) {
     t_current_dispatch_addr = addr;
     uint32_t off = addr - mem::kText;
-#if defined(_WIN32)
+#if BOTW_RVA_TABLE
     if (__builtin_expect(off < kMaxTextSpan, 1)) {
         uint32_t rva = g_text_rva[off >> 2];
-        if (__builtin_expect(rva != 0, 1)) return (GuestFn)(__ImageBase + rva);
+        if (__builtin_expect(rva != 0, 1)) return (GuestFn)(BOTW_IMAGE_BASE + rva);
         if (g_text_table && off < g_text_span && g_text_table[off >> 2]) return g_text_table[off >> 2];
         return nullptr;
     }
@@ -209,18 +223,20 @@ static void save_and_set_fn_override_locked(uint32_t idx, GuestFn new_fn) {
         SavedFnOverride sv;
         sv.idx = idx;
         sv.orig_fn = g_text_table[idx];
-#if defined(_WIN32)
+#if BOTW_RVA_TABLE
         if ((idx << 2) < kMaxTextSpan) sv.orig_rva = g_text_rva[idx];
 #endif
         g_saved_fn_overrides.push_back(sv);
     }
     g_text_table[idx] = new_fn;
-#if defined(_WIN32)
+#if BOTW_RVA_TABLE
     if ((idx << 2) < kMaxTextSpan) {
-        uintptr_t diff = (uintptr_t)new_fn - (uintptr_t)__ImageBase;
-        g_text_rva[idx] = (new_fn && diff <= 0xFFFFFFFFu) ? (uint32_t)diff : 0u;
+        uintptr_t diff = (uintptr_t)new_fn - (uintptr_t)BOTW_IMAGE_BASE;
+        // stub_fn_ret_imm reads t_current_dispatch_addr: keep it on the slow path, which sets it
+        g_text_rva[idx] = (new_fn && new_fn != stub_fn_ret_imm && diff <= 0xFFFFFFFFu) ? (uint32_t)diff : 0u;
     }
 #endif
+    ic_bump_epoch();
 }
 
 bool is_function_entry(uint32_t addr) {
@@ -247,6 +263,21 @@ void override_fn_ret_imm(uint32_t addr, uint32_t imm) {
     save_and_set_fn_override_locked((addr - mem::kText) >> 2, fn);
 }
 
+// A native replacement owned by the port (not a mod patch): not saved, so restore_fn_overrides keeps it.
+void replace_fn_native(uint32_t addr, GuestFn fn) {
+    if (!is_function_entry(addr)) return;
+    std::unique_lock<std::shared_mutex> l(g_lock);
+    const uint32_t idx = (addr - mem::kText) >> 2;
+    g_text_table[idx] = fn;
+#if BOTW_RVA_TABLE
+    if ((idx << 2) < kMaxTextSpan) {
+        uintptr_t diff = (uintptr_t)fn - (uintptr_t)BOTW_IMAGE_BASE;
+        g_text_rva[idx] = diff <= 0xFFFFFFFFu ? (uint32_t)diff : 0u;
+    }
+#endif
+    ic_bump_epoch();
+}
+
 bool redirect_fn(uint32_t addr, uint32_t target) {
     if (!is_function_entry(addr)) return false;
     GuestFn target_fn = lookup(target);
@@ -261,13 +292,14 @@ void restore_fn_overrides() {
     if (g_text_table) {
         for (auto it = g_saved_fn_overrides.rbegin(); it != g_saved_fn_overrides.rend(); ++it) {
             g_text_table[it->idx] = it->orig_fn;
-#if defined(_WIN32)
+#if BOTW_RVA_TABLE
             if ((it->idx << 2) < kMaxTextSpan) g_text_rva[it->idx] = it->orig_rva;
 #endif
         }
     }
     g_saved_fn_overrides.clear();
     g_fn_ret_imms.clear();
+    ic_bump_epoch();
 }
 
 static void trap_unimplemented_thunk(PPCContext* c) {
@@ -291,6 +323,104 @@ uint32_t guest_call(PPCContext* c, uint32_t fn, std::initializer_list<uint32_t> 
 }
 
 // ---- runtime entry points used by generated code -----------------------------------------------
+static void rt_call_slow(PPCContext* c, uint32_t target);
+
+// Per-call-site cache of the generated code (ppc.h rt_call, BOTW_INLINE_RT_CALL): one 64-bit word per site,
+// target | epoch << 32 | (rva / 16) << 36. Function overrides bump the epoch, which drops every entry; at epoch 15
+// the cache stays off for the session so a wrapped epoch can never match an old entry. Epochs start at 1, so a
+// zero-initialized entry never matches (a call to guest address 0 still reaches rt_trap).
+extern "C" {
+uint32_t botw_ic_epoch = 1;
+}
+
+static void ic_bump_epoch() {
+    if (botw_ic_epoch < 15) __atomic_store_n(&botw_ic_epoch, botw_ic_epoch + 1, __ATOMIC_RELEASE);
+}
+
+// TEST ONLY (BOTW_ICPROBE=1): how many distinct targets the missing call sites have, to size a polymorphic cache.
+// Logs every 2^22 fills: fills, per-site target-count histogram (sites and fills), for the first 64k sites seen.
+static void ic_probe(uint64_t* entry, uint32_t target) {
+    static const bool on = getenv("BOTW_ICPROBE") && atoi(getenv("BOTW_ICPROBE")) != 0;
+    if (!on) return;
+    static std::mutex m;
+    static std::unordered_map<uint64_t*, std::pair<std::array<uint32_t, 8>, uint64_t>> sites;  // targets, fills
+    static uint64_t fills = 0;
+    std::lock_guard<std::mutex> l(m);
+    fills++;
+    auto it = sites.find(entry);
+    if (it == sites.end()) {
+        if (sites.size() < 65536) it = sites.emplace(entry, std::make_pair(std::array<uint32_t, 8>{}, (uint64_t)0)).first;
+    }
+    if (it != sites.end()) {
+        auto& t = it->second.first;
+        it->second.second++;
+        for (uint32_t& v : t) {
+            if (v == target) break;
+            if (v == 0) { v = target; break; }
+        }
+    }
+    if ((fills & ((1u << 22) - 1)) != 0) return;
+    uint64_t sitesBy[9] = {}, fillsBy[9] = {};
+    for (auto& [e, p] : sites) {
+        int n = 0;
+        for (uint32_t v : p.first) n += v != 0;
+        sitesBy[n]++;
+        fillsBy[n] += p.second;
+    }
+    LOG("icprobe: %llu fills; sites/fills by distinct targets: 1:%llu/%llu 2:%llu/%llu 3:%llu/%llu 4:%llu/%llu 5-7:%llu/%llu 8+:%llu/%llu",
+        (unsigned long long)fills, (unsigned long long)sitesBy[1], (unsigned long long)fillsBy[1], (unsigned long long)sitesBy[2],
+        (unsigned long long)fillsBy[2], (unsigned long long)sitesBy[3], (unsigned long long)fillsBy[3], (unsigned long long)sitesBy[4],
+        (unsigned long long)fillsBy[4], (unsigned long long)(sitesBy[5] + sitesBy[6] + sitesBy[7]),
+        (unsigned long long)(fillsBy[5] + fillsBy[6] + fillsBy[7]), (unsigned long long)sitesBy[8], (unsigned long long)fillsBy[8]);
+}
+
+// Shared target cache in front of g_text_rva for call-site misses. 80% of those misses come from ~430 sites with 8+
+// targets (virtual calls; BOTW_ICPROBE), and the 38 MB table load was 75% of rt_call_fill on the Deck (cache miss).
+// 8192 one-word entries (64 KB, stays in L2), same format as the per-site entries; an epoch bump invalidates both.
+// BOTW_TCACHE=0 off.
+constexpr uint32_t kTCacheBits = 13;
+alignas(64) static uint64_t s_tcache[1u << kTCacheBits];
+static const bool s_tcache_on = !(getenv("BOTW_TCACHE") && atoi(getenv("BOTW_TCACHE")) == 0);
+
+extern "C" void rt_call_fill(PPCContext* c, uint32_t target, uint64_t* entry) {
+    ic_probe(entry, target);
+#if BOTW_RVA_TABLE
+    const uint32_t off = target - mem::kText;
+    const uint32_t epoch = __atomic_load_n(&botw_ic_epoch, __ATOMIC_ACQUIRE);
+    if (off < kMaxTextSpan && epoch < 15) {
+        uint64_t* const slot = &s_tcache[((target >> 2) * 2654435761u) >> (32 - kTCacheBits)];
+        const uint64_t te = s_tcache_on ? __atomic_load_n(slot, __ATOMIC_RELAXED) : 0;
+        uint32_t rva;
+        if ((uint32_t)te == target && ((te >> 32) & 15) == epoch) {
+            rva = (uint32_t)(te >> 36) << 4;
+        } else {
+            rva = g_text_rva[off >> 2];
+            if (s_tcache_on && rva != 0 && (rva & 15) == 0)
+                __atomic_store_n(slot, (uint64_t)target | ((uint64_t)epoch << 32) | ((uint64_t)(rva >> 4) << 36), __ATOMIC_RELAXED);
+        }
+        if (rva != 0 && (rva & 15) == 0) {
+            // The first target of an epoch sticks: a call site with several targets would otherwise rewrite its
+            // entry on every miss, and threads running the same code would bounce that cache line between cores.
+            // Except a run: the same target missing twice in a row at this site on this thread takes the site over.
+            // The runtime's array construct/destroy loops (f_0420ca64 / f_0420cc7c) are one site for every class,
+            // so all but the first class missed on every element (rt_call_fill ~10% of RadarMgr in the CPU power
+            // spikes, session 151616).
+            static thread_local uint64_t* t_run_site = nullptr;
+            static thread_local uint32_t t_run_target = 0;
+            const uint64_t old = __atomic_load_n(entry, __ATOMIC_RELAXED);
+            if (((old >> 32) & 15) != epoch || (t_run_site == entry && t_run_target == target))
+                __atomic_store_n(entry, (uint64_t)target | ((uint64_t)epoch << 32) | ((uint64_t)(rva >> 4) << 36), __ATOMIC_RELAXED);
+            t_run_site = entry, t_run_target = target;
+            t_current_dispatch_addr = target;
+            ((GuestFn)(BOTW_IMAGE_BASE + rva))(c);
+            return;
+        }
+    }
+#endif
+    (void)entry;
+    rt_call(c, target);
+}
+
 static __attribute__((noinline)) void rt_call_slow(PPCContext* c, uint32_t target) {
     GuestFn fn = lookup_slow(target);
     if (__builtin_expect(!fn, 0)) rt_trap(c, target, "indirect call to an address with no recompiled function");
@@ -300,11 +430,11 @@ static __attribute__((noinline)) void rt_call_slow(PPCContext* c, uint32_t targe
 extern "C" void rt_call(PPCContext* c, uint32_t target) {
     t_current_dispatch_addr = target;
     uint32_t off = target - mem::kText;
-#if defined(_WIN32)
+#if BOTW_RVA_TABLE
     if (__builtin_expect(off < kMaxTextSpan, 1)) {
         uint32_t rva = g_text_rva[off >> 2];
         if (__builtin_expect(rva != 0, 1)) {
-            GuestFn fn = (GuestFn)(__ImageBase + rva);
+            GuestFn fn = (GuestFn)(BOTW_IMAGE_BASE + rva);
             fn(c);
             return;
         }

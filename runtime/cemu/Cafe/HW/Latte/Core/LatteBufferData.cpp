@@ -321,4 +321,6 @@ void LatteBufferCache_Sync(uint32 maxVtxIndex, uint32 baseInstance, uint32 insta
 		if ( LatteBufferCache_syncGPUUniformBuffers(geometryShader, mmSQ_GS_UNIFORM_BLOCK_START, LatteConst::ShaderType::Geometry, gsUniformBufferDirtyMask) )
 			stageUniformModifiedMask |= (1<<static_cast<int>(LatteConst::ShaderType::Geometry) /* BotWRecomp: was VulkanRendererConst */);
 	}
+	if (g_bufferCacheUploads != 0)
+		LatteBufferCache_syncAllInvalidated();
 }

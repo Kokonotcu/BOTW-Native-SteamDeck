@@ -201,31 +201,37 @@ CachedFBOVk::RendertargetSelfDependencyMask CachedFBOVk::CheckForSelfDependency(
 {
 	s_selfDependencyCheckIndex++;
 	const uint32 curColIndex = s_selfDependencyCheckIndex;
+	auto markAttachment = [curColIndex](const LatteTextureView* view, VkImageAspectFlags aspect) {
+		LatteTextureVk* vkTex = static_cast<LatteTextureVk*>(view->baseTexture);
+		const bool again = vkTex->m_selfDependencyCheckIndex == curColIndex;
+		vkTex->m_selfDependencyCheckIndex = curColIndex;
+		vkTex->m_selfDependencyCheckAspectMask = again ? (vkTex->m_selfDependencyCheckAspectMask | aspect) : aspect;
+		vkTex->m_selfDependencyCheckView = again ? nullptr : view;
+	};
 	for (auto& colorAttachment : colorBuffer)
 	{
 		if (colorAttachment.texture)
-		{
-			LatteTextureVk* vkTex = static_cast<LatteTextureVk*>(colorAttachment.texture->baseTexture);
-			vkTex->m_selfDependencyCheckIndex = curColIndex;
-			vkTex->m_selfDependencyCheckAspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		}
+			markAttachment(colorAttachment.texture, VK_IMAGE_ASPECT_COLOR_BIT);
 	}
 	if (depthBuffer.texture)
-	{
-		LatteTextureVk* vkTex = static_cast<LatteTextureVk*>(depthBuffer.texture->baseTexture);
-		vkTex->m_selfDependencyCheckIndex = curColIndex;
-		vkTex->m_selfDependencyCheckAspectMask = depthBuffer.hasStencil ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT): VK_IMAGE_ASPECT_DEPTH_BIT;
-	}
+		markAttachment(depthBuffer.texture, depthBuffer.hasStencil ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_DEPTH_BIT);
 
-	auto getSelfDependencyMask = [curColIndex](VkDescriptorSetInfo* ds) -> VkImageAspectFlags
+	// BotW-Native: per subresource. Sampling another mip or slice of an attached image (downsample chains, shadow
+	// cascades) reads nothing this render pass writes; only overlapping views are a self dependency
+	auto overlaps = [](const LatteTextureView* a, const LatteTextureView* b) {
+		return a->firstMip < b->firstMip + b->numMip && b->firstMip < a->firstMip + a->numMip &&
+			a->firstSlice < b->firstSlice + b->numSlice && b->firstSlice < a->firstSlice + a->numSlice;
+	};
+	auto getSelfDependencyMask = [curColIndex, &overlaps](VkDescriptorSetInfo* ds) -> VkImageAspectFlags
 	{
 		VkImageAspectFlags aspectMask = 0;
 		if (!ds)
 			return aspectMask;
-		for (auto& itr : ds->list_fboCandidates)
+		for (auto& view : ds->list_referencedViews)
 		{
-			if (itr->m_selfDependencyCheckIndex == curColIndex)
-				aspectMask |= itr->m_selfDependencyCheckAspectMask;
+			const LatteTextureVk* tex = static_cast<const LatteTextureVk*>(view->baseTexture);
+			if (tex->m_selfDependencyCheckIndex == curColIndex && (!tex->m_selfDependencyCheckView || overlaps(tex->m_selfDependencyCheckView, view)))
+				aspectMask |= tex->m_selfDependencyCheckAspectMask;
 		}
 		return aspectMask;
 	};

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -26,6 +27,7 @@
 extern std::atomic<pthread_t> g_gpu_thread;  // cemu_shims/overlay_menu.cpp: Cemu's GPU thread
 #include "menu.h"
 #include "../settings.h"
+#include "swkbd_host.h"
 #include "touch.h"
 #include "../bench/bench.h"
 #include "../thread.h"
@@ -130,6 +132,7 @@ struct Controller {
     SDL_JoystickID id = 0;
     uint64_t last_used = 0;
     uint64_t connect_seq = 0;
+    bool gyro = false;  // its gyro and accelerometer are enabled
 };
 std::vector<Controller> g_ctrls;
 uint64_t g_connect_seq = 0;
@@ -139,9 +142,56 @@ int find_ctrl(SDL_JoystickID id) {
         if (g_ctrls[i].id == id) return i;
     return -1;
 }
+// Under Steam Input the game reads Steam's virtual gamepad, which has no motion sensors. The Deck's own
+// controller (opened through HIDAPI, see controller_hints) then only supplies gyro and accelerometer;
+// its buttons and sticks stay with the virtual gamepad and the player's Steam Input layout.
+// SDL reports a Steam virtual gamepad with the IDs of the controller behind it (28de:1205 for the Deck),
+// so the Steam Input handle is what tells them apart.
+bool is_steam_virtual(SDL_Gamepad* pad) { return SDL_GetGamepadSteamHandle(pad) != 0; }
+bool is_deck_builtin(SDL_Gamepad* pad) {
+    return pad && !is_steam_virtual(pad) && SDL_GetGamepadVendor(pad) == 0x28de && SDL_GetGamepadProduct(pad) == 0x1205;
+}
+// Steam turns the Deck's motion sensor off while a game runs with a layout that does not use gyro (reports
+// then carry zeros), and SDL's Deck driver never turns it on. Send the controller SETTING_IMU_MODE = raw
+// accelerometer + raw gyro (the feature report SDL's Steam Controller driver uses), again every 2 s in
+// case Steam resets it. Only while a Deck built-in controller is open and gyro is enabled.
+void keep_deck_imu_on() {
+    static uint64_t next = 0;
+    const uint64_t now = SDL_GetTicks();
+    if (now < next) return;
+    next = now + 2000;
+    bool deck = false;
+    for (const Controller& c : g_ctrls) deck |= c.gyro && is_deck_builtin(c.pad);
+    if (!deck) return;
+    SDL_hid_device_info* list = SDL_hid_enumerate(0x28de, 0x1205);
+    for (SDL_hid_device_info* d = list; d; d = d->next) {
+        if (d->interface_number != 2) continue;  // 0 mouse, 1 keyboard, 2 controller
+        if (SDL_hid_device* h = SDL_hid_open_path(d->path)) {
+            unsigned char buf[65] = {};
+            buf[1] = 0x87;                         // ID_SET_SETTINGS_VALUES
+            buf[2] = 3;                            // one setting: id + 16-bit value
+            buf[3] = 48;                           // SETTING_IMU_MODE
+            buf[4] = 0x08 | 0x10;                  // SETTING_GYRO_MODE_SEND_RAW_ACCEL | _SEND_RAW_GYRO
+            static bool logged = false;
+            if (SDL_hid_send_feature_report(h, buf, sizeof buf) < 0 && !logged) {
+                logged = true;
+                LOG("controller: could not turn the Deck motion sensor on (%s)", SDL_GetError());
+            }
+            SDL_hid_close(h);
+        }
+    }
+    SDL_hid_free_enumeration(list);
+}
+bool motion_only(int i) {
+    if (i < 0 || !is_deck_builtin(g_ctrls[i].pad)) return false;
+    for (const Controller& c : g_ctrls)
+        if (is_steam_virtual(c.pad)) return true;
+    return false;
+}
 int active_index() {
     int best = -1;
     for (int i = 0; i < (int)g_ctrls.size(); i++) {
+        if (motion_only(i)) continue;
         if (best < 0) {
             best = i;
             continue;
@@ -155,6 +205,14 @@ int active_index() {
 SDL_Gamepad* active_pad() {
     int i = active_index();
     return i >= 0 ? g_ctrls[i].pad : nullptr;
+}
+// Motion comes from the active controller, or from a motion-only one when the active one has no sensors.
+SDL_JoystickID motion_source() {
+    int a = active_index();
+    if (a >= 0 && g_ctrls[a].gyro) return g_ctrls[a].id;
+    for (int i = 0; i < (int)g_ctrls.size(); i++)
+        if (g_ctrls[i].gyro && motion_only(i)) return g_ctrls[i].id;
+    return 0;
 }
 const char* type_name(SDL_GamepadType t) {
     switch (t) {
@@ -231,9 +289,10 @@ void open_controller(SDL_JoystickID id) {
     bool gyro = enable_motion(pad);
     SDL_JoystickID prev = 0;
     if (int p = active_index(); p >= 0) prev = g_ctrls[p].id;
-    g_ctrls.push_back(Controller{pad, SDL_GetGamepadID(pad), 0, ++g_connect_seq});
-    LOG("controller connected: %s (%s%s, %s)", pad_name(pad), type_name(SDL_GetGamepadType(pad)), gyro ? ", gyro" : "",
-        face_phrase(pad));
+    g_ctrls.push_back(Controller{pad, SDL_GetGamepadID(pad), 0, ++g_connect_seq, gyro});
+    LOG("controller connected: %s (%s%s, %s) %04x:%04x%s%s", pad_name(pad), type_name(SDL_GetGamepadType(pad)),
+        gyro ? ", gyro" : "", face_phrase(pad), SDL_GetGamepadVendor(pad), SDL_GetGamepadProduct(pad),
+        is_steam_virtual(pad) ? " Steam virtual" : "", is_deck_builtin(pad) ? " Deck built-in" : "");
     touch::set_controller_connected(true);
     if (int n = active_index(); n >= 0 && g_ctrls[n].id != prev) {
         if (prev) input::motion_reset();
@@ -258,7 +317,7 @@ void close_controller(SDL_JoystickID id) {
 }
 void note_used(SDL_JoystickID id) {
     int i = find_ctrl(id);
-    if (i < 0) return;
+    if (i < 0 || motion_only(i)) return;
     SDL_JoystickID prev = 0;
     if (int p = active_index(); p >= 0) prev = g_ctrls[p].id;
     uint64_t now = SDL_GetTicks();
@@ -288,6 +347,33 @@ void controller_hints() {
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_COMBINE_JOY_CONS, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_8BITDO, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_GAMECUBE, "1");
+#if defined(__linux__)
+    // Steam lists the Deck's built-in controller (28de:1205) in SDL_GAMECONTROLLER_IGNORE_DEVICES so games only
+    // see its virtual gamepad, which has no motion sensors. Keep the rest of the list; the built-in controller
+    // is then opened for gyro and accelerometer only (motion_only).
+    auto deck = [](std::string s) {
+        s.erase(std::remove(s.begin(), s.end(), ' '), s.end());
+        return SDL_strcasecmp(s.c_str(), "0x28de/0x1205") == 0;
+    };
+    if (const char* e = getenv("SDL_GAMECONTROLLER_IGNORE_DEVICES"); e && *e) {
+        std::string kept, item;
+        for (const char* p = e;; p++) {
+            if (*p == ',' || *p == 0) {
+                if (!item.empty() && !deck(item)) kept += (kept.empty() ? "" : ",") + item;
+                item.clear();
+                if (!*p) break;
+            } else {
+                item += *p;
+            }
+        }
+        SDL_SetHintWithPriority(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES, kept.c_str(), SDL_HINT_OVERRIDE);
+        LOG("controller: Steam's ignore list without the Deck controller: %s", kept.empty() ? "(empty)" : kept.c_str());
+    }
+    if (const char* e = getenv("SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT"); e && *e) {
+        std::string allowed = std::string(e) + ",0x28de/0x1205";
+        SDL_SetHintWithPriority(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT, allowed.c_str(), SDL_HINT_OVERRIDE);
+    }
+#endif
 #if defined(_WIN32)
     // Xbox stays on RawInput + XInput. HIDAPI for those pads as well opens each
     // one twice. RawInput claims the IG_ device; DirectInput then skips it.
@@ -410,6 +496,10 @@ void apply_input() {
         }
     }
     touch::apply(s);  // on-screen controls (s is cleared below while the menu is open)
+    if (swkbd::active()) {  // the game's text entry owns the controls (window.cpp event loop)
+        g_key_pulses.clear();
+        s = input::PadState{};
+    }
     if (menu::is_open()) {  // the menu owns the controls; the game sees nothing pressed
         g_key_pulses.clear();
         s = input::PadState{};
@@ -606,6 +696,7 @@ void run() {
     auto t0 = SDL_GetTicks();
     update_safe_area();
     while (!g_quit) {
+        keep_deck_imu_on();
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT) g_quit = true;
@@ -616,10 +707,10 @@ void run() {
             else if (e.type == SDL_EVENT_GAMEPAD_ADDED) open_controller(e.gdevice.which);
             else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) close_controller(e.gdevice.which);
             else if (e.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE) {
-                if (SDL_Gamepad* pad = active_pad(); pad && e.gsensor.which == SDL_GetGamepadID(pad))
+                if (SDL_JoystickID src = motion_source(); src && e.gsensor.which == src)
                     if (e.gsensor.sensor == SDL_SENSOR_GYRO || e.gsensor.sensor == SDL_SENSOR_ACCEL)
                         input::motion_sensor(e.gsensor.sensor == SDL_SENSOR_GYRO, e.gsensor.data, e.gsensor.timestamp);
-            } else if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+            } else if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && !motion_only(find_ctrl(e.gbutton.which))) {
                 note_used(e.gbutton.which);
                 int ci = find_ctrl(e.gbutton.which);
                 SDL_Gamepad* pad = ci >= 0 ? g_ctrls[ci].pad : nullptr;
@@ -628,8 +719,15 @@ void run() {
                                            (b == SDL_GAMEPAD_BUTTON_RIGHT_STICK && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_LEFT_STICK)));
                 // The menu uses the physical positions, whatever the in-game button layout is: the bottom
                 // face button (Cross / Xbox A) selects, the right one (Circle / Xbox B) closes.
-                if (b == SDL_GAMEPAD_BUTTON_TOUCHPAD || both_sticks) menu::toggle();
-                else if (b == SDL_GAMEPAD_BUTTON_GUIDE || b == SDL_GAMEPAD_BUTTON_MISC1) toggle_gamepad_view();
+                if (swkbd::active() && !menu::is_open()) {  // the game's text entry: Start = OK, B = delete, Y = keyboard again
+                    if (b == SDL_GAMEPAD_BUTTON_START) swkbd::confirm();
+                    else if (b == SDL_GAMEPAD_BUTTON_EAST) swkbd::backspace();
+                    else if (b == SDL_GAMEPAD_BUTTON_NORTH && getenv("SteamGameId")) SDL_OpenURL("steam://open/keyboard?Mode=0");
+                    else if (b == SDL_GAMEPAD_BUTTON_TOUCHPAD || both_sticks) menu::toggle();
+                } else if (b == SDL_GAMEPAD_BUTTON_TOUCHPAD || both_sticks) menu::toggle();
+                // the Deck's Steam and "..." buttons belong to SteamOS (they reach the game too with Steam Input off)
+                else if ((b == SDL_GAMEPAD_BUTTON_GUIDE || b == SDL_GAMEPAD_BUTTON_MISC1) && !is_deck_builtin(pad))
+                    toggle_gamepad_view();
                 else if (menu::is_open()) {
                     if (b == SDL_GAMEPAD_BUTTON_DPAD_UP) menu::move(-1);
                     else if (b == SDL_GAMEPAD_BUTTON_DPAD_DOWN) menu::move(+1);
@@ -645,7 +743,12 @@ void run() {
             } else if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
                 if (e.gaxis.value > kTriggerOn || e.gaxis.value < -kTriggerOn) note_used(e.gaxis.which);
             } else if (e.type == SDL_EVENT_TEXT_INPUT && g_win) {
-                SDL_StopTextInput(g_win);
+                if (swkbd::active()) swkbd::type(e.text.text);  // Steam Deck / physical keyboard into the game's form
+                else SDL_StopTextInput(g_win);
+            } else if (e.type == SDL_EVENT_KEY_DOWN && swkbd::active() && !menu::is_open()) {
+                if (e.key.key == SDLK_BACKSPACE) swkbd::backspace();
+                else if (e.key.key == SDLK_RETURN || e.key.key == SDLK_KP_ENTER) swkbd::confirm();
+                else if (e.key.key == SDLK_F1) menu::toggle();
             } else if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
                 // Record the press before the menu toggle. A tap of E can be down and
                 // up inside one poll; the pulse keeps it visible to the next VPADRead.
@@ -694,9 +797,23 @@ void run() {
                 update_safe_area();
             }
         }
+        // The game asked for text (swkbd.rpl): SDL text input on, and the Steam Deck keyboard opened through Steam
+        // (steam://open/keyboard; only when started from Steam). Closed again when the game hides its keyboard.
+        if (const int vis = swkbd::take_visibility_change(); vis && g_win) {
+            const bool steam = getenv("SteamGameId") != nullptr;
+            if (vis > 0) {
+                SDL_StartTextInput(g_win);
+                if (steam) SDL_OpenURL("steam://open/keyboard?Mode=0");
+                LOG("swkbd: text entry opened%s", steam ? ", Steam keyboard requested" : "");
+            } else {
+                SDL_StopTextInput(g_win);
+                if (steam) SDL_OpenURL("steam://close/keyboard");
+                LOG("swkbd: text entry closed");
+            }
+        }
         // A game text box is not an OS field. If text input turns on, key events
         // can stop updating the keyboard state the game is sampled from.
-        if (g_win && SDL_TextInputActive(g_win)) {
+        if (g_win && SDL_TextInputActive(g_win) && !swkbd::active()) {
             SDL_StopTextInput(g_win);
             static bool logged = false;
             if (!logged) {
@@ -705,8 +822,9 @@ void run() {
             }
         }
         apply_input();
-        // Freeze watchdog: no game frame for 8 s while in the foreground -> log every thread (once a minute)
-        {
+        // Freeze watchdog: no game frame for 8 s while in the foreground -> log every thread (once a minute).
+        // Diagnostics: only with telemetry on (as the slow-frame sampler below).
+        if (telem::on()) {
             static uint64_t seen = 0, changed_ms = 0, dumped_ms = 0;
             uint64_t ms = SDL_GetTicks(), gf = g_game_frames;
             if (gf != seen || g_background) seen = gf, changed_ms = ms;
@@ -719,7 +837,7 @@ void run() {
         }
         // Slow-frame sampler: fewer than 6 game frames in the last second (foreground) -> log the host stack of
         // Cemu's GPU thread every 200 ms, at most 40 a minute (symbolize with atos against the binary).
-        {
+        if (telem::on()) {
             static uint64_t win_ms = 0, win_gf = 0, next_ms = 0, minute_ms = 0;
             static bool slow = false;
             static int taken = 0;

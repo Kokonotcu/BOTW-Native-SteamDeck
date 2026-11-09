@@ -137,16 +137,20 @@ HLE_EXPORT(nn_aoc, AOC_ListTitle) {
     RET(0);
 }
 // AOC_OpenTitle(char* pathOut, AOCTitle* title, work, workSize): path is at AOCTitle+0x0E
+// Writes only the string and its terminator, like Cemu's strcpy. BotW passes the 0x60-byte buffer of a
+// sead::FixedSafeString with the next string object right behind it; clearing 0x80 bytes wiped that
+// object's vtable and the boot crashed whenever the DLC was installed.
 HLE_EXPORT(nn_aoc, AOC_OpenTitle) {
-    if (!ARG(0) || !mem::commit(ARG(0), 0x80, true)) {
-        RET(0);
-        return;
-    }
-    memset(mem::host(ARG(0)), 0, 0x80);
     const char* src = "";
     if (ARG(1) && mem::commit(ARG(1) + 0x0E, 88, false)) src = mem::str(ARG(1) + 0x0E);
     if (!src) src = "";
-    strncpy((char*)mem::host(ARG(0)), src, 0x7F);
+    size_t n = strnlen(src, 87);
+    if (!ARG(0) || !mem::commit(ARG(0), n + 1, true)) {
+        RET(0);
+        return;
+    }
+    memcpy(mem::host(ARG(0)), src, n);
+    mem::host(ARG(0))[n] = 0;
     RET(0);
 }
 HLE_EXPORT(nn_aoc, AOC_CloseTitle) { RET(0); }

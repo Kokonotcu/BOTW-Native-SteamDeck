@@ -19,7 +19,9 @@ uint32 RendererShader::GeneratePrecompiledCacheId()
 	// settings that can influence shaders
 	v += (uint32)g_current_game_profile->GetAccurateShaderMul() * 133;
 
-	v += 0x820a5291; // change this value for manual invalidation
+	v += 0x820a5293; // change this value for manual invalidation (BotW-Native: +1 fmulz mul_nonIEEE, +1 plain saturate + bfe sign extension)
+	if (const char* e = getenv("BOTW_EXACT_SATURATE"); e && e[0] == '1')
+		v += 0x5A7;  // the exact saturate emits different shader code (LatteDecompilerEmitGLSL.cpp)
 
 	return v;
 }

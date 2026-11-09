@@ -1,6 +1,7 @@
 // coreinit synchronization: OSMutex, OSFastMutex, OSEvent, OSSemaphore, OSRendezvous,
 // OSMessageQueue and the GHS C-library locks. State lives in the guest structs where games may
 // look; waiting uses per-object host condition variables under threads::g_klock.
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <stdlib.h>
@@ -8,6 +9,8 @@
 #include "diag.h"
 #include "hle.h"
 #include "thread.h"
+
+void LatteCP_idleUntilWrite(const void* addr, uint32_t seen);  // MONITORX/MWAITX wait (LatteCommandProcessor.cpp)
 
 using threads::g_klock;
 using threads::GuestThread;
@@ -144,6 +147,19 @@ struct WaiterScope {
     }
 };
 
+// Under g_klock: the waiter list to notify once g_klock is released, or nullptr. Notifying while holding g_klock woke
+// the waiter straight into a block on g_klock (a second sleep/wake per hand-off; libc lock wait/wake on the Deck's
+// main thread and workers). Waiters re-check their predicate under g_klock, and SyncCV storage never moves.
+inline SyncCV* wake_target(uint32_t obj) {
+    threads::note_signal(obj);
+    SyncCV* s = g_cvs.find_existing(obj);
+    if (!s || s->waiters <= 0) return nullptr;
+    for (int c = 0; c < 3; c++) {
+        if (s->high_core_waiters[c] > 0) threads::reserve_high_wake(c);
+    }
+    return s;
+}
+
 inline void notify_one_if_waiting(uint32_t obj) {
     threads::note_signal(obj);
     if (SyncCV* s = g_cvs.find_existing(obj)) {
@@ -168,6 +184,39 @@ inline void notify_all_if_waiting(uint32_t obj) {
     }
 }
 
+// Before a foreground thread (prio <= 17: main, job and physics workers) sleeps on an event or semaphore, it watches
+// the word with MONITORX/MWAITX for up to 300 us, its guest core already handed over. A futex sleep lets the cpu drop
+// to C2/C3 (18 / 350 us exit on the Deck, acpi_idle; every cpu entered C3 230-380 times a second); MWAITX stays in C1
+// (1 us), so a job (or its completion) handed over soon after is picked up at once. b118 Deck run vs b118 off:
+// main's wait on workers 2.82 -> 0.94 ms/frame, frames > 25 ms 36 -> 11 ("workers" class 25 -> 1), presents > 20 ms
+// 101 -> 50/min (rep) and 128 -> 92/min (wander), CPU power unchanged. BOTW_WAIT_SPIN_US=n (0 = off) overrides.
+// 150 us and 1000 us were worse in one run each (presents > 20 ms 87-95/min rep).
+// Other foreground threads (job / physics workers) spin 1000 us, the main thread 300 us (BOTW_MAIN_SPIN_US): b126 long
+// Deck run, presents > 20 ms in the standing phase 37.6 -> 23.5/min, frames > 20 ms 3.84 -> 3.68%, woth 0.60 -> 0.55.
+const uint32_t g_wait_spin_ns = [] {
+    const char* e = getenv("BOTW_WAIT_SPIN_US");
+    return (uint32_t)std::clamp(e ? atoi(e) : 1000, 0, 2000) * 1000u;
+}();
+
+// The main thread's own spin window (BOTW_MAIN_SPIN_US=n, default 300; 1000 for main too was worse in one run)
+const uint32_t g_main_spin_ns = [] {
+    const char* e = getenv("BOTW_MAIN_SPIN_US");
+    return (uint32_t)std::clamp(e ? atoi(e) : 300, 0, 2000) * 1000u;
+}();
+
+template<typename Ready>
+bool spin_until(const uint32_t* word, GuestThread* me, Ready ready) {
+    if (!me || me->prio > 17) return false;  // background threads (18+) sleep at once (spinning them did not help)
+    const uint32_t spin_ns = me->is_main ? g_main_spin_ns : g_wait_spin_ns;
+    if (!spin_ns) return false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(spin_ns);
+    do {
+        if (ready()) return true;
+        LatteCP_idleUntilWrite(word, __atomic_load_n(word, __ATOMIC_ACQUIRE));  // until written, ~20 us at most
+    } while (std::chrono::steady_clock::now() < deadline);
+    return ready();
+}
+
 // ---- recursive mutexes (OSMutex and OSFastMutex share the implementation) ----------------
 struct MutexState {
     std::atomic<GuestThread*> owner{nullptr};
@@ -187,7 +236,7 @@ __attribute__((noinline)) MutexState* get_mutex_slow(GuestThread* me, uint32_t m
     std::lock_guard<std::mutex> l(g_klock);
     MutexState* s = &g_mutexes.get(m);
     if (__builtin_expect(me != nullptr && m != 0, 1)) {
-        uint32_t slot = ((m >> 2) ^ (m >> 10)) & 63u;
+        uint32_t slot = ((m >> 2) ^ (m >> 11)) & GuestThread::kMutexCacheMask;
         me->mutex_cache[slot] = {m, s};
     }
     return s;
@@ -195,7 +244,7 @@ __attribute__((noinline)) MutexState* get_mutex_slow(GuestThread* me, uint32_t m
 
 inline MutexState* get_mutex_fast(GuestThread* me, uint32_t m) {
     if (__builtin_expect(me != nullptr && m != 0, 1)) {
-        uint32_t slot = ((m >> 2) ^ (m >> 10)) & 63u;
+        uint32_t slot = ((m >> 2) ^ (m >> 11)) & GuestThread::kMutexCacheMask;
         auto& ce = me->mutex_cache[slot];
         if (__builtin_expect(ce.key == m, 1)) return (MutexState*)ce.state;
     }
@@ -228,6 +277,19 @@ __attribute__((noinline)) void mutex_lock_contended(GuestThread* me, uint32_t m,
         if (expected == me) {
             s->count++;
             return;
+        }
+        if (me) threads::inherit_prio(expected, threads::eff_prio(me));  // the owner runs at our priority until it unlocks
+        // After lending our priority, the same C1 spin as events (spin_until) on the owner word before sleeping; a
+        // release seen while spinning goes back to the CAS at the loop top. b125 long Deck run (GPU 700 MHz both):
+        // presents > 20 ms 68.9 -> 37.6/min (rep), 102 -> 61/min (wander), frames > 20 ms 5.33 -> 3.84%, main's
+        // wait on workers 1.01 -> 0.60 ms/frame. BOTW_MUTEX_SPIN=0 off.
+        static const bool mutex_spin = !(getenv("BOTW_MUTEX_SPIN") && getenv("BOTW_MUTEX_SPIN")[0] == '0');
+        if (mutex_spin) {
+            l.unlock();
+            const bool freed = spin_until((const uint32_t*)&s->owner, me,
+                                          [s] { return s->owner.load(std::memory_order_acquire) == nullptr; });
+            l.lock();
+            if (freed) continue;
         }
         threads::WaitMark w("mutex", m);
         AtomicWaiterScope ws(s->waiters);
@@ -272,8 +334,12 @@ inline bool mutex_trylock(PPCContext* c, uint32_t m) {
 }
 
 __attribute__((noinline)) void mutex_unlock_wake(MutexState* s) {
-    std::lock_guard<std::mutex> l(g_klock);
-    if (s->waiters.load(std::memory_order_relaxed) > 0) s->cv.notify_one();
+    bool wake;
+    {
+        std::lock_guard<std::mutex> l(g_klock);  // orders against a waiter between its owner check and cv.wait
+        wake = s->waiters.load(std::memory_order_relaxed) > 0;
+    }
+    if (wake) s->cv.notify_one();  // after unlocking: see wake_target
 }
 
 inline void mutex_unlock(PPCContext* c, uint32_t m) {
@@ -285,9 +351,17 @@ inline void mutex_unlock(PPCContext* c, uint32_t m) {
     }
     if (--s->count == 0) {
         s->owner.store(nullptr, std::memory_order_seq_cst);
-        if (__builtin_expect(s->waiters.load(std::memory_order_seq_cst) > 0, 0)) mutex_unlock_wake(s);
+        const bool had_waiters = s->waiters.load(std::memory_order_seq_cst) > 0;
+        if (__builtin_expect(had_waiters, 0)) mutex_unlock_wake(s);
         if (me) {
             if (--me->held_mutex_count <= 0) me->held_mutex_count = 0;
+            // The inherited priority is dropped as soon as a mutex with waiters is released (it was lent for that
+            // one; waiters of another mutex we still hold lend it again when they wake and find it taken). b94/b95
+            // kept it until the owner held no mutex at all: NavMeshSystemThread, holding some mutex through a
+            // 125 ms burst, stayed at the lent prio 16 and no worker or boosted owner could preempt it.
+            if (__builtin_expect((had_waiters || me->held_mutex_count == 0) &&
+                                     me->boost_prio.load(std::memory_order_relaxed) != 32, 0))
+                me->boost_prio.store(32, std::memory_order_relaxed);
             if (__builtin_expect(me->prio >= 18, 0)) threads::maybe_preempt_sync(me);
         }
     }
@@ -363,9 +437,14 @@ inline bool event_try_consume(uint32_t e) {
 }
 
 __attribute__((noinline)) void event_signal_wake(uint32_t e, uint32_t mode) {
-    std::lock_guard<std::mutex> l(g_klock);
-    if (mode == kBeOne) notify_one_if_waiting(e);
-    else notify_all_if_waiting(e);
+    SyncCV* s;
+    {
+        std::lock_guard<std::mutex> l(g_klock);
+        s = wake_target(e);
+    }
+    if (!s) return;
+    if (mode == kBeOne) s->cv.notify_one();
+    else s->cv.notify_all();
 }
 }  // namespace
 
@@ -405,6 +484,8 @@ HLE_EXPORT(coreinit, OSWaitEvent) {
         diag_sync("event wait %08x mode %u (clear)", e, mem::r32(e + 0x20));
         l.unlock();
         handoff.yield();
+        GuestThread* me = c && c->thread ? (GuestThread*)c->thread : threads::current();
+        if (spin_until((const uint32_t*)(g_mem + e + 0x0C), me, [e] { return event_try_consume(e); })) return;
         l.lock();
         if (!event_try_consume(e)) {
             threads::WaitMark w("event", e);
@@ -467,7 +548,9 @@ HLE_EXPORT(coreinit, OSWaitSemaphore) {
     if ((int32_t)mem::r32(s + 0x0C) <= 0) {
         l.unlock();
         handoff.yield();
-        l.lock();
+        GuestThread* me = c && c->thread ? (GuestThread*)c->thread : threads::current();
+        spin_until((const uint32_t*)(g_mem + s + 0x0C), me, [s] { return (int32_t)mem::r32(s + 0x0C) > 0; });
+        l.lock();  // the count is taken under the lock as before (the spin only waits)
         if ((int32_t)mem::r32(s + 0x0C) <= 0) {
             threads::WaitMark w("semaphore", s);
             SyncCV& scv = g_cvs.get(s);
@@ -481,10 +564,15 @@ HLE_EXPORT(coreinit, OSWaitSemaphore) {
 }
 HLE_EXPORT(coreinit, OSSignalSemaphore) {
     uint32_t s = ARG(0);
-    std::lock_guard<std::mutex> l(g_klock);
-    int32_t v = (int32_t)mem::r32(s + 0x0C);
-    mem::w32(s + 0x0C, v + 1);
-    notify_one_if_waiting(s);
+    SyncCV* w;
+    int32_t v;
+    {
+        std::lock_guard<std::mutex> l(g_klock);
+        v = (int32_t)mem::r32(s + 0x0C);
+        mem::w32(s + 0x0C, v + 1);
+        w = wake_target(s);
+    }
+    if (w) w->cv.notify_one();
     RET(v);
 }
 HLE_EXPORT(coreinit, OSGetSemaphoreCount) {
@@ -580,8 +668,10 @@ HLE_EXPORT(coreinit, OSSendMessage) {
     mem::commit(msg, 16, false);
     memcpy(mem::host(slot_addr), mem::host(msg), 16);
     mem::w32(q + Q_USED, used + 1);
-    notify_all_if_waiting(q);
+    SyncCV* w = wake_target(q);
     diag_sync("msg send q %08x flags %x slot %u used %u cap %u word %08x", q, flags, slot, used + 1, cap, mem::r32(msg));
+    l.unlock();
+    if (w) w->cv.notify_all();
     RET(1);
 }
 // BOOL OSReceiveMessage(q, msg, flags): flags 1 = block
@@ -619,7 +709,9 @@ HLE_EXPORT(coreinit, OSReceiveMessage) {
     diag_sync("msg recv q %08x flags %x used %u cap %u word %08x", q, flags, mem::r32(q + Q_USED), cap, mem::r32(msg));
     mem::w32(q + Q_FIRST, (first + 1) % cap);
     mem::w32(q + Q_USED, mem::r32(q + Q_USED) - 1);
-    notify_all_if_waiting(q);
+    SyncCV* w = wake_target(q);
+    l.unlock();
+    if (w) w->cv.notify_all();
     RET(1);
 }
 HLE_EXPORT(coreinit, OSPeekMessage) {

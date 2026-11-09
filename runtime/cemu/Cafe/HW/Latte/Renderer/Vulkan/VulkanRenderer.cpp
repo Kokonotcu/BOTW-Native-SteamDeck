@@ -1,5 +1,7 @@
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
+
+void VkDefer_Install();  // VulkanDeferred.cpp
 #include "Cafe/HW/Latte/Renderer/Vulkan/LatteTextureVk.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanTextureReadback.h"
@@ -27,8 +29,17 @@
 #include "Cafe/TitleList/GameInfo.h"
 
 #include "Cafe/HW/Latte/Core/LatteTiming.h" // vsync control
+#include "Cafe/HW/Latte/Core/Latte.h"
+#include "telemetry.h"
 
+#include "botw_target.h"
+
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <functional>
+#include <mutex>
+#include <unordered_map>
 #include <glslang/Public/ShaderLang.h>
 
 #ifndef VK_API_VERSION_MAJOR
@@ -37,6 +48,346 @@
 #endif
 
 extern std::atomic_int g_compiling_pipelines;
+
+// Telemetry: GPU execution time of every command buffer and of every render pass in it, from timestamps
+// written into the command stream (no stalls) and read without waiting once the buffer's fence signalled.
+// Per command buffer slot the queries are: [0] buffer start, [1] buffer end, then a start/end pair per pass.
+// Passes are grouped by render target set (LatteCachedFBO::key) and reported once a second (telemetry.cpp).
+bool g_telemGpu = false;  // GPU thread: GPU timing active (follows the Telemetry switch, TelemTimestampBegin)
+namespace
+{
+	constexpr uint32 kTelemMaxPasses = 384;  // per command buffer; further passes are counted, not timed
+	constexpr uint32 kTelemQueriesPerSlot = 2 + 2 * kTelemMaxPasses;
+	VkQueryPool s_tsPool = VK_NULL_HANDLE;
+	double s_tsPeriodNs = 0.0;
+	uint64 s_tsMask = ~0ull;
+	std::vector<uint8> s_tsArmed;
+	// Per-pass timestamps go into every 32nd command buffer only (results scaled by 32): about 17 buffers a
+	// second on the Deck, every part of the frame over time, at 1/32 of the timestamp traffic.
+	constexpr uint32 kTelemPassSampling = 32;
+	uint64 s_cmdSeq = 0;
+	struct SlotPasses
+	{
+		bool timed = false;  // this command buffer carries per-pass timestamps
+		uint32 n = 0;  // passes begun in this command buffer (may exceed kTelemMaxPasses)
+		uint32 sig[kTelemMaxPasses];
+		uint32 draws[kTelemMaxPasses];
+	};
+	std::vector<SlotPasses> s_slotPasses;
+	size_t s_curSlot = 0;
+	bool s_inPass = false;
+	uint32 s_passDraws = 0;
+	// pass signatures (GPU thread only)
+	std::unordered_map<uint64, uint32> s_sigIndex;
+	std::vector<std::string> s_sigName;
+	struct SigAcc { uint64 ns = 0, passes = 0, draws = 0; };
+	std::vector<SigAcc> s_sigAcc;
+	uint64 s_sigFlushNs = 0;
+	uint32 s_sigOutside = 0, s_sigUntimed = 0;
+
+	uint32 TelemSig(uint64 key, const std::function<std::string()>& describe)
+	{
+		auto it = s_sigIndex.find(key);
+		if (it != s_sigIndex.end())
+			return it->second;
+		uint32 id = (uint32)s_sigName.size();
+		s_sigIndex.emplace(key, id);
+		s_sigName.push_back(describe());
+		s_sigAcc.emplace_back();
+		return id;
+	}
+
+	// counting wrappers for the GPU-side work outside draws (installed only while telemetry is on)
+	PFN_vkCmdPipelineBarrier s_realBarrier;
+	PFN_vkCmdCopyBufferToImage s_realUpload;
+	PFN_vkCmdCopyImage s_realCopy;
+	PFN_vkCmdBlitImage s_realBlit;
+	PFN_vkCmdClearColorImage s_realClearColor;
+	PFN_vkCmdClearDepthStencilImage s_realClearDepth;
+	// every 16th barrier records the code that issued it (gpu_passes.txt "barrier site" rows, BotWRecomp offsets)
+	std::mutex s_barrierSiteMutex;
+	std::unordered_map<uintptr_t, uint64> s_barrierSites;
+	std::atomic<uint32> s_barrierSeq{0};
+	__attribute__((noinline)) VKAPI_ATTR void VKAPI_CALL TelemBarrier(VkCommandBuffer cb, VkPipelineStageFlags s, VkPipelineStageFlags d, VkDependencyFlags f, uint32_t mc,
+		const VkMemoryBarrier* m, uint32_t bc, const VkBufferMemoryBarrier* b, uint32_t ic, const VkImageMemoryBarrier* i)
+	{
+		telem::add(telem::GpuBarriers, 1);
+		if ((s_barrierSeq.fetch_add(1, std::memory_order_relaxed) & 15) == 0)
+		{
+			std::lock_guard<std::mutex> l(s_barrierSiteMutex);
+			s_barrierSites[(uintptr_t)__builtin_return_address(0)] += 16;
+		}
+		s_realBarrier(cb, s, d, f, mc, m, bc, b, ic, i);
+	}
+	VKAPI_ATTR void VKAPI_CALL TelemUpload(VkCommandBuffer cb, VkBuffer src, VkImage dst, VkImageLayout l, uint32_t n, const VkBufferImageCopy* r)
+	{
+		telem::add(telem::GpuUploads, 1);
+		s_realUpload(cb, src, dst, l, n, r);
+	}
+	VKAPI_ATTR void VKAPI_CALL TelemCopy(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageCopy* r)
+	{
+		telem::add(telem::GpuCopies, 1);
+		s_realCopy(cb, s, sl, d, dl, n, r);
+	}
+	VKAPI_ATTR void VKAPI_CALL TelemBlit(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageBlit* r, VkFilter f)
+	{
+		telem::add(telem::GpuCopies, 1);
+		s_realBlit(cb, s, sl, d, dl, n, r, f);
+	}
+	VKAPI_ATTR void VKAPI_CALL TelemClearColor(VkCommandBuffer cb, VkImage img, VkImageLayout l, const VkClearColorValue* c, uint32_t n, const VkImageSubresourceRange* r)
+	{
+		telem::add(telem::GpuClears, 1);
+		s_realClearColor(cb, img, l, c, n, r);
+	}
+	VKAPI_ATTR void VKAPI_CALL TelemClearDepth(VkCommandBuffer cb, VkImage img, VkImageLayout l, const VkClearDepthStencilValue* c, uint32_t n, const VkImageSubresourceRange* r)
+	{
+		telem::add(telem::GpuClears, 1);
+		s_realClearDepth(cb, img, l, c, n, r);
+	}
+
+	// GPU timing follows the in-game Telemetry switch live: switched on, the GPU thread creates the timestamp pool
+	// (once) and puts the counting wrappers in front of the Vulkan calls; switched off, it takes the wrappers out again
+	// and writes no timestamps, so the GPU and the GPU thread do exactly what they would without telemetry. Only the
+	// GPU thread calls these vkCmd* pointers (VkRecord replays through its own copies), so the swap happens there.
+	struct TsConfig { VkDevice dev = VK_NULL_HANDLE; VkPhysicalDevice phys = VK_NULL_HANDLE; size_t slots = 0; int32_t family = -1; bool failed = false; };
+	TsConfig s_tsCfg;
+	VkQueryPool s_tsPoolKeep = VK_NULL_HANDLE;  // created on the first switch-on, kept for later ones
+
+	void TelemTimestampsInit(VkDevice dev, VkPhysicalDevice phys, size_t slots, int32_t family)
+	{
+		s_tsCfg = {dev, phys, slots, family, false};
+	}
+	bool TelemTimestampsCreate()
+	{
+		if (s_tsPoolKeep != VK_NULL_HANDLE)
+			return true;
+		const TsConfig& c = s_tsCfg;
+		if (c.failed || !vkCmdWriteTimestamp || !vkGetQueryPoolResults || c.family < 0 || c.dev == VK_NULL_HANDLE)
+			return false;
+		s_tsCfg.failed = true;  // until it worked
+		VkPhysicalDeviceProperties props{};
+		vkGetPhysicalDeviceProperties(c.phys, &props);
+		uint32_t count = 0;
+		vkGetPhysicalDeviceQueueFamilyProperties(c.phys, &count, nullptr);
+		std::vector<VkQueueFamilyProperties> families(count);
+		vkGetPhysicalDeviceQueueFamilyProperties(c.phys, &count, families.data());
+		if ((uint32_t)c.family >= count || families[c.family].timestampValidBits == 0 || props.limits.timestampPeriod <= 0.0f)
+			return false;
+		const uint32_t bits = families[c.family].timestampValidBits;
+		s_tsMask = bits >= 64 ? ~0ull : ((1ull << bits) - 1);
+		s_tsPeriodNs = props.limits.timestampPeriod;
+		VkQueryPoolCreateInfo info{};
+		info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+		info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+		info.queryCount = (uint32_t)(c.slots * kTelemQueriesPerSlot);
+		if (vkCreateQueryPool(c.dev, &info, nullptr, &s_tsPoolKeep) != VK_SUCCESS)
+		{
+			s_tsPoolKeep = VK_NULL_HANDLE;
+			return false;
+		}
+		s_tsArmed.assign(c.slots, 0);
+		s_slotPasses.resize(c.slots);
+		s_sigOutside = TelemSig(1, [] { return std::string("(outside render passes: copies, clears, uploads, barriers)"); });
+		s_sigUntimed = TelemSig(2, [] { return std::string("(passes past the per-buffer limit, not timed)"); });
+		s_tsCfg.failed = false;
+		return true;
+	}
+	void TelemGpuSwitch(bool on)
+	{
+		if (on)
+		{
+			if (!TelemTimestampsCreate())
+				return;
+			s_tsPool = s_tsPoolKeep;
+			s_realBarrier = vkCmdPipelineBarrier, vkCmdPipelineBarrier = TelemBarrier;
+			s_realUpload = vkCmdCopyBufferToImage, vkCmdCopyBufferToImage = TelemUpload;
+			s_realCopy = vkCmdCopyImage, vkCmdCopyImage = TelemCopy;
+			s_realBlit = vkCmdBlitImage, vkCmdBlitImage = TelemBlit;
+			s_realClearColor = vkCmdClearColorImage, vkCmdClearColorImage = TelemClearColor;
+			s_realClearDepth = vkCmdClearDepthStencilImage, vkCmdClearDepthStencilImage = TelemClearDepth;
+			s_sigFlushNs = telem::now_ns();
+		}
+		else
+		{
+			vkCmdPipelineBarrier = s_realBarrier;
+			vkCmdCopyBufferToImage = s_realUpload;
+			vkCmdCopyImage = s_realCopy;
+			vkCmdBlitImage = s_realBlit;
+			vkCmdClearColorImage = s_realClearColor;
+			vkCmdClearDepthStencilImage = s_realClearDepth;
+			s_tsPool = VK_NULL_HANDLE;
+			std::fill(s_tsArmed.begin(), s_tsArmed.end(), 0);  // results still in flight are never read
+			for (auto& a : s_sigAcc)
+				a = {};
+			s_inPass = false;
+		}
+		g_telemGpu = on;
+	}
+	// Command buffer completion markers (not telemetry). Cemu polls the oldest command buffer's fence often: every 8th
+	// occlusion query, on the virtual vsync timer, and every 64 draws for our dry-GPU submit. Each poll of an unsignaled
+	// fence is a syscall into the driver (amdgpu syncobj wait), ~2.8% of the GPU thread on the Deck (b99). Each command
+	// buffer now ends with a timestamp into its own query slot; RADV answers vkGetQueryPoolResults for an unwritten
+	// timestamp from memory, so "not finished yet" costs no syscall. The fence stays the authority: when the marker is
+	// there (or stale from the slot's previous use), vkGetFenceStatus is still asked. BOTW_FENCE_MARKER=0 off.
+	VkQueryPool s_donePool = VK_NULL_HANDLE;
+
+	void DoneMarkersInit(VkDevice dev, VkPhysicalDevice phys, size_t slots, int32_t family)
+	{
+		if (const char* e = getenv("BOTW_FENCE_MARKER"); e && e[0] == '0')
+			return;
+		if (!vkCmdWriteTimestamp || !vkGetQueryPoolResults || !vkCmdResetQueryPool || family < 0)
+			return;
+		// AMD (RADV) only: the poll reads the result on the GPU thread while the slot's reset is still being recorded
+		// on the VkRecord thread. RADV reads it from memory; lavapipe (the PC soak) crashed there (signal 11 at 0x68 in
+		// the driver from ProcessFinishedCommandBuffers, b132/b133 soak seeds 25/26).
+		VkPhysicalDeviceProperties props{};
+		vkGetPhysicalDeviceProperties(phys, &props);
+		if (props.vendorID != 0x1002)
+			return;
+		uint32_t count = 0;
+		vkGetPhysicalDeviceQueueFamilyProperties(phys, &count, nullptr);
+		std::vector<VkQueueFamilyProperties> families(count);
+		vkGetPhysicalDeviceQueueFamilyProperties(phys, &count, families.data());
+		if ((uint32_t)family >= count || families[family].timestampValidBits == 0)
+			return;
+		VkQueryPoolCreateInfo info{};
+		info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+		info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+		info.queryCount = (uint32_t)slots;
+		if (vkCreateQueryPool(dev, &info, nullptr, &s_donePool) != VK_SUCCESS)
+			s_donePool = VK_NULL_HANDLE;
+	}
+	void DoneMarkerBegin(VkCommandBuffer cmd, size_t slot)
+	{
+		if (s_donePool != VK_NULL_HANDLE)
+			vkCmdResetQueryPool(cmd, s_donePool, (uint32_t)slot, 1);
+	}
+	void DoneMarkerEnd(VkCommandBuffer cmd, size_t slot)
+	{
+		if (s_donePool != VK_NULL_HANDLE)
+			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_donePool, (uint32_t)slot);
+	}
+	// false only when the command buffer certainly has not finished (its end marker is not written yet)
+	bool DoneMarkerMaybeFinished(VkDevice dev, size_t slot)
+	{
+		if (s_donePool == VK_NULL_HANDLE)
+			return true;
+		uint64 v;
+		return vkGetQueryPoolResults(dev, s_donePool, (uint32_t)slot, 1, sizeof(v), &v, sizeof(v), VK_QUERY_RESULT_64_BIT) != VK_NOT_READY;
+	}
+
+	void TelemTimestampBegin(VkCommandBuffer cmd, size_t slot)
+	{
+		if (telem::on() != g_telemGpu)
+			TelemGpuSwitch(!g_telemGpu);
+		if (!g_telemGpu)
+			return;
+		const bool timed = (++s_cmdSeq % kTelemPassSampling) == 0;
+		vkCmdResetQueryPool(cmd, s_tsPool, (uint32_t)(slot * kTelemQueriesPerSlot), timed ? kTelemQueriesPerSlot : 2);
+		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_tsPool, (uint32_t)(slot * kTelemQueriesPerSlot));
+		s_tsArmed[slot] = 1;
+		s_slotPasses[slot].n = 0;
+		s_slotPasses[slot].timed = timed;
+		s_curSlot = slot;
+		s_inPass = false;
+	}
+	void TelemTimestampEnd(VkCommandBuffer cmd, size_t slot)
+	{
+		if (s_tsPool != VK_NULL_HANDLE && s_tsArmed[slot])
+			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_tsPool, (uint32_t)(slot * kTelemQueriesPerSlot + 1));
+	}
+	void TelemTimestampCollect(VkDevice dev, size_t slot)
+	{
+		if (s_tsPool == VK_NULL_HANDLE || !s_tsArmed[slot])
+			return;
+		s_tsArmed[slot] = 0;
+		const SlotPasses& sp = s_slotPasses[slot];
+		const uint32 timed = std::min(sp.n, kTelemMaxPasses);
+		static uint64 t[kTelemQueriesPerSlot];
+		if (vkGetQueryPoolResults(dev, s_tsPool, (uint32_t)(slot * kTelemQueriesPerSlot), 2 + 2 * timed, sizeof(uint64) * (2 + 2 * timed), t,
+				sizeof(uint64), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+			return;
+		auto ns = [](uint64 a, uint64 b) { return (uint64)((double)((b - a) & s_tsMask) * s_tsPeriodNs); };
+		const uint64 total = ns(t[0], t[1]);
+		telem::add(telem::GpuTimeNs, total);		if (sp.timed)
+		{
+			const uint64 f = kTelemPassSampling;  // scale the sample to all command buffers
+			uint64 inPasses = 0;
+			for (uint32 k = 0; k < timed; k++)
+			{
+				const uint64 d = ns(t[2 + 2 * k], t[3 + 2 * k]);
+				SigAcc& a = s_sigAcc[sp.sig[k]];
+				a.ns += d * f;
+				a.passes += f;
+				a.draws += (uint64)sp.draws[k] * f;
+				inPasses += d;
+			}
+			s_sigAcc[s_sigOutside].ns += (total > inPasses ? total - inPasses : 0) * f;
+			if (sp.n > timed)
+				s_sigAcc[s_sigUntimed].passes += (sp.n - timed) * f;
+		}
+		// hand the last second over to the telemetry writer
+		const uint64 now = telem::now_ns();
+		if (now - s_sigFlushNs < 1000000000ull)
+			return;
+		s_sigFlushNs = now;
+		std::vector<telem::GpuPassStat> out;
+		for (size_t i = 0; i < s_sigAcc.size(); i++)
+		{
+			if (s_sigAcc[i].ns == 0 && s_sigAcc[i].passes == 0)
+				continue;
+			out.push_back({s_sigName[i], s_sigAcc[i].ns, s_sigAcc[i].passes, s_sigAcc[i].draws});
+			s_sigAcc[i] = {};
+		}
+		{
+			std::lock_guard<std::mutex> l(s_barrierSiteMutex);
+			const uintptr_t base = botw_image_base();
+			for (auto& [addr, n] : s_barrierSites)
+			{
+				char name[64];
+				snprintf(name, sizeof(name), "barrier site BotWRecomp+0x%llx", (unsigned long long)(addr - base));
+				out.push_back({name, 0, n, 0});
+			}
+			s_barrierSites.clear();
+		}
+		telem::gpu_pass_stats(std::move(out));
+	}
+}
+
+// Render pass boundaries (VulkanRendererCore.cpp draw_setRenderPass / draw_endRenderPass, VulkanSurfaceCopy.cpp).
+// key: LatteCachedFBO::key for game passes; describe() names it the first time it is seen.
+void TelemPassBegin(VkCommandBuffer cmd, uint64 key, const std::function<std::string()>& describe)
+{
+	if (s_tsPool == VK_NULL_HANDLE)
+		return;
+	telem::add(telem::GpuPasses, 1);
+	SlotPasses& sp = s_slotPasses[s_curSlot];
+	if (!sp.timed)
+		return;
+	if (sp.n < kTelemMaxPasses)
+	{
+		sp.sig[sp.n] = TelemSig(key | (1ull << 63), describe);  // bit 63 keeps game keys apart from the fixed ids
+		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_tsPool, (uint32_t)(s_curSlot * kTelemQueriesPerSlot + 2 + 2 * sp.n));
+		s_inPass = true;
+		s_passDraws = 0;
+	}
+	sp.n++;
+}
+void TelemPassEnd(VkCommandBuffer cmd)
+{
+	if (s_tsPool == VK_NULL_HANDLE || !s_inPass)
+		return;
+	SlotPasses& sp = s_slotPasses[s_curSlot];
+	const uint32 k = sp.n - 1;
+	vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_tsPool, (uint32_t)(s_curSlot * kTelemQueriesPerSlot + 3 + 2 * k));
+	sp.draws[k] = s_passDraws;
+	s_inPass = false;
+}
+void TelemPassDraw()
+{
+	s_passDraws++;
+}
+
 
 const  std::vector<const char*> kOptionalDeviceExtensions =
 {
@@ -354,6 +705,12 @@ void VulkanRenderer::GetDeviceFeatures()
 		m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state = attachmentFeedbackLoopDynamicStateFeature.attachmentFeedbackLoopDynamicState == VK_TRUE;
 	if (!UseAttachmentFeedbackLoop())
 		cemuLog_log(LogType::Force, "VK_EXT_attachment_feedback_loop_layout(_dynamic_state) not supported");
+	// BotW-Native: no feedback loop layout. RADV keeps VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT images without
+	// DCC and HTILE compression (radv_layout_dcc_compressed, radv_layout_is_htile_compressed), and it was the default
+	// layout of every render target: the whole frame rendered uncompressed, each copy decompressed (GENERAL <-> feedback
+	// loop) and each self-dependent draw added a barrier. Self-dependent draws now share the render pass as in Cemu
+	// before 2.7 (vk_accurate_barriers is off).
+	m_featureControl.deviceExtensions.attachment_feedback_loop_dynamic_state = false;
 	// get limits
 	m_featureControl.limits.minUniformBufferOffsetAlignment = std::max(prop2.properties.limits.minUniformBufferOffsetAlignment, (VkDeviceSize)4);
 	m_featureControl.limits.nonCoherentAtomSize = std::max(prop2.properties.limits.nonCoherentAtomSize, (VkDeviceSize)4);
@@ -365,6 +722,21 @@ void VulkanRenderer::GetDeviceFeatures()
 #if BOOST_OS_LINUX
 #include <sys/wait.h>
 #include "resource/IconsFontAwesome5.h"
+
+// BotW-Native: RADV runs vertex/geometry shaders as wave32 (RADV_PERFTEST=gewave32; its default on RDNA2 is wave64).
+// BotW's ~4500 draws a frame are mostly small, and a half-filled wave64 wastes lanes in the vertex-heavy G-buffer and
+// shadow passes. Set before the first Vulkan instance reads it; BOTW_GEWAVE32=0 off, a user RADV_PERFTEST is kept.
+static const bool s_radvGeWave32 = [] {
+	const char* off = getenv("BOTW_GEWAVE32");
+	if (off && off[0] == '0')
+		return false;
+	const char* cur = getenv("RADV_PERFTEST");
+	if (!cur || !cur[0])
+		setenv("RADV_PERFTEST", "gewave32", 1);
+	else if (!strstr(cur, "gewave32"))
+		setenv("RADV_PERFTEST", (std::string(cur) + ",gewave32").c_str(), 1);
+	return true;
+}();
 
 int BreathOfTheWildChildProcessMain()
 {
@@ -1707,6 +2079,9 @@ void VulkanRenderer::CreateCommandBuffers()
 		cemuLog_log(LogType::Force, "Failed to allocate command buffers: {}", result);
 		throw std::runtime_error(fmt::format("Failed to allocate command buffers: {}", result));
 	}
+	VkDefer_Install();  // before the telemetry wrappers, so they count on the GPU thread and queue through it
+	TelemTimestampsInit(m_logicalDevice, m_physicalDevice, m_commandBuffers.size(), m_indices.graphicsFamily);
+	DoneMarkersInit(m_logicalDevice, m_physicalDevice, m_commandBuffers.size(), m_indices.graphicsFamily);
 
 	for (auto& semItr : m_commandBufferSemaphores)
 	{
@@ -2159,6 +2534,8 @@ void VulkanRenderer::InitFirstCommandBuffer()
 	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(m_state.currentCommandBuffer, &beginInfo);
+	DoneMarkerBegin(m_state.currentCommandBuffer, m_commandBufferIndex);
+	TelemTimestampBegin(m_state.currentCommandBuffer, m_commandBufferIndex);
 
 	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &m_state.currentViewport);
 	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &m_state.currentScissorRect);
@@ -2171,9 +2548,12 @@ void VulkanRenderer::ProcessFinishedCommandBuffers()
 	bool finishedCmdBuffers = false;
 	while (m_commandBufferSyncIndex != m_commandBufferIndex)
 	{
+		if (!DoneMarkerMaybeFinished(m_logicalDevice, m_commandBufferSyncIndex))
+			break;  // its end marker is not written: certainly not finished, no driver call
 		VkResult fenceStatus = vkGetFenceStatus(m_logicalDevice, m_cmdBufferFences[m_commandBufferSyncIndex]);
 		if (fenceStatus == VK_SUCCESS)
 		{
+			TelemTimestampCollect(m_logicalDevice, m_commandBufferSyncIndex);
 			ProcessDestructionQueue();
 			m_uniformVarBufferReadIndex = m_cmdBufferUniformRingbufIndices[m_commandBufferSyncIndex];
 			m_commandBufferSyncIndex = (m_commandBufferSyncIndex + 1) % m_commandBuffers.size();
@@ -2199,7 +2579,11 @@ void VulkanRenderer::WaitForNextFinishedCommandBuffer()
 {
 	cemu_assert_debug(m_commandBufferSyncIndex != m_commandBufferIndex);
 	// wait on least recently submitted command buffer
+	const uint64 waitStart = telem::now_ns();
 	VkResult result = vkWaitForFences(m_logicalDevice, 1, &m_cmdBufferFences[m_commandBufferSyncIndex], true, UINT64_MAX);
+	const uint64 waited = telem::now_ns() - waitStart;  // also the submit policy's input (m_frameWaitNs), not only telemetry
+	telem::add(telem::FenceWaitNs, waited);
+	m_frameWaitNs += waited;
 	if (result == VK_TIMEOUT)
 	{
 		cemuLog_log(LogType::Force, "vkWaitForFences: Returned VK_TIMEOUT on infinite fence");
@@ -2218,6 +2602,10 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
 
 	occlusionQuery_notifyEndCommandBuffer();
 
+	barrier_flushPendingTransfer();
+	upload_closeGroup();
+	TelemTimestampEnd(m_state.currentCommandBuffer, m_commandBufferIndex);
+	DoneMarkerEnd(m_state.currentCommandBuffer, m_commandBufferIndex);
 	vkEndCommandBuffer(m_state.currentCommandBuffer);
 
 	VkSubmitInfo submitInfo = {};
@@ -2252,7 +2640,13 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
 	submitInfo.pWaitDstStageMask = semWaitStageMask;
 	submitInfo.pWaitSemaphores = waitSemArray;
 
+	const uint64 submitStart = telem::on() ? telem::now_ns() : 0;
 	const VkResult result = vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, m_cmdBufferFences[m_commandBufferIndex]);
+	if (submitStart)
+	{
+		telem::add(telem::SubmitNs, telem::now_ns() - submitStart);
+		telem::add(telem::Submits, 1);
+	}
 	if (result != VK_SUCCESS)
 		UnrecoverableError(fmt::format("failed to submit command buffer. Error {}", result).c_str());
 	m_numSubmittedCmdBuffers++;
@@ -2280,6 +2674,8 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
 	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(m_state.currentCommandBuffer, &beginInfo);
+	DoneMarkerBegin(m_state.currentCommandBuffer, m_commandBufferIndex);
+	TelemTimestampBegin(m_state.currentCommandBuffer, m_commandBufferIndex);
 
 	// make sure some states are set for this command buffer
 	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &m_state.currentViewport);
@@ -2294,7 +2690,14 @@ void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphor
 	occlusionQuery_notifyBeginCommandBuffer();
 
 	m_recordedDrawcalls = 0;
-	m_submitThreshold = 300;
+	// BotW-Native: 1000 instead of 300. Every submit also costs a fence reset and status check (driver ioctls);
+	// at ~4500 draws a frame 300 meant ~10 submits, about 2 ms of the GPU thread. Submitting whenever the GPU
+	// ran dry was measured worse on the Deck (CPU-bound at 15 W: more submits, GPU thread 13.9 -> 16.5 ms).
+	// Readbacks still ask for an early submit (RequestSubmitSoon); queries only for one at idle.
+	// 2500 after the frame's first command buffer: every submit ends with the GPU drained (RADV waits for query and
+	// timestamp writes at command buffer end), ~8 a frame. The first buffer after a present stays at 1000 so the GPU
+	// starts on a new frame early.
+	m_submitThreshold = signalSemaphore != VK_NULL_HANDLE ? 1000 : 2500;
 	m_submitOnIdle = false;
 }
 
@@ -2981,7 +3384,11 @@ bool VulkanRenderer::AcquireNextSwapchainImage(bool mainWindow)
 	if (!UpdateSwapchainProperties(mainWindow))
 		return false;
 
+	const uint64 acquireStart = telem::now_ns();
 	bool result = chainInfo.AcquireImage();
+	const uint64 acquired = telem::now_ns() - acquireStart;  // also the submit policy's input
+	telem::add(telem::AcquireNs, acquired);
+	m_frameWaitNs += acquired;
 	if (!result)
 		return false;
 
@@ -3079,7 +3486,9 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
 	WaitCommandBufferFinished(m_commandBufferIDOfPrevFrame);
 	m_commandBufferIDOfPrevFrame = currentFrameCmdBufferID;
 
-	chainInfo.WaitAvailableFence();
+	// BotW-Native: no WaitAvailableFence here any more (SwapchainInfoVk::AcquireImage waits before reusing the fence),
+	// and the present below is queued to the VkRecord thread (VulkanDeferred.cpp)
+	telem::Scope presentTimed(telem::PresentNs);
 
 	VkPresentIdKHR presentId = {};
 
@@ -3127,6 +3536,11 @@ void VulkanRenderer::SwapBuffer(bool mainWindow)
 	chainInfo.hasDefinedSwapchainImage = false;
 
 	chainInfo.swapchainImageIndex = -1;
+
+	// BotW-Native: next frame submits whenever the GPU runs dry only if this thread waited 1 ms+ this frame
+	// (at 15 W it is the bottleneck and every extra submit costs it time)
+	m_submitWhenGpuDry = m_frameWaitNs >= 1'000'000;
+	m_frameWaitNs = 0;
 }
 
 void VulkanRenderer::Flush(bool waitIdle)
@@ -3156,7 +3570,10 @@ void VulkanRenderer::SwapBuffers(bool swapTV, bool swapDRC)
 		SwapBuffer(false);
 
 	if(swapTV)
+	{
 		VulkanBenchmarkPrintResults();
+		if (telem::on()) telem::on_present(LatteGPUState.drawCallCounter);
+	}
 }
 
 void VulkanRenderer::ClearColorbuffer(bool padView)
@@ -3282,6 +3699,7 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
 
 	auto descriptSet = backbufferBlit_createDescriptorSet(m_swapchainDescriptorSetLayout, texViewVk, useLinearTexFilter);
 
+	if (g_telemGpu) TelemPassBegin(m_state.currentCommandBuffer, 4, [] { return std::string("screen output (scaling blit to the display)"); });
 	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
 	if (clearBackground)
@@ -3307,9 +3725,13 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
 	vkCmdDraw(m_state.currentCommandBuffer, 6, 1, 0, 0);
 
 	vkCmdEndRenderPass(m_state.currentCommandBuffer);
+	if (g_telemGpu) TelemPassEnd(m_state.currentCommandBuffer);
 
 	// restore viewport
 	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &m_state.currentViewport);
+	// BotW-Native: and the scissor this pass changed (ImguiEnd used to restore it; the ImGui pass is now skipped
+	// when the overlay has nothing to draw)
+	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &m_state.currentScissorRect);
 
 	// mark current swapchain image as well defined
 	chainInfo.hasDefinedSwapchainImage = true;
@@ -3609,7 +4031,6 @@ void VulkanRenderer::texture_loadSlice(LatteTexture* hostTexture, sint32 width, 
 	barrierSubresourceRange.mipLevel = mipIndex;
 	barrierSubresourceRange.baseArrayLayer = is3DTexture ? 0 : sliceIndex;
 	barrierSubresourceRange.layerCount = 1;
-	barrier_image<ANY_TRANSFER | IMAGE_READ | IMAGE_WRITE | HOST_WRITE, ANY_TRANSFER>(vkTexture, barrierSubresourceRange, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
 	VkBufferImageCopy imageRegion[2]{};
 	sint32 imageRegionCount = 0;
@@ -3677,9 +4098,73 @@ void VulkanRenderer::texture_loadSlice(LatteTexture* hostTexture, sint32 width, 
 	else
 		cemu_assert_debug(false);
 
+	if (m_uploadBatchDepth > 0)
+	{
+		PendingUpload u{vkTexture, uploadResv.vkBuffer, {}, {imageRegion[0], imageRegion[1]}, (uint32)imageRegionCount};
+		u.range = {barrierSubresourceRange.aspectMask, barrierSubresourceRange.mipLevel, 1, barrierSubresourceRange.baseArrayLayer, 1};
+		m_uploadBatch.push_back(u);  // recorded by texture_endUploadBatch
+		return;
+	}
+	barrier_image<ANY_TRANSFER | IMAGE_READ | IMAGE_WRITE | HOST_WRITE, ANY_TRANSFER>(vkTexture, barrierSubresourceRange, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
 	vkCmdCopyBufferToImage(m_state.currentCommandBuffer, uploadResv.vkBuffer, vkImageObj->m_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, imageRegionCount, imageRegion);
 
 	barrier_image<ANY_TRANSFER, ANY_TRANSFER | IMAGE_READ | IMAGE_WRITE>(vkTexture, barrierSubresourceRange, vkTexture->GetDefaultLayout());
+}
+
+void VulkanRenderer::texture_beginUploadBatch()
+{
+	m_uploadBatchDepth++;
+}
+
+// BotW-Native: a texture (re)load uploads every mip level and slice, each with a barrier before and after its copy:
+// 4000+ uploads and 9000+ barriers in one frame when the game streams in an area. The slices of one load never
+// overlap, so they get one barrier with every "before" transition, all copies, and one with every "after" one.
+void VulkanRenderer::texture_endUploadBatch()
+{
+	if (--m_uploadBatchDepth > 0 || m_uploadBatch.empty())
+		return;
+	std::vector<PendingUpload> batch;
+	batch.swap(m_uploadBatch);
+	draw_endRenderPass();
+	VkPipelineStageFlags preSrc, preDst, postSrc, postDst;
+	VkAccessFlags preSrcAccess, preDstAccess, postSrcAccess, postDstAccess;
+	barrier_calcStageAndMask<ANY_TRANSFER | IMAGE_READ | IMAGE_WRITE | HOST_WRITE>(preSrc, preSrcAccess);
+	barrier_calcStageAndMask<ANY_TRANSFER>(preDst, preDstAccess);
+	barrier_calcStageAndMask<ANY_TRANSFER>(postSrc, postSrcAccess);
+	barrier_calcStageAndMask<ANY_TRANSFER | IMAGE_READ | IMAGE_WRITE>(postDst, postDstAccess);
+	std::vector<VkImageMemoryBarrier> pre, post;
+	for (size_t i = 0; i < batch.size(); i++)
+	{
+		const PendingUpload& u = batch[i];
+		bool seen = false;  // the slices of a 3D texture share one barrier range
+		for (size_t j = 0; j < i && !seen; j++)
+			seen = batch[j].tex == u.tex && batch[j].range.baseMipLevel == u.range.baseMipLevel && batch[j].range.baseArrayLayer == u.range.baseArrayLayer;
+		if (seen)
+			continue;
+		VkImageSubresourceRange r = u.range;
+		VkImageMemoryBarrier b{};
+		b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image = u.tex->GetImageObj()->m_image;
+		b.subresourceRange = r;
+		b.srcAccessMask = preSrcAccess;
+		b.dstAccessMask = preDstAccess;
+		b.oldLayout = u.tex->GetImageLayout(r);
+		b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		pre.push_back(b);
+		b.srcAccessMask = postSrcAccess;
+		b.dstAccessMask = postDstAccess;
+		b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		b.newLayout = u.tex->GetDefaultLayout();
+		post.push_back(b);
+		u.tex->SetImageLayout(r, b.newLayout);
+	}
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, preSrc, preDst, 0, 0, nullptr, 0, nullptr, (uint32)pre.size(), pre.data());
+	for (auto& u : batch)
+		vkCmdCopyBufferToImage(m_state.currentCommandBuffer, u.buffer, u.tex->GetImageObj()->m_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, u.regionCount, u.regions);
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, postSrc, postDst, 0, 0, nullptr, 0, nullptr, (uint32)post.size(), post.data());
 }
 
 LatteTexture* VulkanRenderer::texture_createTextureEx(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddress, Latte::E_GX2SURFFMT format, uint32 width, uint32 height, uint32 depth, uint32 pitch, uint32 mipLevels,
@@ -3764,16 +4249,156 @@ void VulkanRenderer::texture_copyImageSubData(LatteTexture* src, sint32 srcMip, 
 		}
 	}
 
-	// make sure all write operations to the src image have finished
-	barrier_image<SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER, SYNC_OP::ANY_TRANSFER>(srcVk, region.srcSubresource, VK_IMAGE_LAYOUT_GENERAL);
-	// make sure all read and write operations to the dst image have finished
-	barrier_image<SYNC_OP::IMAGE_READ | SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER, SYNC_OP::ANY_TRANSFER>(dstVk, region.dstSubresource, VK_IMAGE_LAYOUT_GENERAL);
+	if (m_copyBatchDepth > 0)
+	{
+		m_copyBatch.push_back({srcVk, dstVk, region});  // recorded by texture_endCopyBatch
+		return;
+	}
+	texture_copyImageNow(srcVk, dstVk, region);
+}
 
-	vkCmdCopyImage(m_state.currentCommandBuffer, srcVkObj->m_image, VK_IMAGE_LAYOUT_GENERAL, dstVkObj->m_image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+void VulkanRenderer::texture_copyImageNow(LatteTextureVk* srcVk, LatteTextureVk* dstVk, VkImageCopy& region)
+{
+	draw_endRenderPass();
+	// make sure all write operations to the src image and all read and write operations to the dst image have
+	// finished (one barrier call for both: one GPU wait instead of two)
+	barrier_image2<SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER, SYNC_OP::ANY_TRANSFER,
+		SYNC_OP::IMAGE_READ | SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER, SYNC_OP::ANY_TRANSFER>(
+		srcVk, region.srcSubresource, VK_IMAGE_LAYOUT_GENERAL, dstVk, region.dstSubresource, VK_IMAGE_LAYOUT_GENERAL);
 
-	// make sure the transfer is finished before the image is read or written
-	barrier_image<SYNC_OP::ANY_TRANSFER, SYNC_OP::IMAGE_READ | SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER>(srcVk, region.srcSubresource, srcVk->GetDefaultLayout());
-	barrier_image<SYNC_OP::ANY_TRANSFER, SYNC_OP::IMAGE_READ | SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER>(dstVk, region.dstSubresource, dstVk->GetDefaultLayout());
+	vkCmdCopyImage(m_state.currentCommandBuffer, srcVk->GetImageObj()->m_image, VK_IMAGE_LAYOUT_GENERAL, dstVk->GetImageObj()->m_image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+
+	// make sure the transfer is finished before either image is read or written
+	// BotW-Native: images that stay in GENERAL need no transition: deferred to the next render pass (pending transfer
+	// barrier); every other image barrier outside render passes already waits for earlier transfers
+	if (srcVk->GetDefaultLayout() == VK_IMAGE_LAYOUT_GENERAL && dstVk->GetDefaultLayout() == VK_IMAGE_LAYOUT_GENERAL)
+	{
+		m_transferBarrierPending = true;
+		return;
+	}
+	barrier_image2<SYNC_OP::ANY_TRANSFER, SYNC_OP::IMAGE_READ | SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER,
+		SYNC_OP::ANY_TRANSFER, SYNC_OP::IMAGE_READ | SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER>(
+		srcVk, region.srcSubresource, srcVk->GetDefaultLayout(), dstVk, region.dstSubresource, dstVk->GetDefaultLayout());
+}
+
+void VulkanRenderer::texture_beginCopyBatch()
+{
+	m_copyBatchDepth++;
+}
+
+// BotW-Native: Cemu keeps textures that share memory in sync with bursts of copies (~70-100 a frame in BotW),
+// each with a barrier before and after. A burst whose copies are independent (no image written by one copy and
+// read or written by another) gets one barrier with every "before" transition, all copies, and one with every
+// "after" transition. Anything else is recorded copy by copy as before.
+void VulkanRenderer::texture_endCopyBatch()
+{
+	if (--m_copyBatchDepth > 0 || m_copyBatch.empty())
+		return;
+	std::vector<PendingImageCopy> batch;
+	batch.swap(m_copyBatch);
+	auto sameRange = [](const VkImageSubresourceLayers& a, const VkImageSubresourceLayers& b) {
+		return a.aspectMask == b.aspectMask && a.mipLevel == b.mipLevel && a.baseArrayLayer == b.baseArrayLayer && a.layerCount == b.layerCount;
+	};
+	// same image, same mip level, overlapping layers (3D slices are offsets inside one layer: same layer = overlap)
+	auto overlaps = [](const VkImageSubresourceLayers& a, const VkImageSubresourceLayers& b) {
+		return (a.aspectMask & b.aspectMask) != 0 && a.mipLevel == b.mipLevel && a.baseArrayLayer < b.baseArrayLayer + b.layerCount &&
+			b.baseArrayLayer < a.baseArrayLayer + a.layerCount;
+	};
+	bool independent = batch.size() > 1;
+	for (size_t i = 0; i < batch.size() && independent; i++)
+		for (size_t j = 0; j < batch.size() && independent; j++)
+		{
+			if (i == j)
+				continue;
+			const auto& w = batch[i];  // copy i writes w.dst / w.region.dstSubresource
+			if ((w.dst == batch[j].src && overlaps(w.region.dstSubresource, batch[j].region.srcSubresource)) ||
+				(w.dst == batch[j].dst && overlaps(w.region.dstSubresource, batch[j].region.dstSubresource)))
+				independent = false;
+		}
+	if (!independent)
+	{
+		for (auto& c : batch)
+			texture_copyImageNow(c.src, c.dst, c.region);
+		return;
+	}
+	draw_endRenderPass();
+	// one barrier entry per distinct (image, subresource): several copies may read the same source slice
+	struct Entry
+	{
+		LatteTextureVk* tex;
+		VkImageSubresourceLayers layers;
+		bool isDst;
+	};
+	std::vector<Entry> entries;
+	auto add = [&](LatteTextureVk* tex, const VkImageSubresourceLayers& l, bool isDst) {
+		for (auto& e : entries)
+			if (e.tex == tex && sameRange(e.layers, l))
+				return;
+		entries.push_back({tex, l, isDst});
+	};
+	for (auto& c : batch)
+	{
+		add(c.src, c.region.srcSubresource, false);
+		add(c.dst, c.region.dstSubresource, true);
+	}
+	// two different but overlapping ranges of one image would transition the same subresource twice in one call
+	for (size_t i = 0; i < entries.size(); i++)
+		for (size_t j = i + 1; j < entries.size(); j++)
+			if (entries[i].tex == entries[j].tex && overlaps(entries[i].layers, entries[j].layers))
+			{
+				for (auto& c : batch)
+					texture_copyImageNow(c.src, c.dst, c.region);
+				return;
+			}
+	VkPipelineStageFlags srcReadStages, srcReadDst, dstStages, dstDst, postSrc, postDst;
+	VkAccessFlags srcReadAccess, srcReadDstAccess, dstAccess, dstDstAccess, postSrcAccess, postDstAccess;
+	barrier_calcStageAndMask<SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER>(srcReadStages, srcReadAccess);
+	barrier_calcStageAndMask<SYNC_OP::ANY_TRANSFER>(srcReadDst, srcReadDstAccess);
+	barrier_calcStageAndMask<SYNC_OP::IMAGE_READ | SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER>(dstStages, dstAccess);
+	barrier_calcStageAndMask<SYNC_OP::ANY_TRANSFER>(dstDst, dstDstAccess);
+	barrier_calcStageAndMask<SYNC_OP::ANY_TRANSFER>(postSrc, postSrcAccess);
+	barrier_calcStageAndMask<SYNC_OP::IMAGE_READ | SYNC_OP::IMAGE_WRITE | SYNC_OP::ANY_TRANSFER>(postDst, postDstAccess);
+
+	std::vector<VkImageMemoryBarrier> pre(entries.size()), post(entries.size());
+	std::vector<VkImageSubresourceRange> ranges(entries.size());
+	for (size_t i = 0; i < entries.size(); i++)
+	{
+		const Entry& e = entries[i];
+		VkImageSubresourceRange& r = ranges[i];
+		r.aspectMask = e.layers.aspectMask;
+		r.baseMipLevel = e.layers.mipLevel;
+		r.levelCount = 1;
+		r.baseArrayLayer = e.layers.baseArrayLayer;
+		r.layerCount = e.layers.layerCount;
+		VkImageMemoryBarrier b{};
+		b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image = e.tex->GetImageObj()->m_image;
+		b.subresourceRange = r;
+		pre[i] = b;
+		pre[i].srcAccessMask = e.isDst ? dstAccess : srcReadAccess;
+		pre[i].dstAccessMask = e.isDst ? dstDstAccess : srcReadDstAccess;
+		pre[i].oldLayout = e.tex->GetImageLayout(r);
+		pre[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+		post[i] = b;
+		post[i].srcAccessMask = postSrcAccess;
+		post[i].dstAccessMask = postDstAccess;
+		post[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+		post[i].newLayout = e.tex->GetDefaultLayout();
+	}
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, srcReadStages | dstStages, srcReadDst | dstDst, 0, 0, nullptr, 0, nullptr,
+		(uint32)pre.size(), pre.data());
+	for (auto& c : batch)
+	{
+		c.src->GetImageObj()->flagForCurrentCommandBuffer();
+		c.dst->GetImageObj()->flagForCurrentCommandBuffer();
+		vkCmdCopyImage(m_state.currentCommandBuffer, c.src->GetImageObj()->m_image, VK_IMAGE_LAYOUT_GENERAL,
+			c.dst->GetImageObj()->m_image, VK_IMAGE_LAYOUT_GENERAL, 1, &c.region);
+	}
+	vkCmdPipelineBarrier(m_state.currentCommandBuffer, postSrc, postDst, 0, 0, nullptr, 0, nullptr, (uint32)post.size(), post.data());
+	for (size_t i = 0; i < entries.size(); i++)
+		entries[i].tex->SetImageLayout(ranges[i], entries[i].tex->GetDefaultLayout());
 }
 
 LatteTextureReadbackInfo* VulkanRenderer::texture_createReadback(LatteTextureView* textureView)
@@ -3814,6 +4439,10 @@ uint64 VulkanRenderer::GenUniqueId()
 void VulkanRenderer::streamout_setupXfbBuffer(uint32 bufferIndex, sint32 ringBufferOffset, uint32 rangeAddr, uint32 rangeSize)
 {
 	VkDeviceSize tfBufferOffset = ringBufferOffset;
+	// the ring wrapped: this draw may overwrite ring data that a waiting copy still has to read
+	if (!m_streamoutCopies.empty() && (uint32)ringBufferOffset < m_streamoutLastRingOffset)
+		draw_endRenderPass();
+	m_streamoutLastRingOffset = (uint32)ringBufferOffset;
 	m_streamoutState.buffer[bufferIndex].enabled = true;
 	m_streamoutState.buffer[bufferIndex].ringBufferOffset = ringBufferOffset;
 }
@@ -3836,6 +4465,7 @@ void VulkanRenderer::buffer_bindVertexBuffers(std::span<BindBufferParam> binding
 	VkBuffer buffer = m_bufferCache;
 	for (auto& binding : bindings)
 	{
+		m_vertexBindSize[binding.index] = binding.bindSize;
 		if (m_state.currentVertexBinding[binding.index].offset == binding.bindOffset)
 			continue;
 		m_state.currentVertexBinding[binding.index].offset = binding.bindOffset;
@@ -3882,12 +4512,15 @@ void VulkanRenderer::buffer_bindUniformBuffer(LatteConst::ShaderType shaderType,
 	{
 	case LatteConst::ShaderType::Vertex:
 		dynamicOffsetInfo.shaderUB[VulkanRendererConst::SHADER_STAGE_INDEX_VERTEX].uniformBufferOffset[bufferIndex] = offset;
+		m_uniformBindSize[VulkanRendererConst::SHADER_STAGE_INDEX_VERTEX][bufferIndex] = size;
 		break;
 	case LatteConst::ShaderType::Geometry:
 		dynamicOffsetInfo.shaderUB[VulkanRendererConst::SHADER_STAGE_INDEX_GEOMETRY].uniformBufferOffset[bufferIndex] = offset;
+		m_uniformBindSize[VulkanRendererConst::SHADER_STAGE_INDEX_GEOMETRY][bufferIndex] = size;
 		break;
 	case LatteConst::ShaderType::Pixel:
 		dynamicOffsetInfo.shaderUB[VulkanRendererConst::SHADER_STAGE_INDEX_FRAGMENT].uniformBufferOffset[bufferIndex] = offset;
+		m_uniformBindSize[VulkanRendererConst::SHADER_STAGE_INDEX_FRAGMENT][bufferIndex] = size;
 		break;
 	default:
 		cemu_assert_debug(false);
@@ -3927,10 +4560,22 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
 
 	vkMemAllocator.FlushReservation(uploadResv);
 
-	barrier_bufferRange<ANY_TRANSFER | HOST_WRITE, ANY_TRANSFER,
-		BUFFER_SHADER_READ, TRANSFER_WRITE>(
-			uploadResv.vkBuffer, uploadResv.bufferOffset, uploadResv.size, // make sure any in-flight transfers are completed
-			m_bufferCache, bufferOffset, size); // make sure all reads are completed before we overwrite the data
+	m_copyGroupRanges.clear();
+	// a full group (batched uploads can number thousands) also takes a new barrier, keeping this check short
+	bool overlaps = m_uploadGroupRanges.size() >= 64;
+	for (auto& [o, s] : m_uploadGroupRanges)
+		overlaps |= bufferOffset < o + s && o < bufferOffset + (uint32)size;
+	if (!m_uploadGroupOpen || overlaps)
+	{
+		// first upload since the last render pass start (or a range copied earlier in this group)
+		barrier_bufferRangeAfterTransfers<ANY_TRANSFER | HOST_WRITE, ANY_TRANSFER,
+			BUFFER_SHADER_READ, TRANSFER_WRITE>(
+				uploadResv.vkBuffer, uploadResv.bufferOffset, uploadResv.size, // make sure any in-flight transfers are completed
+				m_bufferCache, bufferOffset, size, false); // make sure all reads are completed before we overwrite the data
+		m_uploadGroupOpen = true;
+		m_uploadGroupRanges.clear();
+	}
+	m_uploadGroupRanges.emplace_back(bufferOffset, (uint32)size);
 
 	VkBufferCopy region;
 	region.srcOffset = uploadResv.bufferOffset;
@@ -3938,7 +4583,7 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
 	region.size = size;
 	vkCmdCopyBuffer(m_state.currentCommandBuffer, uploadResv.vkBuffer, m_bufferCache, 1, &region);
 
-	barrier_sequentializeTransfer();
+	m_transferBarrierPending = true;  // was barrier_sequentializeTransfer(); issued before the next render pass
 }
 
 void VulkanRenderer::bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32 size)
@@ -3946,7 +4591,19 @@ void VulkanRenderer::bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32
 	cemu_assert_debug(!m_useHostMemoryForCache);
 	draw_endRenderPass();
 
-	barrier_sequentializeTransfer();
+	bool touchesGroup = m_copyGroupRanges.empty() || m_copyGroupRanges.size() >= 64;
+	for (auto& [o, s] : m_copyGroupRanges)
+		touchesGroup |= (srcOffset < o + s && o < srcOffset + size) || (dstOffset < o + s && o < dstOffset + size);
+	m_uploadGroupOpen = false;
+	m_uploadGroupRanges.clear();
+	if (touchesGroup)
+	{
+		m_transferBarrierPending = false;  // covered by this one
+		barrier_sequentializeTransfer();
+		m_copyGroupRanges.clear();
+	}
+	m_copyGroupRanges.emplace_back(srcOffset, size);
+	m_copyGroupRanges.emplace_back(dstOffset, size);
 
 	bool isOverlapping = (srcOffset + size) > dstOffset && (srcOffset) < (dstOffset + size);
 	cemu_assert_debug(!isOverlapping);
@@ -3957,11 +4614,30 @@ void VulkanRenderer::bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32
 	bufferCopy.size = size;
 	vkCmdCopyBuffer(m_state.currentCommandBuffer, m_bufferCache, m_bufferCache, 1, &bufferCopy);
 
-	barrier_sequentializeTransfer();
+	m_transferBarrierPending = true;  // was barrier_sequentializeTransfer(); issued before the next render pass
 }
+
+// BotW-Native: BotW issues its streamout draws in runs (~5 back to back, two buffers each). Each copy used to end the
+// render pass and take its own barrier; now they wait in m_streamoutCopies and go out together when the pass ends
+// (draw_endRenderPass), or earlier if a draw binds a range they write, the ring wraps, or two would write the same
+// range. BOTW_SO_BATCH=0 copies at once as before.
+static const bool s_streamoutBatch = []{ const char* e = getenv("BOTW_SO_BATCH"); return !(e && e[0] == '0'); }();
 
 void VulkanRenderer::bufferCache_copyStreamoutToMainBuffer(uint32 srcOffset, uint32 dstOffset, uint32 size)
 {
+	if (s_streamoutBatch && !m_useHostMemoryForCache)
+	{
+		for (auto& c : m_streamoutCopies)
+		{
+			if (dstOffset < c.dst + c.size && c.dst < dstOffset + size)
+			{
+				draw_endRenderPass(); // flushes the earlier write to this range first
+				break;
+			}
+		}
+		m_streamoutCopies.push_back({srcOffset, dstOffset, size});
+		return;
+	}
 	draw_endRenderPass();
 
 	VkBuffer dstBuffer;
@@ -3974,12 +4650,12 @@ void VulkanRenderer::bufferCache_copyStreamoutToMainBuffer(uint32 srcOffset, uin
 	else
 		dstBuffer = m_bufferCache;
 
-	barrier_bufferRange<BUFFER_SHADER_WRITE, TRANSFER_READ,
+	// the two barriers before the copy (range waits + barrier_sequentializeTransfer) in one call
+	upload_closeGroup();
+	barrier_bufferRangeAfterTransfers<BUFFER_SHADER_WRITE, TRANSFER_READ,
 		ANY_TRANSFER | BUFFER_SHADER_READ, TRANSFER_WRITE>(
 			m_xfbRingBuffer, srcOffset, size, // wait for all writes to finish
-			dstBuffer, dstOffset, size); // wait for all reads to finish
-
-	barrier_sequentializeTransfer();
+			dstBuffer, dstOffset, size, true); // wait for all reads to finish
 
 	VkBufferCopy bufferCopy{};
 	bufferCopy.srcOffset = srcOffset;
@@ -3987,7 +4663,51 @@ void VulkanRenderer::bufferCache_copyStreamoutToMainBuffer(uint32 srcOffset, uin
 	bufferCopy.size = size;
 	vkCmdCopyBuffer(m_state.currentCommandBuffer, m_xfbRingBuffer, dstBuffer, 1, &bufferCopy);
 
-	barrier_sequentializeTransfer();
+	m_transferBarrierPending = true;  // was barrier_sequentializeTransfer(); issued before the next render pass
+}
+
+// outside a render pass (draw_endRenderPass): the waiting streamout copies behind one barrier over all their ranges
+void VulkanRenderer::streamout_flushCopies()
+{
+	if (m_streamoutCopies.empty())
+		return;
+	uint32 srcLo = 0xFFFFFFFF, srcHi = 0, dstLo = 0xFFFFFFFF, dstHi = 0;
+	for (auto& c : m_streamoutCopies)
+	{
+		srcLo = std::min(srcLo, c.src), srcHi = std::max(srcHi, c.src + c.size);
+		dstLo = std::min(dstLo, c.dst), dstHi = std::max(dstHi, c.dst + c.size);
+	}
+	upload_closeGroup();
+	barrier_bufferRangeAfterTransfers<BUFFER_SHADER_WRITE, TRANSFER_READ,
+		ANY_TRANSFER | BUFFER_SHADER_READ, TRANSFER_WRITE>(
+			m_xfbRingBuffer, srcLo, srcHi - srcLo, // wait for the streamout writes
+			m_bufferCache, dstLo, dstHi - dstLo, true); // and for earlier reads of the destinations
+	for (auto& c : m_streamoutCopies)
+	{
+		VkBufferCopy bufferCopy{ c.src, c.dst, c.size };
+		vkCmdCopyBuffer(m_state.currentCommandBuffer, m_xfbRingBuffer, m_bufferCache, 1, &bufferCopy);
+	}
+	m_streamoutCopies.clear();
+	m_transferBarrierPending = true;
+}
+
+// a bound vertex or uniform buffer range that a waiting streamout copy writes (stale bindings count too)
+bool VulkanRenderer::streamout_copiesOverlapBindings() const
+{
+	auto overlaps = [this](uint32 offset, uint32 size) {
+		for (auto& c : m_streamoutCopies)
+			if (offset < c.dst + c.size && c.dst < offset + size)
+				return true;
+		return false;
+	};
+	for (uint32 i = 0; i < Latte::GPU_LIMITS::NUM_VERTEX_BUFFERS; i++)
+		if (m_vertexBindSize[i] && m_state.currentVertexBinding[i].offset != 0xFFFFFFFF && overlaps(m_state.currentVertexBinding[i].offset, m_vertexBindSize[i]))
+			return true;
+	for (uint32 s = 0; s < VulkanRendererConst::SHADER_STAGE_INDEX_COUNT; s++)
+		for (uint32 i = 0; i < LATTE_NUM_MAX_UNIFORM_BUFFERS; i++)
+			if (m_uniformBindSize[s][i] && overlaps(dynamicOffsetInfo.shaderUB[s].uniformBufferOffset[i], m_uniformBindSize[s][i]))
+				return true;
+	return false;
 }
 
 void VulkanRenderer::AppendOverlayDebugInfo()
