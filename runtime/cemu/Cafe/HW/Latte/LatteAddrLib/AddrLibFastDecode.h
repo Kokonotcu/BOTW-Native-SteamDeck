@@ -1,6 +1,16 @@
 #pragma once
 #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
 
+// BotW-Native: true when every row of this 8x8 micro tile's pixel index table is 8 consecutive indices, so a row of
+// pixels is one contiguous run in the tiled data (the row-copy loop reads the row's first index only)
+inline bool microTileRowsContiguous(const uint16* table)
+{
+	for (int i = 0; i < 64; i++)
+		if (table[i] != table[i & ~7] + (i & 7))
+			return false;
+	return true;
+}
+
 template<typename texelBaseType, int texelBaseTypeCount, bool isEncodeDirection, bool isCompressed>
 void optimizedDecodeLoop_tm04_numSamples1_8x8(LatteTextureLoaderCtx* textureLoader, uint8* outputData, sint32 texelCountX, sint32 texelCountY)
 {
@@ -170,6 +180,24 @@ void optimizedDecodeLoop_tm04_numSamples1_8x8_optimizedRowCopy(LatteTextureLoade
 					else
 						cemu_assert_unimplemented();
 				}
+				else if ((sizeof(texelBaseType)*texelBaseTypeCount) == 2)
+				{
+					// bpp = 16 (BotW-Native): the 8 pixels of a micro tile row are 16 contiguous bytes; only taken when
+					// the tile's pixel index table says so (microTileRowsContiguous)
+					uint64* blockOutput64 = (uint64*)blockOutput;
+					uint64* blockData64 = (uint64*)blockData;
+					if (isEncodeDirection)
+					{
+						blockData64[0] = blockOutput64[0];
+						blockData64[1] = blockOutput64[1];
+					}
+					else
+					{
+						blockOutput64[0] = blockData64[0];
+						blockOutput64[1] = blockData64[1];
+					}
+					blockOutput += 8 * texelBaseTypeCount;
+				}
 				else if ((sizeof(texelBaseType)*texelBaseTypeCount) == 1)
 				{
 					// bpp = 8
@@ -230,6 +258,13 @@ void optimizedDecodeLoops(LatteTextureLoaderCtx* textureLoader, uint8* outputDat
 		}
 		else if (textureLoader->computeAddrInfo.microTileType == 0 && (sizeof(texelBaseType)*texelBaseTypeCount) == 1)
 		{
+			optimizedDecodeLoop_tm04_numSamples1_8x8_optimizedRowCopy<texelBaseType, texelBaseTypeCount, isEncodeDirection, isCompressed>(textureLoader, outputData, texelCountX, texelCountY);
+		}
+		else if (textureLoader->computeAddrInfo.microTileType == 0 && (sizeof(texelBaseType)*texelBaseTypeCount) == 2 &&
+				 microTileRowsContiguous(textureLoader->computeAddrInfo.microTilePixelIndexTable + ((textureLoader->computeAddrInfo.slice & 7) << 6)))
+		{
+			// BotW-Native: 16 bpp row copy instead of the per-pixel table loop below (2 x 8-byte moves per row of 8 pixels
+			// instead of 8 table lookups + 2-byte moves; ~5% of the GPU thread's samples in b141 streaming-burst frames)
 			optimizedDecodeLoop_tm04_numSamples1_8x8_optimizedRowCopy<texelBaseType, texelBaseTypeCount, isEncodeDirection, isCompressed>(textureLoader, outputData, texelCountX, texelCountY);
 		}
 		else
@@ -340,6 +375,54 @@ void optimizedDecodeLoops(LatteTextureLoaderCtx* textureLoader, uint8* outputDat
 						blockOutput[1] = ((texelBaseType*)blockData)[1];
 					}
 					blockData += 2;
+					blockOutput += 2;
+				}
+			}
+		}
+	}
+	else if (textureLoader->tileMode == Latte::E_HWTILEMODE::TM_1D_TILED_THIN1 && textureLoader->bpp == sizeof(texelBaseType) * texelBaseTypeCount * 8)
+	{
+		// BotW-Native: 1D tiled (small mips). ComputeSurfaceAddrFromCoordMicroTiled = slice + micro tile offset (x>>3, y>>3)
+		// + bpp * pixelIndex(x&7, y&7) / 8, with pixelIndex(0,0) = 0: one full address per 8 texels (the tile corner) plus
+		// a 64-entry in-tile table built from the same function - the same offsets the generic handler computes per texel
+		const uint32 slice = textureLoader->sliceIndex, bpp = textureLoader->bpp, pitch = textureLoader->pitch, h = textureLoader->surfaceInfoHeight;
+		const auto addr = [&](uint32 tx, uint32 ty) { return LatteAddrLib::ComputeSurfaceAddrFromCoordMicroTiled(tx, ty, slice, bpp, pitch, h, Latte::E_HWTILEMODE::TM_1D_TILED_THIN1, false); };
+		const uint32 base = addr(0, 0);
+		uint32 inTile[64];
+		for (uint32 i = 0; i < 64; i++)
+			inTile[i] = addr(i & 7, i >> 3) - base;
+		for (sint32 y = 0; y < textureLoader->height; y += textureLoader->stepY)
+		{
+			const uint32 ty = y / textureLoader->stepY;
+			sint32 pixelOffset = (ty * textureLoader->decodedTexelCountX) * (sizeof(texelBaseType) * texelBaseTypeCount);
+			texelBaseType* blockOutput = (texelBaseType*)(outputData + pixelOffset);
+			uint32 corner = 0;
+			for (sint32 x = 0; x < textureLoader->width; x += textureLoader->stepX)
+			{
+				const uint32 tx = x / textureLoader->stepX;
+				if ((tx & 7) == 0)
+					corner = addr(tx, ty & ~7u);
+				uint8* blockData = textureLoader->inputData + corner + inTile[((ty & 7) << 3) | (tx & 7)];
+				if (texelBaseTypeCount == 1)
+				{
+					if (isEncodeDirection)
+						*(texelBaseType*)blockData = *blockOutput;
+					else
+						*blockOutput = *(texelBaseType*)blockData;
+					blockOutput++;
+				}
+				else if (texelBaseTypeCount == 2)
+				{
+					if (isEncodeDirection)
+					{
+						((texelBaseType*)blockData)[0] = blockOutput[0];
+						((texelBaseType*)blockData)[1] = blockOutput[1];
+					}
+					else
+					{
+						blockOutput[0] = ((texelBaseType*)blockData)[0];
+						blockOutput[1] = ((texelBaseType*)blockData)[1];
+					}
 					blockOutput += 2;
 				}
 			}

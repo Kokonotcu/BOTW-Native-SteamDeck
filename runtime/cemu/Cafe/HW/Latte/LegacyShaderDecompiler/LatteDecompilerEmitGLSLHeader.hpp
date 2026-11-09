@@ -264,7 +264,14 @@ namespace LatteDecompiler
 					cemu_assert_debug(decompilerContext->output->resourceMappingVK.attributeMapping[i] >= 0);
 					cemu_assert_debug(decompilerContext->output->resourceMappingGL.attributeMapping[i] == decompilerContext->output->resourceMappingVK.attributeMapping[i]);
 
-					shaderSrc->addFmt("ATTR_LAYOUT({}) in uvec4 attrDataSem{};" _CRLF, (sint32)decompilerContext->output->resourceMappingVK.attributeMapping[i], i);
+					// BotW-Native: the input type follows the Vulkan vertex format (LatteDecompiler_nativeAttrType)
+					const char* type = "uvec4";
+					for (auto& group : decompilerContext->fetchShader->bufferGroups)
+						for (sint32 j = 0; j < group.attribCount; j++)
+							if (group.attrib[j].semanticId == i)
+								if (char t = LatteDecompiler_nativeAttrType(group.attrib[j]))
+									type = t == 'i' ? "ivec4" : "vec4";
+					shaderSrc->addFmt("ATTR_LAYOUT({}) in {} attrDataSem{};" _CRLF, (sint32)decompilerContext->output->resourceMappingVK.attributeMapping[i], type, i);
 				}
 			}
 		}

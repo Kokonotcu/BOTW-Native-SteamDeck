@@ -126,8 +126,19 @@ PipelineCompiler::~PipelineCompiler()
 		m_renderPassObj->decRef();
 };
 
-VkFormat PipelineCompiler::GetVertexFormat(Latte::E_HWFMT format)
+VkFormat PipelineCompiler::GetVertexFormat(const LatteParsedFetchShaderAttribute& attr)
 {
+	// BotW-Native: 8-bit attributes the vertex shader reads converted (LatteDecompiler_nativeAttrType)
+	if (char t = LatteDecompiler_nativeAttrType(attr))
+	{
+		static const VkFormat formats[3][3] = {
+			{VK_FORMAT_R8_USCALED, VK_FORMAT_R8G8_USCALED, VK_FORMAT_R8G8B8A8_USCALED},
+			{VK_FORMAT_R8_SSCALED, VK_FORMAT_R8G8_SSCALED, VK_FORMAT_R8G8B8A8_SSCALED},
+			{VK_FORMAT_R8_SINT, VK_FORMAT_R8G8_SINT, VK_FORMAT_R8G8B8A8_SINT}};
+		int size = attr.format == Latte::E_HWFMT::HWFMT_8 ? 0 : attr.format == Latte::E_HWFMT::HWFMT_8_8 ? 1 : 2;
+		return formats[t == 'i' ? 2 : attr.isSigned ? 1 : 0][size];
+	}
+	Latte::E_HWFMT format = attr.format;
 	switch (format)
 	{
 	case Latte::E_HWFMT::HWFMT_32_32_32_32_FLOAT:
@@ -408,7 +419,7 @@ void PipelineCompiler::InitVertexInputState(const LatteContextRegister& latteReg
 			entry.location = semanticId;
 			entry.offset = attr.offset;
 			entry.binding = attr.attributeBufferIndex;
-			entry.format = GetVertexFormat(attr.format);
+			entry.format = GetVertexFormat(attr);
 			vertexInputAttributeDescription.emplace_back(entry);
 
 			if (fetchType.has_value())

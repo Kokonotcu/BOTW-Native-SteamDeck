@@ -100,8 +100,30 @@ void _readBigEndianAttributeU16x4(LatteDecompilerShader* shaderContext, StringBu
 	src->add("attrDecoder = ((attrDecoder>>8)&0xFF)|((attrDecoder<<8)&0xFF00);" _CRLF);
 }
 
+// BotW-Native: 8-bit attributes the Vulkan fetch hands over already converted: 'f' = USCALED/SSCALED (vec4 input,
+// replaces the shader's int-to-float and sign extension), 'i' = SINT (ivec4, replaces the sign extension), 0 = raw UINT.
+// Exact: 8-bit integers convert to float without rounding (scratch/vfetch_check.cpp). The UNORM/SCALED decodes below
+// read vec4(attrDataSem) unchanged, a no-op on a vec4 input. Normalized fetch (UNORM/SNORM) is not used: the hardware
+// division need not round like the shader's c * (1/255).
+char LatteDecompiler_nativeAttrType(const LatteParsedFetchShaderAttribute& attrib)
+{
+	if (g_renderer->GetType() != RendererAPI::Vulkan || attrib.attributeBufferIndex >= Latte::GPU_LIMITS::NUM_VERTEX_BUFFERS)
+		return 0;
+	bool rgba8 = attrib.format == Latte::E_HWFMT::HWFMT_8_8_8_8;
+	bool small8 = attrib.format == Latte::E_HWFMT::HWFMT_8_8 || attrib.format == Latte::E_HWFMT::HWFMT_8;
+	if (!(rgba8 && attrib.endianSwap == LatteConst::VertexFetchEndianMode::SWAP_U32) &&
+		!((rgba8 || small8) && attrib.endianSwap == LatteConst::VertexFetchEndianMode::SWAP_NONE))
+		return 0;
+	if (attrib.nfa == 0 || (attrib.nfa == 2 && attrib.isSigned == 0))
+		return 'f';
+	if (attrib.nfa == 1 && attrib.isSigned != 0)
+		return 'i';
+	return 0;
+}
+
 void LatteDecompiler_emitAttributeDecodeGLSL(LatteDecompilerShader* shaderContext, StringBuf* src, LatteParsedFetchShaderAttribute* attrib)
 {
+	const bool native = LatteDecompiler_nativeAttrType(*attrib) != 0;
 	if (attrib->attributeBufferIndex >= Latte::GPU_LIMITS::NUM_VERTEX_BUFFERS)
 	{
 		src->add("attrDecoder = ivec4(0);" _CRLF);
@@ -175,6 +197,10 @@ void LatteDecompiler_emitAttributeDecodeGLSL(LatteDecompilerShader* shaderContex
 		{
 			// seen in Minecraft Wii U Edition
 			src->addFmt("attrDecoder.xyzw = floatBitsToUint(vec4(attrDataSem{}.wzyx)/255.0);" _CRLF, attributeInputIndex);
+		}
+		else if (attrib->format == Latte::E_HWFMT::HWFMT_8_8_8_8 && attrib->nfa == 0 && attrib->isSigned != 0 && native)
+		{
+			src->addFmt("attrDecoder.xyzw = floatBitsToUint(max(attrDataSem{}.wzyx/127.0,-1.0));" _CRLF, attributeInputIndex);
 		}
 		else if( attrib->format == Latte::E_HWFMT::HWFMT_8_8_8_8 && attrib->nfa == 0 && attrib->isSigned != 0 )
 		{
@@ -274,6 +300,10 @@ void LatteDecompiler_emitAttributeDecodeGLSL(LatteDecompilerShader* shaderContex
 		{
 			src->addFmt("attrDecoder.xyzw = floatBitsToUint(vec4(attrDataSem{}.xyzw)/255.0);" _CRLF, attributeInputIndex);
 		}
+		else if (attrib->format == Latte::E_HWFMT::HWFMT_8_8_8_8 && attrib->nfa == 0 && attrib->isSigned != 0 && native)
+		{
+			src->addFmt("attrDecoder.xyzw = floatBitsToUint(max(attrDataSem{}.xyzw/127.0,-1.0));" _CRLF, attributeInputIndex);
+		}
 		else if( attrib->format == Latte::E_HWFMT::HWFMT_8_8_8_8 && attrib->nfa == 0 && attrib->isSigned != 0 )
 		{
 			src->addFmt("attrDecoder.xyzw = attrDataSem{}.xyzw;" _CRLF, attributeInputIndex);
@@ -290,8 +320,13 @@ void LatteDecompiler_emitAttributeDecodeGLSL(LatteDecompilerShader* shaderContex
 		else if (attrib->format == Latte::E_HWFMT::HWFMT_8_8_8_8 && attrib->nfa == 1 && attrib->isSigned != 0)
 		{
 			// seen in Sonic Lost World
-			src->addFmt("attrDecoder.xyzw = attrDataSem{}.xyzw;" _CRLF, attributeInputIndex);
-			src->add("attrDecoder.xyzw = uvec4(bitfieldExtract(ivec4(attrDecoder.xyzw), 0, 8));" _CRLF);
+			if (native)
+				src->addFmt("attrDecoder.xyzw = uvec4(attrDataSem{}.xyzw);" _CRLF, attributeInputIndex);
+			else
+			{
+				src->addFmt("attrDecoder.xyzw = attrDataSem{}.xyzw;" _CRLF, attributeInputIndex);
+				src->add("attrDecoder.xyzw = uvec4(bitfieldExtract(ivec4(attrDecoder.xyzw), 0, 8));" _CRLF);
+			}
 		}
 		else if( attrib->format == Latte::E_HWFMT::HWFMT_8_8_8_8 && attrib->nfa == 2 && attrib->isSigned == 0 )
 		{
@@ -336,6 +371,11 @@ void LatteDecompiler_emitAttributeDecodeGLSL(LatteDecompilerShader* shaderContex
 				src->add("attrDecoder.xy = uvec2(bitfieldExtract(ivec2(attrDecoder.xy), 0, 8));" _CRLF);
 				src->add("attrDecoder.x = floatBitsToUint(max(float(int(attrDecoder.x))/127.0,-1.0));" _CRLF);
 				src->add("attrDecoder.y = floatBitsToUint(max(float(int(attrDecoder.y))/127.0,-1.0));" _CRLF);
+				src->add("attrDecoder.zw = uvec2(0);" _CRLF);
+			}
+			else if (native)
+			{
+				src->addFmt("attrDecoder.xy = floatBitsToUint(max(attrDataSem{}.xy/127.0,-1.0));" _CRLF, attributeInputIndex);
 				src->add("attrDecoder.zw = uvec2(0);" _CRLF);
 			}
 			else

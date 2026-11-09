@@ -293,6 +293,8 @@ struct LatteDecompilerSubroutineInfo;
 void LatteDecompiler_DecompileVertexShader(uint64 shaderBaseHash, uint32* contextRegisters, uint8* programData, uint32 programSize, struct LatteFetchShader* fetchShader, LatteDecompilerOptions& options, LatteDecompilerOutput_t* output);
 void LatteDecompiler_DecompileGeometryShader(uint64 shaderBaseHash, uint32* contextRegisters, uint8* programData, uint32 programSize, uint8* gsCopyProgramData, uint32 gsCopyProgramSize, uint32 vsRingParameterCount, LatteDecompilerOptions& options, LatteDecompilerOutput_t* output);
 void LatteDecompiler_DecompilePixelShader(uint64 shaderBaseHash, uint32* contextRegisters, uint8* programData, uint32 programSize, LatteDecompilerOptions& options, LatteDecompilerOutput_t* output);
+// BotW-Native: 'f'/'i' when the Vulkan fetch converts this 8-bit attribute (USCALED/SSCALED, SINT), else 0
+char LatteDecompiler_nativeAttrType(const struct LatteParsedFetchShaderAttribute& attrib);
 
 // specialized shader parsers
 

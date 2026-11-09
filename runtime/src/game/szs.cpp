@@ -26,14 +26,40 @@ enum : uint32_t { cStepNormal = 0, cStepShort = 1, cStepLong = 2 };
 
 inline void dcbz(uint8_t* M, uint32_t ea) { memset(M + (ea & ~31u), 0, 32); }
 
+// n bytes s -> d, the ranges do not overlap: two overlapping fixed-size copies instead of a byte loop (same bytes)
+inline void copy_disjoint(uint8_t* d, const uint8_t* s, uint32_t n) {
+    if (n >= 16) {
+        while (n > 16) { memcpy(d, s, 16); d += 16; s += 16; n -= 16; }
+        memcpy(d + n - 16, s + n - 16, 16);
+    } else if (n >= 8) {
+        memcpy(d, s, 8); memcpy(d + n - 8, s + n - 8, 8);
+    } else if (n >= 4) {
+        memcpy(d, s, 4); memcpy(d + n - 4, s + n - 4, 4);
+    } else if (n >= 2) {
+        memcpy(d, s, 2); memcpy(d + n - 2, s + n - 2, 2);
+    } else if (n) {
+        *d = *s;
+    }
+}
+
 // n bytes from dst - dist to dst, front to back (overlap repeats the pattern, as the byte loop does)
 inline void lz_copy(uint8_t* M, uint32_t dst, uint32_t dist, uint32_t n) {
     uint8_t* d = M + dst;
     const uint8_t* s = d - dist;
+    if (dist >= n) {  // source ends before the destination starts (most Yaz0 back-references: 3-17 bytes)
+        copy_disjoint(d, s, n);
+        return;
+    }
+    if (dist == 1) {  // run of one byte
+        memset(d, *s, n);
+        return;
+    }
     if (dist >= 16) {
         while (n >= 16) { memcpy(d, s, 16); d += 16; s += 16; n -= 16; }
     } else if (dist >= 8) {
         while (n >= 8) { memcpy(d, s, 8); d += 8; s += 8; n -= 8; }
+    } else if (dist >= 4) {
+        while (n >= 4) { memcpy(d, s, 4); d += 4; s += 4; n -= 4; }
     }
     while (n--) *d++ = *s++;
 }
@@ -82,10 +108,19 @@ void stream_decomp(PPCContext* c) {
                 flagMask = 0x80;
             }
             if (flags & flagMask) {
-                if ((destp & 31) == 0) dcbz(M, destp);
-                M[destp++] = *s++;
-                left--;
-                destCount--;
+                // run of r literal bits from flagMask down: one copy; the one 32-byte line start inside the run (r <= 8)
+                // gets its dcbz before the copy, as the byte loop zeroes it right before writing that byte
+                const uint32_t nonlit = ~flags & ((flagMask << 1) - 1);
+                const uint32_t pos = 31 - __builtin_clz(flagMask);
+                const uint32_t r = nonlit ? pos - (31 - __builtin_clz(nonlit)) : pos + 1;
+                const uint32_t k = (32 - (destp & 31)) & 31;
+                if (k < r) dcbz(M, destp + k);
+                copy_disjoint(M + destp, s, r);
+                s += r;
+                left -= r;
+                destCount -= r;
+                destp += r;
+                flagMask >>= r - 1;  // the shared >>= 1 below takes the last one
             } else {
                 const uint32_t b1 = s[0], pair = (b1 << 8) | s[1];
                 s += 2;

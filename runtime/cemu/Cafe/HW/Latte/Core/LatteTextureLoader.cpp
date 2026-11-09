@@ -737,6 +737,8 @@ namespace
 #if defined(__linux__)
 			pthread_setname_np(pthread_self(), "TexDecode");
 			botw_place_thread(0);  // created by LatteThread: off the GPU pair's core (runtime/src/thread.cpp)
+			// stays at nice 0: LatteThread waits for these helpers (b140 at nice +5, session 20261110-000405: GPU thread
+			// 11.4 -> 12.0 ms/frame, main waits on GX2DrawDone +0.4 ms, GPU-class frames > 25 ms 6-8 -> 17)
 #endif
 			uint64 seen = 0;
 			std::unique_lock lock(m_mutex);

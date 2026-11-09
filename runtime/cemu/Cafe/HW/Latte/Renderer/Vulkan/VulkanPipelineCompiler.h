@@ -6,7 +6,7 @@ class PipelineCompiler : public VKRMoveableRefCounter
 {
 private:
 	// helper functions
-	VkFormat GetVertexFormat(Latte::E_HWFMT format);
+	VkFormat GetVertexFormat(const struct LatteParsedFetchShaderAttribute& attr);
 	bool ConsumesBlendConstants(VkBlendFactor blendFactor);
 
 	void CreateDescriptorSetLayout(VulkanRenderer* vkRenderer, LatteDecompilerShader* shader, VkDescriptorSetLayout& layout, PipelineInfo* vkrPipelineInfo);
