@@ -1,7 +1,8 @@
 // Real Latte microcode -> Cemu GLSL -> SPIR-V for the Vulkan backend.
 #include "shaders.h"
-#include "mods/cemu_pack.h"
-#include "mods/shader_interface.h"
+#include "log.h"
+#include "mem.h"
+#include "os.h"
 #include "graphic_pack_hash.h"
 #include "gfx/area_sample.h"
 #include "gfx/shader_linkage.h"
@@ -21,7 +22,6 @@
 #include <memory>
 #include <filesystem>
 #include <glslang/build_info.h>
-#include "platform/host.h"
 #include <array>
 #include <algorithm>
 #include <chrono>
@@ -33,7 +33,6 @@ LatteDecompilerShader* FinishDecompiledShader(LatteDecompilerOutput_t& output);
 LatteFetchShader* LatteShaderRecompiler_createFetchShader(LatteFetchShader::CacheHash hash,
     uint32* regs, uint32* code, uint32 size);
 
-void log_msg(const char* fmt, ...);  // runtime.h (not included here: the Cemu headers)
 namespace gfxvk::vk {
 using Latte::REGADDR;
 namespace {
@@ -154,7 +153,7 @@ void initialize_disk_cache() {
         const char* general=getenv("WWHD_SHADER_CACHE");
         if((overridePath && !strcmp(overridePath,"0")) ||
            (!overridePath && general && !strcmp(general,"0"))) return;
-        std::string dir=overridePath ? overridePath : host::config_dir()+"/shadercache/vulkan-shaders";
+        std::string dir=overridePath ? overridePath : g_user_root+"/shadercache/vulkan-shaders";
         if(dir.empty()) return;
         diskPath=dir+"/spirv.bin";
         std::error_code ec;
@@ -175,7 +174,7 @@ uint64_t program_hash(uint32_t address, uint32_t size, uint64_t frame) {
     // Include size: the same address can refer to different program ranges.
     auto& entry = programHashes[(uint64_t(address) << 32) | size];
     if (frame == ~uint64_t{0} || entry.frame != frame) {
-        entry.hash = hash_bytes(ppc_ptr(address), size);
+        entry.hash = hash_bytes(mem::host(address), size);
         entry.frame = frame;
     }
     return entry.hash;
@@ -197,7 +196,7 @@ uint64_t program_hash(uint32_t address, uint32_t size, uint64_t frame) {
 // and are not in the key; the pipeline key has the attachment formats.
 constexpr size_t kLinkageWords = ::gfx::kShaderLinkageWords;
 size_t gather_linkage(const uint32_t* regs, bool vertex, const LatteFetchShader* fetch, uint32_t* out) {
-    return ::gfx::gather_shader_linkage(regs, vertex, fetch, mods::cemu::has_shaders(), out);
+    return ::gfx::gather_shader_linkage(regs, vertex, fetch, false, out);
 }
 // What the program reads beyond the linkage, recorded from its first translation.
 struct ProgramUse {
@@ -437,31 +436,15 @@ bool decompile(Shader& shader, const uint32_t* regs, bool vertex, LatteFetchShad
     // mail sorting game); Cemu's default too. WWHD_STRICT_MUL=0 turns it off for comparisons
     static const bool strictMul = !getenv("WWHD_STRICT_MUL") || strcmp(getenv("WWHD_STRICT_MUL"), "0");
     options.strictMul = strictMul;
-    uint64_t packBase=0;
-    if(mods::cemu::has_shaders()) {
-        packBase=cemu_pack_hash::base(ppc_ptr(address),size,regs,vertex,fetch);
-        options.legacyGraphicPackUniforms=!vertex&&mods::cemu::legacy_pixel_uniforms(packBase);
-    }
-    const uint64_t decompilerBase=mods::cemu::has_shaders()?packBase:base;
-    if (!vertex) options.areaSampledTextures = ::gfx::area_sample::units_for_pixel_shader(ppc_ptr(address), size);
+    const uint64_t decompilerBase=base;
+    if (!vertex) options.areaSampledTextures = ::gfx::area_sample::units_for_pixel_shader(mem::host(address), size);
     LatteDecompilerOutput_t output{};
     if (vertex) LatteDecompiler_DecompileVertexShader(decompilerBase, const_cast<uint32_t*>(regs),
-        ppc_ptr(address), size, fetch, options, &output);
+        mem::host(address), size, fetch, options, &output);
     else LatteDecompiler_DecompilePixelShader(decompilerBase, const_cast<uint32_t*>(regs),
-        ppc_ptr(address), size, options, &output);
+        mem::host(address), size, options, &output);
     if (!output.shader || output.shader->hasError || !output.shader->strBuf_shaderSource) {
         free_decompiler(output.shader); shader.error = "Latte GLSL translation failed"; return false;
-    }
-    if (options.areaSampledTextures && packReplacement && mods::cemu::has_shaders() &&
-        !mods::cemu::shader_source(packBase, cemu_pack_hash::auxiliary(*output.shader, regs, vertex), vertex).empty()) {
-        // a graphics pack replaces this shader: translate it as Cemu does, so its interface matches
-        free_decompiler(output.shader);
-        options.areaSampledTextures = 0;
-        output = LatteDecompilerOutput_t{};
-        LatteDecompiler_DecompilePixelShader(decompilerBase, const_cast<uint32_t*>(regs), ppc_ptr(address), size, options, &output);
-        if (!output.shader || output.shader->hasError || !output.shader->strBuf_shaderSource) {
-            free_decompiler(output.shader); shader.error = "Latte GLSL translation failed"; return false;
-        }
     }
     shader.dec = FinishDecompiledShader(output);
     shader.mapping = output.resourceMappingVK;
@@ -476,32 +459,6 @@ bool decompile(Shader& shader, const uint32_t* regs, bool vertex, LatteFetchShad
         auto main = shader.glsl.find("void main(");
         if (main != std::string::npos)
             shader.glsl.insert(main, "invariant gl_Position;\n");
-    }
-    if(packReplacement && mods::cemu::has_shaders()) {
-        auto packAux=cemu_pack_hash::auxiliary(*shader.dec,regs,vertex);
-        auto custom=mods::cemu::shader_source(packBase,packAux,vertex);
-        if(!custom.empty()) {
-            if(!vertex&&link.unfed) {
-                // the inputs the translation made constants (ps_link), with the same values
-                const char* values[32]={};
-                for(uint32_t f=0;f<GPU7_PS_MAX_INPUTS&&f<32;f++)
-                    if(link.unfed&(1u<<f))values[f]=LattePSInputDefaultGLSL(regs[mmSPI_PS_INPUT_CNTL_0+f]);
-                custom=mods::cemu::const_pixel_inputs(std::move(custom),values);
-            }
-            std::string error;
-            auto replacement=compile_glsl(custom,vertex,&error);
-            std::string originalError;
-            auto original=compile_glsl(shader.glsl,vertex,&originalError);
-            bool accepted=!replacement.empty()&&!original.empty()&&
-                mods::cemu::compatible_shader_interface(original,replacement,error);
-            if(accepted && key_verify_rate()) shader.translatedGlsl=shader.glsl;
-            if(accepted)shader.glsl=std::move(custom);
-            if(error.empty()&&!accepted)error=originalError.empty()?"Shader compilation failed":originalError;
-            mods::cemu::report_shader(packBase,packAux,vertex,accepted,error);
-            fprintf(stderr,"[cemu-pack] %016llx_%016llx_%s %s%s\n",
-                (unsigned long long)packBase,(unsigned long long)packAux,vertex?"vs":"ps",
-                accepted?"applied":"rejected: ",accepted?"":error.c_str());
-        }
     }
     return true;
 }
@@ -523,8 +480,6 @@ void verify_key(const uint32_t* regs, bool vertex, LatteFetchShader* fetch, uint
     const uint32_t rate = key_verify_rate();
     if (!rate || !shader.dec) return;
     uint64_t legacy = legacy_state_hash(regs, base, vertex) ^ (vertex ? fsKey * 31 : 0);
-    if (vertex && mods::cemu::has_shaders())
-        legacy ^= uint64_t(regs[REGADDR::PA_CL_VTE_CNTL]) * 0x9E3779B97F4A7C15ull;
     auto [it, inserted] = verifiedKeys.emplace(legacy, key);
     if (!inserted) {
         if (it->second != key) ++stats.verifySplitKeys;  // narrower is allowed to be finer, never coarser
@@ -666,7 +621,7 @@ LatteFetchShader* get_fetch_shader(const uint32_t* regs, uint64_t* keyOut, uint6
     if (auto it = fetchShaders.find(key); it != fetchShaders.end()) return remember(it->second);
     auto* fetch = compact ? gx2::build_fetch_shader(address)
         : LatteShaderRecompiler_createFetchShader(key, const_cast<uint32_t*>(regs),
-                                                  reinterpret_cast<uint32_t*>(ppc_ptr(address)), size);
+                                                  reinterpret_cast<uint32_t*>(mem::host(address)), size);
     fetchShaders.emplace(key, fetch);
     return remember(fetch);
 }
@@ -734,7 +689,7 @@ Shader* translate(const uint32_t* regs, bool vertex, LatteFetchShader* fetch, ui
     auto owned = std::make_unique<Shader>();
     Shader* shader = owned.get();
     shader->vertex = vertex;
-    shader->kind = gfx::program_kind(ppc_ptr(address), size, vertex);
+    shader->kind = gfx::program_kind(mem::host(address), size, vertex);
     if (!decompile(*shader, regs, vertex, fetch, address, size, base, true, link)) {
         // Failures are per linkage: the variant words need the program's analysis.
         shader->key = shader->pipelineId = linkage ^ 0xFA17EDull;
@@ -757,7 +712,7 @@ Shader* translate(const uint32_t* regs, bool vertex, LatteFetchShader* fetch, ui
         static int reported = 0;
         if (reported < 20) {
             ++reported;
-            ::log_msg("[vulkan] pixel shader %08X: %d inputs without a vertex shader output read their default value",
+            ::log_write("[vulkan] pixel shader %08X: %d inputs without a vertex shader output read their default value",
                       address, __builtin_popcount(link.unfed));
         }
     }
@@ -765,8 +720,6 @@ Shader* translate(const uint32_t* regs, bool vertex, LatteFetchShader* fetch, ui
         std::chrono::steady_clock::now()-started).count();
     if (key_verify_rate()) {
         uint64_t legacy = legacy_state_hash(regs, base, vertex) ^ (vertex ? fsKey * 31 : 0);
-        if (vertex && mods::cemu::has_shaders())
-            legacy ^= uint64_t(regs[REGADDR::PA_CL_VTE_CNTL]) * 0x9E3779B97F4A7C15ull;
         verifiedKeys.emplace(legacy, key);
     }
     // Different keys can still translate to the same shader (e.g. a PS input table entry that the
@@ -889,7 +842,9 @@ DiskSaveResult write_shader_snapshot(DiskSnapshot snapshot,std::string path,uint
         bool wrote=fwrite(header.data(),1,header.size(),file)==header.size() &&
                    fwrite(payload.data(),1,payload.size(),file)==payload.size();
         if(fclose(file)!=0) wrote=false;
-        result.saved=wrote && host::replace_file(temporary,path);
+        std::error_code renameError;
+        std::filesystem::rename(temporary,path,renameError);
+        result.saved=wrote && !renameError;
         if(result.saved) result.bytes=header.size()+payload.size();
     } catch(...) { result.saved=false; }
     if(!result.saved && !temporary.empty()) { std::error_code ec; std::filesystem::remove(temporary,ec); }
@@ -969,7 +924,7 @@ void pack_uniforms_into(const uint32_t* regs, const Shader& shader,
             uint32_t address = regs[blockBase + group.kcacheBankIdOffset / 4];
             if (!address) continue;
             for (const auto& entry : group.entries)
-                copy(offsets.offset_remapped + entry.mappedIndexOffset, ppc_ptr(address + entry.indexOffset), 16);
+                copy(offsets.offset_remapped + entry.mappedIndexOffset, mem::host(address + entry.indexOffset), 16);
         }
     }
     if (offsets.offset_uniformRegister >= 0)

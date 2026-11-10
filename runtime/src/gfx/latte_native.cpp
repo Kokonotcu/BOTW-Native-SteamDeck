@@ -26,6 +26,7 @@ uint64_t g_vsync_count = 0;  // under g_sync_lock
 std::atomic<uint32_t> g_flip_requests{0}, g_flips_executed{0}, g_swap_interval{1};
 std::atomic<uint64_t> g_last_flip_time{0}, g_last_vsync_time{0}, g_frames{0};
 std::function<void(latte::Event)> g_sink;
+std::atomic<int> g_vsync_hz{0};  // benchmark override (0: 60 * 0.999 Hz)
 
 // LatteTiming_signalVsync
 void signal_vsync() {
@@ -55,11 +56,15 @@ void signal_vsync() {
 
 void vsync_thread() {
     botw_set_thread_name("vsync");
-    const auto period = std::chrono::nanoseconds(1000000000ll * 1002 / 60000);  // 60 * 0.999 Hz, LatteTime_CalculateTimeBetweenVSync
-    auto next = std::chrono::steady_clock::now() + period;
+    auto period_now = [] {  // 60 * 0.999 Hz (LatteTime_CalculateTimeBetweenVSync), or the benchmark's rate
+        const int hz = g_vsync_hz.load(std::memory_order_relaxed);
+        return std::chrono::nanoseconds(hz > 0 ? 1000000000ll / hz : 1000000000ll * 1002 / 60000);
+    };
+    auto next = std::chrono::steady_clock::now() + period_now();
     for (;;) {
         std::this_thread::sleep_until(next);
         signal_vsync();
+        const auto period = period_now();
         next += period;
         const auto now = std::chrono::steady_clock::now();
         if (now - next > period * 4) next = now + period;  // the process was stopped: no burst of catch-up vsyncs
@@ -101,4 +106,5 @@ uint64_t last_vsync_time() { return g_last_vsync_time; }
 uint32_t swap_interval() { return g_swap_interval.load(); }
 void set_swap_interval(uint32_t v) { g_swap_interval = v ? v : 1; }
 void set_event_sink(std::function<void(Event)> sink) { g_sink = std::move(sink); }
+void set_vsync_frequency(int hz) { g_vsync_hz = hz; }
 }  // namespace latte

@@ -349,24 +349,24 @@ HLE_EXPORT(coreinit, OSGetMemBound) {
 // ---- block memory / cache ops ---------------------------------------------------------------
 // Data-cache flushes tell the GPU buffer cache which CPU-written ranges (vertex / uniform data,
 // e.g. skinning matrices) it has to re-upload, as in Cemu's coreinit.
-void LatteBufferCache_notifyDCFlush(uint32_t address, uint32_t size);  // vendored Cemu GPU
+#include "gfx/write_watch.h"  // the renderer's buffer cache: "the CPU wrote here"
 namespace {
 void dc_flush(uint32_t addr, uint32_t size) {
     uint32_t a = addr & ~31u, e = (addr + size + 31) & ~31u;
-    LatteBufferCache_notifyDCFlush(a, e - a);
+    wwatch::hint(a, e - a);
 }
 }  // namespace
 HLE_EXPORT(coreinit, memcpy) {
     mem::commit(ARG(0), ARG(2), true);
     mem::commit(ARG(1), ARG(2), false);
     memcpy(mem::host(ARG(0)), mem::host(ARG(1)), ARG(2));
-    if (ARG(2)) LatteBufferCache_notifyDCFlush(ARG(0), ARG(2));  // COS memcpy always flushes
+    if (ARG(2)) wwatch::hint(ARG(0), ARG(2));  // COS memcpy always flushes
 }
 HLE_EXPORT(coreinit, memmove) {
     mem::commit(ARG(0), ARG(2), true);
     mem::commit(ARG(1), ARG(2), false);
     memmove(mem::host(ARG(0)), mem::host(ARG(1)), ARG(2));
-    if (ARG(2)) LatteBufferCache_notifyDCFlush(ARG(0), ARG(2));
+    if (ARG(2)) wwatch::hint(ARG(0), ARG(2));
 }
 HLE_EXPORT(coreinit, memset) {
     mem::commit(ARG(0), ARG(2), true);
@@ -377,7 +377,7 @@ HLE_EXPORT(coreinit, OSBlockMove) {
     mem::commit(ARG(0), ARG(2), true);
     mem::commit(ARG(1), ARG(2), false);
     memmove(mem::host(ARG(0)), mem::host(ARG(1)), ARG(2));
-    if (ARG(2) && (ARG(3) & 0xFF)) LatteBufferCache_notifyDCFlush(ARG(0), ARG(2));
+    if (ARG(2) && (ARG(3) & 0xFF)) wwatch::hint(ARG(0), ARG(2));
 }
 HLE_EXPORT(coreinit, OSBlockSet) {
     mem::commit(ARG(0), ARG(2), true);
@@ -390,7 +390,7 @@ HLE_EXPORT(coreinit, DCZeroRange) {
     uint32_t a = ARG(0) & ~31u, e = (ARG(0) + ARG(1) + 31) & ~31u;
     mem::commit(a, e - a, true);
     memset(mem::host(a), 0, e - a);
-    LatteBufferCache_notifyDCFlush(a, e - a);
+    wwatch::hint(a, e - a);
 }
 HLE_EXPORT(coreinit, OSIsAddressValid) { RET(ARG(0) >= 0x01000000); }
 HLE_EXPORT(coreinit, OSIsAddressRangeDCValid) { RET(1); }

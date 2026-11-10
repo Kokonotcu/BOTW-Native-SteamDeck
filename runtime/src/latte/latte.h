@@ -76,6 +76,8 @@ void wait_for_vsync();
 uint64_t last_flip_time();
 uint64_t last_vsync_time();
 uint32_t swap_interval();
+// benchmark: vsync at this rate instead of 59.94 Hz (0: back to normal)
+void set_vsync_frequency(int hz);
 void set_swap_interval(uint32_t);
 
 // GX2 event callbacks (GX2SetEventCallback): the GPU raises, GX2 dispatches on a guest thread

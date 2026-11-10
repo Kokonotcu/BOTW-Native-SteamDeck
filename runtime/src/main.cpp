@@ -55,7 +55,6 @@ static std::string default_user_root() {
 }
 
 #if defined(__linux__) && defined(ENABLE_VULKAN)
-int BreathOfTheWildChildProcessMain();
 #endif
 #if defined(__linux__)
 void hugetext_init();
@@ -130,10 +129,6 @@ static void on_fault(int sig, siginfo_t* si, void* uctx) {
 #endif
 
 int main(int argc, char** argv) {
-#if defined(__linux__) && defined(ENABLE_VULKAN)
-    // Cemu re-execs itself to see whether RADV was built with LLVM. Must run before anything else.
-    if (getenv("CEMU_DETECT_RADV") != nullptr) return BreathOfTheWildChildProcessMain();
-#endif
     // saves, caches, logs, settings; BOTW_USER_ROOT lets test runs use their own folder (tools/run.sh)
     if (const char* e = getenv("BOTW_USER_ROOT")) g_user_root = e;
     else g_user_root = default_user_root();

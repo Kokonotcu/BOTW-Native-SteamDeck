@@ -29,8 +29,6 @@
 #include <string>
 #include <vector>
 
-#include "../aspect.h"
-#include "input.h"
 #include "hle.h"
 
 namespace gfx {
@@ -40,13 +38,7 @@ const char* const kModeNames[kDrcModeCount] = {"window", "pip", "auto", "off", "
 const char* const kCornerNames[4] = {"tl", "tr", "bl", "br"};
 const char* const kFilterNames[3] = {"smooth", "sharp", "integer"};
 
-#ifdef __ANDROID__
-// one surface, no GamePad window: the TV picture first; the GamePad-only view (with the game's
-// Off-TV Play on Minus) and the overlay are a tap on the view button away
-std::atomic<int> g_mode{kDrcOff};
-#else
 std::atomic<int> g_mode{kDrcWindow};
-#endif
 std::atomic<int> g_corner{3};
 std::atomic<float> g_pip_size{0.25f};
 std::atomic<float> g_pip_opacity{1.0f};
@@ -158,11 +150,7 @@ void display_touched() { g_auto_until = std::max<double>(g_auto_until, display_n
 // ---------------------------------------------------------------- GamePad screen while paused
 static const bool g_pause_view = [] {
     const char* e = getenv("WWHD_DRC_PAUSE");
-#ifdef __ANDROID__
-    return !e || atoi(e) != 0;
-#else
     return e && atoi(e) != 0;
-#endif
 }();
 static std::atomic<double> g_plus_at{-1};      // display_now() of the last +, -1: none pending
 // the view to go back to (-1: not switched) and the time of the switch: written by the sampling
@@ -307,11 +295,7 @@ bool main_picture(float* x, float* y, float* w, float* h) {
 bool view_button_enabled() {
     static const bool on = [] {
         const char* e = getenv("WWHD_VIEW_BUTTON");
-#ifdef __ANDROID__
-        return !e || atoi(e) != 0;
-#else
         return e && atoi(e) != 0;
-#endif
     }();
     return on;
 }
@@ -415,46 +399,6 @@ void display_auto_signature(const std::vector<float>& cur_in, const std::vector<
     prev = std::move(cur);
 }
 
-// ---------------------------------------------------------------- scripted touch (tests)
-struct TestTouch { uint64_t from, to; float x, y; };
-static void test_touch(uint64_t frame) {
-    static const std::vector<TestTouch> script = [] {
-        std::vector<TestTouch> v;
-        if (const char* e = getenv("WWHD_TEST_TOUCH")) {
-            unsigned long long a, b; float x, y; int n;
-            while (sscanf(e, "%llu-%llu:%f:%f%n", &a, &b, &x, &y, &n) == 4) {
-                v.push_back({a, b, x, y});
-                e += n;
-                if (*e != ',') break;
-                e++;
-            }
-        }
-        return v;
-    }();
-    static bool down = false;
-    bool any = false;
-    for (auto& t : script)
-        if (frame >= t.from && frame <= t.to) {
-            float tx, ty;
-            any = true;
-            if (overlay_hit(t.x, t.y, &tx, &ty)) {
-                if (!down) LOG("[display] test touch: window (%.3f, %.3f) -> GamePad (%.3f, %.3f) = pixel (%.0f, %.0f) at frame %llu",
-                               t.x, t.y, tx, ty, tx * 854, ty * 480, (unsigned long long)frame);
-                input::set_touch(true, tx, ty);
-                down = true;
-            } else if (!down) {
-                LOG("[display] test touch: window (%.3f, %.3f) misses the GamePad overlay at frame %llu", t.x, t.y,
-                    (unsigned long long)frame);
-                down = true;  // log once
-                input::set_touch(false, 0, 0);
-            }
-        }
-    if (!any && down) {
-        input::set_touch(false, 0, 0);
-        down = false;
-    }
-}
-
 // ---------------------------------------------------------------- present
 static std::mutex g_dump_mu;
 static std::vector<std::string> g_present_dumps;
@@ -489,7 +433,6 @@ static PresentPlan plan_from(const Layout& L, float dw, float dh) {
 // start of a present (render thread): everything both renderers share
 PresentPlan display_plan(bool have_tv, float tw, float th, bool have_drc, float pw, float ph, float layer_w, float layer_h,
                          uint64_t frame) {
-    test_touch(frame);
     if (have_drc) g_drc_aspect = pw / ph;
     // Preserve a requested separate-window mode across display removal. Until
     // that window returns, keep the GamePad accessible in the primary picture.
@@ -499,7 +442,6 @@ PresentPlan display_plan(bool have_tv, float tw, float th, bool have_drc, float 
     float dw = 0, dh = 0;
     bool sim = sim_screen(&dw, &dh);
     if (!sim) dw = layer_w, dh = layer_h;
-    if (dw >= 1 && dh >= 1) aspect::set_window_aspect(dw / dh);  // "Match window" (aspect.cpp): the TV window / screen shape
     Layout L;
     if (have_tv || drc_only) L = layout(dw, dh, have_tv ? tw : 0, have_tv ? th : 0, have_drc ? pw : 0, have_drc ? ph : 0, pip, drc_only);
     PresentPlan p = plan_from(L, dw, dh);

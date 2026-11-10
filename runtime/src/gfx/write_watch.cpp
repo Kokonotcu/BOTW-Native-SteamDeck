@@ -7,16 +7,13 @@
 #include <mutex>
 #include <vector>
 
-#include "platform/host.h"
+#include <pthread.h>
+#include <unistd.h>
 
-#ifdef _WIN32
-#include <windows.h>
-#else
 #include <dlfcn.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/ucontext.h>
-#endif
 #include <cstdio>
 #include <thread>
 
@@ -56,12 +53,7 @@ std::vector<std::pair<uint64_t, uint64_t>> g_pins;  // page ranges [first, last]
 bool set_rw(uint64_t first, uint64_t count, bool writable) {
     void* p = g_base + (first << g_shift);
     size_t n = (size_t)(count << g_shift);
-#ifdef _WIN32
-    DWORD old;
-    return VirtualProtect(p, n, writable ? PAGE_READWRITE : PAGE_READONLY, &old) != 0;
-#else
     return mprotect(p, n, writable ? PROT_READ | PROT_WRITE : PROT_READ) == 0;
-#endif
 }
 
 void stamp_page(uint64_t page, uint64_t v) {
@@ -86,17 +78,6 @@ bool on_write_fault(uintptr_t a) {
     return true;
 }
 
-#ifdef _WIN32
-LONG CALLBACK veh(EXCEPTION_POINTERS* e) {
-    const EXCEPTION_RECORD* r = e->ExceptionRecord;
-    // ExceptionInformation[0] == 1: a write; [1]: the address
-    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2 && r->ExceptionInformation[0] == 1 &&
-        on_write_fault((uintptr_t)r->ExceptionInformation[1]))
-        return EXCEPTION_CONTINUE_EXECUTION;
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-bool install_handler() { return AddVectoredExceptionHandler(1, veh) != nullptr; }
-#else
 struct sigaction g_old_segv, g_old_bus;
 // debug: WWHD_WRITE_TRAP=addr[+size] (guest, size default 0x300) logs each guest store into the range
 // with the recompiled function doing it and the guest registers; the page is protected again every 2 ms
@@ -110,13 +91,10 @@ void trap_log(uintptr_t a, void* uc) {
     if (!g_trap || a < lo || a >= hi) return;
     if (g_trap_logs.fetch_add(1) >= 400) return;
     uintptr_t pc = 0;
-#if defined(__APPLE__) && defined(__aarch64__)
-    pc = (uintptr_t)((ucontext_t*)uc)->uc_mcontext->__ss.__pc;
-#endif
     Dl_info di{};
     const char* fn = pc && dladdr((void*)pc, &di) && di.dli_sname ? di.dli_sname : "?";
     char tn[32] = {};
-    host::get_thread_name(tn, sizeof tn);
+    pthread_getname_np(pthread_self(), tn, sizeof tn);
     uint32_t lr = 0, r[6] = {};
     if (g_guest_regs && g_guest_regs(&lr, r))
         fprintf(stderr, "[wtrap] %08X by %s img+%lX thread '%s' lr=%08X r3=%08X r4=%08X r5=%08X r6=%08X r30=%08X r31=%08X\n",
@@ -142,7 +120,6 @@ bool install_handler() {
     sigemptyset(&sa.sa_mask);
     return sigaction(SIGSEGV, &sa, &g_old_segv) == 0 && sigaction(SIGBUS, &sa, &g_old_bus) == 0;
 }
-#endif
 
 bool pinned(uint64_t page) {
     for (auto& [a, b] : g_pins)
@@ -164,7 +141,7 @@ bool page_range(uint32_t addr, uint32_t size, uint64_t& first, uint64_t& last) {
 bool init(uint8_t* base, uint64_t size) {
     static std::once_flag once;
     std::call_once(once, [&] {
-        size_t ps = host::page_size();
+        size_t ps = (size_t)sysconf(_SC_PAGESIZE);
         if (!ps || (ps & (ps - 1))) return;
         unsigned shift = 0;
         while (((size_t)1 << shift) < ps) shift++;
@@ -177,7 +154,6 @@ bool init(uint8_t* base, uint64_t size) {
         g_flags = (std::atomic<uint8_t>*)calloc(g_pages, sizeof(std::atomic<uint8_t>));
         if (!g_stamp || !g_flags || !install_handler()) return;
         g_active.store(true, std::memory_order_release);
-#ifndef _WIN32
         if (const char* e = getenv("WWHD_WRITE_TRAP")) {
             char* p;
             g_trap = (uint32_t)strtoul(e, &p, 16);
@@ -190,7 +166,6 @@ bool init(uint8_t* base, uint64_t size) {
                 }
             }).detach();
         }
-#endif
     });
     return active();
 }
@@ -256,13 +231,11 @@ uint32_t written_pages(uint32_t addr, uint32_t size, uint64_t stamp, uint32_t* e
 }
 
 void host_write_begin(uint32_t addr, uint32_t size) {
-#ifndef _WIN32
     if (g_trap && addr <= g_trap + g_trap_size && g_trap < addr + size) {
         char tn[32] = {};
-        host::get_thread_name(tn, sizeof tn);
+        pthread_getname_np(pthread_self(), tn, sizeof tn);
         fprintf(stderr, "[wtrap] host write %08X+%X thread '%s'\n", addr, size, tn);
     }
-#endif
     uint64_t first, last;
     if (!page_range(addr, size, first, last)) return;
     std::lock_guard<std::mutex> lk(g_m);

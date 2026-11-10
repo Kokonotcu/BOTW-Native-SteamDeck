@@ -1,52 +1,21 @@
-#include "../../audio_out.h"
 #ifndef VK_ENABLE_BETA_EXTENSIONS
 #define VK_ENABLE_BETA_EXTENSIONS
 #endif
-#ifndef __ANDROID__
 #define WWHD_CREATE_WINDOW_SURFACE SDL_Vulkan_CreateSurface
-#else
-#define WWHD_CREATE_WINDOW_SURFACE drivers::create_surface
-#endif
-#if defined(__APPLE__) && !defined(WWHD_SDL_HOST)
-#define VK_USE_PLATFORM_METAL_EXT  // VK_EXT_metal_surface: AppKit views' CAMetalLayers
-#endif
-#ifdef __ANDROID__
-#define VK_USE_PLATFORM_ANDROID_KHR
-#include <android/native_window_jni.h>
-#include <jni.h>
-#endif
 #include "backend.h"
 #include "bc_decode.h"
-#include "android_driver.h"
 #include "buffer_cache.h"
-#include "perf_metrics.h"
-#include "report_header.h"
 #include "present.h"
 #include "present_worker.h"
-#include "android_isolated_presenter.h"
 #include "presentation_queue.h"
 #include "gfx/display.h"
 #include "gfx/display_modes.h"
 #include "gx2/gx2.h"
-#include "input.h"
-#include "mods/mods.h"
-#include "overlay/hostui.h"
-#include "overlay/overlay.h"
-#include "overlay/guest_hud.h"
-#ifdef WWHD_SDL_HOST
-#include "platform/input_sdl.h"
 #include <SDL3/SDL_vulkan.h>
-#endif
-#include "platform/display_rate.h"
-#include "platform/host.h"
-#include "platform/perf_hint.h"
-#include "platform/gamepad_touch.h"
-#include "platform/dual_display.h"
 #include "hle.h"
-#include "screenshot.h"
+#include "os.h"
 #include "shaders.h"
 #include "settings.h"
-#include "savestate.h"
 #include "gfx/capture_schedule.h"
 #include "sparse_hash_memo.h"
 #include "gfx/write_watch.h"
@@ -61,21 +30,14 @@
 #include <filesystem>
 #include <future>
 #include <mutex>
-#ifdef __APPLE__
-#include <dlfcn.h>
-#include <mach-o/dyld.h>
-#endif
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
-#ifndef _WIN32
 #include <time.h>
-#endif
 #include <vulkan/vulkan_beta.h>
 
 namespace gx2 { uint64_t flips_presented(); void checkpoint_vulkan_caches(); }
-#include "../../interp.h"
 
 namespace gfxvk {
 Renderer R;
@@ -102,12 +64,6 @@ WaitTiming submitWait, presentSubmitWait, queueSubmitTiming;
 WaitTiming fenceStatusTiming, fenceResetTiming, retirementCleanupTiming;
 WaitTiming commandEndTiming;
 std::array<WaitTiming,5> swapPhaseTiming;
-#ifdef __ANDROID__
-VkSemaphore secondarySnapshotSignal=VK_NULL_HANDLE,secondarySnapshotWait=VK_NULL_HANDLE;
-std::unique_ptr<AndroidIsolatedPresenter> isolatedSecondary;
-bool isolatedSourceLinear=false;
-std::optional<std::pair<size_t,uint64_t>> isolatedSnapshotSubmission;
-#endif
 PresentTiming screenTiming[2];
 constexpr size_t maxPipelineCacheBytes = 64u * 1024u * 1024u;
 std::string pipelineCachePath;
@@ -161,13 +117,6 @@ void init_pipeline_cache() try {
   if (const char* explicitPath=std::getenv("WWHD_VK_PIPELINE_CACHE")) {
     if (std::strcmp(explicitPath,"0")) {
       pipelineCachePath=explicitPath;
-#ifdef __ANDROID__
-      // Keep overrides in the driver's cache namespace so removing a driver removes every cache.
-      char key[32];
-      std::snprintf(key,sizeof key,"override-%016llx.bin",static_cast<unsigned long long>(
-          pipeline_cache_checksum(reinterpret_cast<const uint8_t*>(explicitPath),std::strlen(explicitPath))));
-      pipelineCachePath = drivers::pipeline_directory()+"/"+key;
-#endif
     }
   } else if (const char* shaderPath=std::getenv("WWHD_SHADER_CACHE");
              !shaderPath || std::strcmp(shaderPath,"0")) {
@@ -176,24 +125,11 @@ void init_pipeline_cache() try {
     // a WWHD_SHADER_CACHE file (test runs, separate setups) keeps the pipeline cache next to it,
     // so such runs never write the user's own cache in the config folder
     pipelineCachePath=shaderPath ? std::string(shaderPath)+"."+ids
-                                 :
-#ifdef __ANDROID__
-                                   drivers::pipeline_directory()+"/"+ids;
-#else
-                                   host::config_dir()+"/shadercache/"+ids;
-#endif
+                                 : g_user_root+"/shadercache/"+ids;
     for (uint8_t byte : R.properties.pipelineCacheUUID) {
       char hex[3]; std::snprintf(hex,sizeof hex,"%02x",byte); pipelineCachePath+=hex;
     }
     pipelineCachePath+=".bin";
-#ifdef __ANDROID__
-    if (shaderPath) {
-      char key[32];
-      std::snprintf(key,sizeof key,"shaders-%016llx-",static_cast<unsigned long long>(
-          pipeline_cache_checksum(reinterpret_cast<const uint8_t*>(shaderPath),std::strlen(shaderPath))));
-      pipelineCachePath = drivers::pipeline_directory()+"/"+key+std::filesystem::path(pipelineCachePath).filename().string();
-    }
-#endif
   }
   std::vector<uint8_t> bytes;
   if (!pipelineCachePath.empty()) {
@@ -276,7 +212,7 @@ PipelineCacheWriteResult write_pipeline_cache(std::vector<uint8_t> bytes,
       bool written=std::fwrite(wrapper.data(),1,wrapper.size(),file)==wrapper.size();
       if (written) written=std::fwrite(bytes.data(),1,bytes.size(),file)==bytes.size();
       if (std::fclose(file)) written=false;
-      if (written) result.written=host::replace_file(temporary,path);
+      if (written) { std::error_code renameError; std::filesystem::rename(temporary,path,renameError); result.written=!renameError; }
     }
     if (!result.written) {
       std::filesystem::remove(temporary,ec);
@@ -534,49 +470,8 @@ static void destroy_overlay_gpu_queries() {
 static bool overlay_timestamp_capable() {
   return timestamp_capable(R.gpuTimestampValidBits, R.properties.limits.timestampPeriod);
 }
-static void begin_overlay_gpu_queries(VkCommandBuffer cmd, Renderer::Submission& submission) {
+static void begin_overlay_gpu_queries(VkCommandBuffer, Renderer::Submission& submission) {
   submission.perfQuery = UINT32_MAX;
-  if (!perf::enabled() || !overlay_timestamp_capable()) return;
-  static uint64_t lastPoll = UINT64_MAX;
-  if (lastPoll != R.frame) {
-    lastPoll = R.frame;
-    for (auto& q : overlayGpuQueries) {
-      if (!q.pending || q.frame >= R.frame) continue;
-      struct Result { uint64_t ticks, available; } values[2]{};
-      perf::timestamp_read(R.frame - q.frame);
-      VkResult result = vkGetQueryPoolResults(R.device, q.pool, 0, 2, sizeof(values), values,
-          sizeof(Result), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-      if (result == VK_NOT_READY || (result == VK_SUCCESS &&
-          (!values[0].available || !values[1].available))) continue;
-      double ns = result == VK_SUCCESS
-          ? double(timestamp_elapsed_ticks(values[0].ticks, values[1].ticks, R.gpuTimestampValidBits)) *
-                double(R.properties.limits.timestampPeriod) : -1;
-      perf::gpu_complete(q.frame, q.token, ns);
-      q.pending = false;
-    }
-  }
-  perf::gpu_advance(R.frame);
-  uint64_t token = perf::gpu_begin(R.frame);
-  if (!token) return;
-  for (uint32_t i = 0; i < overlayGpuQueries.size(); ++i) {
-    auto& q = overlayGpuQueries[i];
-    if (q.pending) continue;
-    if (!q.pool) {
-      VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-      info.queryType = VK_QUERY_TYPE_TIMESTAMP; info.queryCount = 2;
-      if (vkCreateQueryPool(R.device, &info, nullptr, &q.pool) != VK_SUCCESS) {
-        perf::gpu_complete(R.frame, token, -1); return; // optional measurement
-      }
-    }
-    q.frame = R.frame; q.token = token; q.pending = true;
-    submission.perfQuery = i;
-    vkCmdResetQueryPool(cmd, q.pool, 0, 2);
-    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, q.pool, 0);
-    perf::timestamp_write();
-    return;
-  }
-  // Bounded ring saturated: omit the entire frame rather than report a partial GPU interval.
-  perf::gpu_complete(R.frame, token, -1);
 }
 static void destroy_gpu_timestamp_queries() {
   // Caller has already drained submissions; never destroy in-flight queries.
@@ -802,11 +697,7 @@ bool narrow_barriers() {
     // expected; device numbers pending), opt-in on desktop until native Windows/Linux drivers have
     // been checked (neutral on MoltenVK). WWHD_VK_NARROW_BARRIERS=1|0 overrides it everywhere.
     if (e && *e) return std::strcmp(e, "0") != 0;
-#ifdef __ANDROID__
-    return true;
-#else
     return false;
-#endif
   }();
   return enabled;
 }
@@ -936,7 +827,6 @@ static void submit(VkSemaphore wait = VK_NULL_HANDLE,
   if (recordingSlot.perfQuery != UINT32_MAX) {
     auto& q = overlayGpuQueries[recordingSlot.perfQuery];
     vkCmdWriteTimestamp(R.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q.pool, 1);
-    perf::timestamp_write();
     recordingSlot.perfQuery = UINT32_MAX;
   }
   if (recordingSlot.timestampRecorded)
@@ -950,31 +840,17 @@ static void submit(VkSemaphore wait = VK_NULL_HANDLE,
   si.commandBufferCount = 1;
   si.pCommandBuffers = &R.cmd;
   if(wait)waits[si.waitSemaphoreCount++]=wait;
-#ifdef __ANDROID__
-  if(secondarySnapshotWait)waits[si.waitSemaphoreCount++]=secondarySnapshotWait;
-#endif
   si.pWaitSemaphores=waits.data();si.pWaitDstStageMask=stages.data();
   std::array<VkSemaphore,2> signals{};
   if(signal)signals[si.signalSemaphoreCount++]=signal;
-#ifdef __ANDROID__
-  if(secondarySnapshotSignal)signals[si.signalSemaphoreCount++]=secondarySnapshotSignal;
-#endif
   si.pSignalSemaphores=signals.data();
   vk_check(timed_call(queueSubmitTiming, [&] {
     return vkQueueSubmit(R.queue, 1, &si, R.fence);
   }), "submit graphics");
-#ifdef __ANDROID__
-  const bool isolatedSnapshotQueued=secondarySnapshotSignal && isolatedSecondary && isolatedSecondary->prepared();
-  if(isolatedSnapshotQueued)isolatedSecondary->primary_submitted();
-  secondarySnapshotSignal=secondarySnapshotWait=VK_NULL_HANDLE;
-#endif
   R.recording=false;
   auto& slot=R.submissions[R.activeSubmission];
   static uint64_t nextSubmissionSerial=0;
   slot.serial=++nextSubmissionSerial;
-#ifdef __ANDROID__
-  if(isolatedSnapshotQueued)isolatedSnapshotSubmission=std::pair{R.activeSubmission,slot.serial};
-#endif
   slot.uploadBlocks=std::move(R.uploadBlocks);
   slot.completions=std::move(R.completions);
   slot.garbageBuffers=std::move(R.garbageBuffers);
@@ -1001,20 +877,14 @@ void flush() {
   submit();
   drain_submissions();
 }
-#ifdef __ANDROID__
-static void wait_secondary_present();
-#endif
 static VkResult device_wait_idle() {
-#ifdef __ANDROID__
-  wait_secondary_present(); // synchronize host access to the dedicated queue
-#endif
   return vkDeviceWaitIdle(R.device);
 }
 void wait_idle() {
   flush();
   vk_check(device_wait_idle(), "device idle");
 }
-void with_autorelease_pool(void (*fn)()) { host::with_autorelease_pool(fn); }
+void with_autorelease_pool(void (*fn)()) { fn(); }
 uint64_t frames_completed() { return R.completed.load(); }
 uint64_t frame_count() { return std::atomic_ref<uint64_t>(R.frame).load(); }
 static bool has_extension(const std::vector<VkExtensionProperties> &es,
@@ -1022,29 +892,8 @@ static bool has_extension(const std::vector<VkExtensionProperties> &es,
   return std::any_of(es.begin(), es.end(),
                      [&](auto &e) { return !strcmp(e.extensionName, name); });
 }
-#ifdef __ANDROID__
-static void retire_secondary_swapchain(bool surface);
-static bool secondary_retirement_available();
-#endif
 static void make_swapchain(Screen &s) {
-#ifdef __ANDROID__
-  if (&s == &R.tv) {
-    // Primary views only reference graphics-queue work. Do not synchronize
-    // the separate WSI queue just to resize the main display.
-    vk_check(vkQueueWaitIdle(R.queue), "primary resize graphics idle");
-  } else if (!R.secondaryPresentFences) {
-    ++R.secondaryIdleWaits;
-    vk_check(device_wait_idle(), "resize device idle");
-  }
-#else
   vk_check(device_wait_idle(), "resize device idle");
-#endif
-#ifdef __ANDROID__
-  if(&s==&R.tv && R.primaryInjectQueryLoss.exchange(false))
-    vk_check(VK_ERROR_SURFACE_LOST_KHR,"authored primary surface capability loss");
-  if(&s==&R.drc && R.secondaryInjectQueryLoss.exchange(false))
-    vk_check(VK_ERROR_SURFACE_LOST_KHR,"authored secondary surface capability loss");
-#endif
   VkSurfaceCapabilitiesKHR caps;
   vk_check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(R.physicalDevice,
                                                      s.surface, &caps),
@@ -1064,13 +913,7 @@ static void make_swapchain(Screen &s) {
     fs[0].format = VK_FORMAT_B8G8R8A8_SRGB;
   VkSurfaceFormatKHR format{};
   bool found = false;
-#ifdef WWHD_SDL_HOST
   const VkFormat preferred = VK_FORMAT_B8G8R8A8_SRGB;
-#else
-  // AppKit windows: like the Metal layer, an sRGB drawable only for an sRGB scan buffer (the
-  // composition, overlay blending included, then matches the Metal renderer's)
-  const VkFormat preferred = s.srgb ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
-#endif
   for (auto f : fs) {
     VkFormatProperties props;
     vkGetPhysicalDeviceFormatProperties(R.physicalDevice, f.format, &props);
@@ -1094,30 +937,7 @@ static void make_swapchain(Screen &s) {
               std::clamp<uint32_t>(std::max(s.height.load(), 1),
                                    caps.minImageExtent.height,
                                    caps.maxImageExtent.height)};
-#ifdef __ANDROID__
-  // Phones report the extent in the display's natural (portrait) orientation together with a 90°
-  // or 270° current transform. The pictures are laid out for the landscape window, so the
-  // swapchain gets the window's own size and an identity transform: the compositor rotates it.
-  // (The window can also still be portrait while the activity turns to landscape: its size
-  // changes then and the swapchain is made again for the new size.)
-  {
-    int pw = 0, ph = 0;
-    if (s.window && SDL_GetWindowSizeInPixels(s.window, &pw, &ph) && pw > 0 && ph > 0)
-      extent = {uint32_t(pw), uint32_t(ph)};
-    else if (&s == &R.drc && s.width > 0 && s.height > 0)
-      extent = {uint32_t(s.width.load()), uint32_t(s.height.load())};
-    else if (caps.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR |
-                                      VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR))
-      std::swap(extent.width, extent.height);
-  }
-  const VkSurfaceTransformFlagBitsKHR transform =
-      (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
-          ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : caps.currentTransform;
-  LOG("[vulkan] swapchain %ux%u (surface reports %ux%u, transform %u)", extent.width, extent.height,
-      caps.currentExtent.width, caps.currentExtent.height, unsigned(caps.currentTransform));
-#else
   const VkSurfaceTransformFlagBitsKHR transform = caps.currentTransform;
-#endif
   if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
     throw std::runtime_error("Swapchain cannot receive scan-buffer blits");
   VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
@@ -1140,16 +960,6 @@ static void make_swapchain(Screen &s) {
       (shaderPresentation ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0) |
       (captureTransfer ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
   ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-#ifdef __ANDROID__
-  // Captures/the explicit waiting path draw on the primary queue, while the
-  // ordinary worker draws on its own family. Both may access these images.
-  const uint32_t presentationFamilies[]={R.queueFamily,R.secondaryQueueFamily};
-  if(&s==&R.drc && R.secondaryQueue && R.secondaryQueueFamily!=R.queueFamily) {
-    ci.imageSharingMode=VK_SHARING_MODE_CONCURRENT;
-    ci.queueFamilyIndexCount=2;
-    ci.pQueueFamilyIndices=presentationFamilies;
-  }
-#endif
   ci.preTransform = transform;
   ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
   for (auto flag : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
@@ -1187,18 +997,11 @@ static void make_swapchain(Screen &s) {
         offeredNames.c_str(), chosen != wanted ? " - the requested mode is not offered" : "");
   s.presentMode = chosen;
   s.presentWanted = wanted;
-  // frame interpolation caps 120/240 fps to the display's refresh rate only when presenting waits
-  // for it (interp::output_fps)
-  if (&s == &R.tv) interp::set_present_vsync(chosen == kPresentFifo);
   ci.clipped = VK_TRUE;
   ci.oldSwapchain = s.swapchain;
   VkSwapchainKHR sc;
   vk_check(vkCreateSwapchainKHR(R.device, &ci, nullptr, &sc),
            "create swapchain");
-#ifdef __ANDROID__
-  if (&s == &R.drc && R.secondaryPresentFences) retire_secondary_swapchain(false);
-  else
-#endif
   {
     reset_present_screen(s); // The compatibility path drained the device above.
     if (s.swapchain) vkDestroySwapchainKHR(R.device, s.swapchain, nullptr);
@@ -1215,55 +1018,6 @@ static void make_swapchain(Screen &s) {
   prepare_present_screen(s,shaderPresentation,captureTransfer);
   s.resize = false;
 }
-#ifdef __ANDROID__
-// Android destroys an app's surface when it goes to the background (Home, another app) and gives
-// it a new one when it comes back. Meanwhile nothing is presented (the game keeps running); then
-// the Vulkan surface and swapchain are created again for the window's new native surface.
-static std::atomic<bool> surfaceLost{false}, surfaceRecreate{false};
-static void recover_primary_surface() {
-  ++R.primarySurfaceLosses;
-  surfaceLost = true;
-  surfaceRecreate = true;
-}
-
-static void recreate_surface(Screen &s) {
-  if (!SDL_GetPointerProperty(SDL_GetWindowProperties(s.window),
-                              SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr)) {
-    surfaceRecreate = true;  // the new native surface is not there yet: next frame
-    return;
-  }
-  vk_check(vkQueueWaitIdle(R.queue), "primary surface recreation graphics idle");
-  reset_present_screen(s);
-  if (s.swapchain)
-    vkDestroySwapchainKHR(R.device, s.swapchain, nullptr);
-  s.swapchain = VK_NULL_HANDLE;
-  if (s.surface)
-    vkDestroySurfaceKHR(R.instance, s.surface, nullptr);
-  s.surface = VK_NULL_HANDLE;
-  if (!WWHD_CREATE_WINDOW_SURFACE(s.window, R.instance, nullptr, &s.surface)) {
-    LOG("[vulkan] surface recreation: %s (retrying)", SDL_GetError());
-    s.surface = VK_NULL_HANDLE;
-    surfaceRecreate = true;
-    return;
-  }
-  surfaceLost = false;
-  s.resize = true;
-  LOG("[vulkan] presentation surface recreated");
-}
-// App lifecycle: called by SDL as the events happen, on the thread that sends them; SDL's
-// documentation asks for an event watch here (the queue is not read while the app is paused).
-static bool SDLCALL lifecycle_watch(void *, SDL_Event *event) {
-  if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND || event->type == SDL_EVENT_DID_ENTER_BACKGROUND) {
-    if (!surfaceLost.exchange(true))
-      LOG("[vulkan] app in the background: presentation paused");
-  } else if (event->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
-    LOG("[vulkan] app in the foreground: new presentation surface");
-    R.tv.visible = true;  // (the window may have reported itself minimized meanwhile)
-    surfaceRecreate = true;
-  }
-  return true;
-}
-#endif
 // Asynchronous presentation (the default on every platform since 2026-10-07; WWHD_VK_ASYNC_PRESENT=0
 // restores the waiting path): the presentation submission goes into the four-slot ring like GX2Flush
 // work instead of waiting for the GPU, and swap() does not drain the queue, so the render thread
@@ -1291,469 +1045,11 @@ static VkSemaphore new_semaphore() {
   vk_check(vkCreateSemaphore(R.device, &si, nullptr, &sem), "create presentation semaphore");
   return sem;
 }
-#ifdef __ANDROID__
-namespace {
-std::mutex secondaryMutex;
-ANativeWindow *pendingSecondary = nullptr, *secondaryWindow = nullptr;
-bool secondaryChanged = false;
-int secondaryWidth = 0, secondaryHeight = 0;
-int64_t secondaryGeneration = -1;
-int64_t activeSecondaryGeneration = -1;
-gamepad_touch::Viewport secondaryTouchBox;
-gamepad_touch::Viewport primaryTouchBox;
-struct SecondaryPresentFence { VkFence fence=VK_NULL_HANDLE; bool pending=false; };
-std::array<SecondaryPresentFence,3> secondaryPresentFences;
-unsigned nextSecondaryPresentFence=0;
-struct RetiredSecondarySwapchain {
-  VkSwapchainKHR swapchain=VK_NULL_HANDLE;
-  VkSurfaceKHR surface=VK_NULL_HANDLE;
-  ANativeWindow* window=nullptr;
-  bool ownsSurface=false;
-  std::vector<VkImageView> views;
-  AsyncPresentState presentation;
-  std::array<SecondaryPresentFence,3> presents;
-  std::vector<std::pair<size_t,uint64_t>> submissions;
-  VkSemaphore acquired=VK_NULL_HANDLE,finished=VK_NULL_HANDLE;
-};
-std::vector<RetiredSecondarySwapchain> retiredSecondarySwapchains;
-struct SecondaryPresentResult { VkResult status; uint64_t elapsedNs; bool acquisition=false; uint32_t image=0; bool fencePending=false; };
-std::unique_ptr<PresentWorker<SecondaryPresentResult>> secondaryPresentWorker;
-std::optional<SecondaryPresentResult> secondaryAcquired;
-unsigned secondaryAcquireIndex=0;
-VkFence secondaryAcquireFence=VK_NULL_HANDLE;
-bool secondaryAcquireFencePending=false;
-struct SecondaryDrawing {
-  Surface snapshot;
-  VkCommandPool pool=VK_NULL_HANDLE;
-  VkCommandBuffer cmd=VK_NULL_HANDLE;
-  VkDescriptorPool descriptors=VK_NULL_HANDLE;
-  VkFence fence=VK_NULL_HANDLE;
-  VkSemaphore ready=VK_NULL_HANDLE;
-  bool pending=false; // accessed only by sequential worker operations
-} secondaryDrawing;
-std::optional<PresentImageDraw> secondaryPreparedDraw;
-
-static void prepare_secondary_drawing(const Surface& source) {
-  auto& draw=secondaryDrawing;
-  if(!draw.pool) {
-    VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    pool.queueFamilyIndex=R.secondaryQueueFamily;
-    vk_check(vkCreateCommandPool(R.device,&pool,nullptr,&draw.pool),"secondary command pool");
-    VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    allocation.commandPool=draw.pool;allocation.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;allocation.commandBufferCount=1;
-    vk_check(vkAllocateCommandBuffers(R.device,&allocation,&draw.cmd),"secondary command buffer");
-    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1};
-    VkDescriptorPoolCreateInfo descriptors{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    descriptors.maxSets=1;descriptors.poolSizeCount=1;descriptors.pPoolSizes=&size;
-    vk_check(vkCreateDescriptorPool(R.device,&descriptors,nullptr,&draw.descriptors),"secondary descriptor pool");
-    VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    vk_check(vkCreateFence(R.device,&fence,nullptr,&draw.fence),"secondary drawing fence");
-    draw.ready=new_semaphore();
-  }
-  auto& snapshot=draw.snapshot;
-  if(snapshot.image && snapshot.fmt.pixel==source.fmt.pixel &&
-      snapshot.extent.width==source.extent.width && snapshot.extent.height==source.extent.height)return;
-  // Successful acquisition is published only after the previous worker draw
-  // completed. The snapshot is never overwritten while that queue reads it.
-  if(snapshot.image)destroy_surface_image(&snapshot);
-  snapshot.width=source.extent.width;snapshot.height=source.extent.height;
-  snapshot.slices=1;snapshot.mips=1;snapshot.dim=1;
-  snapshot.format=source.format;snapshot.fmt=source.fmt;
-  create_surface_image(&snapshot,false,source.extent,R.secondaryQueueFamily);
-}
-
-static void prepare_secondary_snapshot() {
-  if(isolatedSecondary) {
-    if(!isolatedSecondary->acquired() || isolatedSecondary->prepared())return;
-    auto& source=presentation_source_screen(R.drc);
-    auto* scan=source.scan.get();if(!scan || !scan->image)return;
-    end_encoder();
-    transition_image(scan,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
-    isolatedSecondary->record_snapshot(command_buffer(),scan->image,scan->fmt.pixel,{scan->extent.width,scan->extent.height});
-    isolatedSourceLinear=source.srgb.load() || scan->fmt.pixel==VK_FORMAT_R8G8B8A8_SRGB ||
-        scan->fmt.pixel==VK_FORMAT_B8G8R8A8_SRGB || scan->fmt.pixel==VK_FORMAT_A8B8G8R8_SRGB_PACK32;
-    secondarySnapshotWait=isolatedSecondary->snapshot_wait();
-    secondarySnapshotSignal=isolatedSecondary->snapshot_signal();
-    return;
-  }
-  if(secondaryPreparedDraw || !secondaryPresentWorker || !secondaryAcquired ||
-      !async_present() || present_capture_requested() || !R.drc.visible || !gfx::g_has_drc_window)return;
-  if(secondaryAcquired->status!=VK_SUCCESS && secondaryAcquired->status!=VK_SUBOPTIMAL_KHR)return;
-  auto& sourceScreen=presentation_source_screen(R.drc);
-  auto* scan=sourceScreen.scan.get();
-  if(!scan || !scan->image)return;
-  prepare_secondary_drawing(*scan);
-  auto draw=prepare_present_image(R.drc,secondaryAcquired->image,secondaryDrawing.snapshot,
-      sourceScreen.srgb.load(),scale_filter(),fxaa_enabled());
-  if(!draw)return;
-  auto& snapshot=secondaryDrawing.snapshot;
-  transition_image(scan,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
-  transition_image(&snapshot,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
-  VkImageCopy copy{};copy.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
-  copy.dstSubresource=copy.srcSubresource;copy.extent=scan->extent;
-  vkCmdCopyImage(command_buffer(),scan->image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-      snapshot.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);
-  transition_image(&snapshot,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,VK_ACCESS_SHADER_READ_BIT);
-  secondaryPreparedDraw=*draw;
-  // Whichever graphics submission consumes this command buffer (normally TV
-  // presentation, otherwise the end-of-frame flush) signals snapshot readiness.
-  secondarySnapshotSignal=secondaryDrawing.ready;
-}
-
-
-std::atomic<uint64_t> touchLayoutGeneration{0};
-}
-// The Java UI thread transfers one retained native-window reference to the
-// mailbox. Coalesce rapid resize/destroy events without touching Vulkan here.
-extern "C" JNIEXPORT void JNICALL
-Java_org_wwhdrecomp_wwhd_GamePadDisplay_publishSurface(
-    JNIEnv* env, jclass, jobject surface, jint width, jint height, jlong generation) {
-  ANativeWindow* window = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
-  std::lock_guard<std::mutex> guard(secondaryMutex);
-  if (generation < secondaryGeneration) {
-    if (window) ANativeWindow_release(window);
-    return;
-  }
-  secondaryGeneration = generation;
-  if (pendingSecondary) ANativeWindow_release(pendingSecondary);
-  pendingSecondary = window;
-  secondaryWidth = width;
-  secondaryHeight = height;
-  secondaryChanged = true;
-  secondaryTouchBox = {};
-  primaryTouchBox = {};
-  ++touchLayoutGeneration;
-  input::set_touch(false, 0, 0);
-}
-extern "C" JNIEXPORT jboolean JNICALL
-Java_org_wwhdrecomp_wwhd_GamePadDisplay_touch(
-    JNIEnv*, jclass, jfloat x, jfloat y, jboolean down, jboolean dragging, jlong generation) {
-  std::lock_guard<std::mutex> guard(secondaryMutex);
-  if (generation != secondaryGeneration || generation != activeSecondaryGeneration)
-    return JNI_FALSE;
-  if (dual_display::active_swap) return JNI_FALSE; // this surface is showing TV
-  if (!down) { input::set_touch(false, 0, 0); return JNI_TRUE; }
-  float tx, ty;
-  if (!gamepad_touch::map(secondaryTouchBox, x, y, dragging, tx, ty)) return JNI_FALSE;
-  input::set_touch(true, tx, ty);
-  return JNI_TRUE;
-}
-static void secondary_surface_lost() {
-  R.drc.visible=false;gfx::g_has_drc_window=false;
-  int64_t generation;
-  {
-    std::lock_guard<std::mutex> guard(secondaryMutex);
-    generation=activeSecondaryGeneration;
-    activeSecondaryGeneration=-1;
-    secondaryTouchBox=primaryTouchBox={};
-    ++touchLayoutGeneration;
-    input::set_touch(false,0,0);
-  }
-  if(generation<0)return; // coalesce repeated errors from the same old surface
-  ++R.secondarySurfaceLosses;
-  // Queue host replacement without waiting for the Android UI thread. A newer
-  // Java generation rejects this request, including pause/recreation/removal.
-  auto* env=static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
-  if(!env)return;
-  jobject activity=static_cast<jobject>(SDL_GetAndroidActivity());
-  if(!activity)return;
-  jclass cls=env->GetObjectClass(activity);
-  if(cls) {
-    if(jmethodID method=env->GetMethodID(cls,"recoverGamePadSurface","(J)V"))
-      env->CallVoidMethod(activity,method,static_cast<jlong>(generation));
-    env->DeleteLocalRef(cls);
-  }
-  if(env->ExceptionCheck()) {
-    env->ExceptionClear();
-    LOG("[vulkan] secondary surface recovery notification unavailable");
-  }
-  env->DeleteLocalRef(activity);
-}
-static VkResult secondary_present_result(VkResult status) {
-  // A real present must enqueue its semaphore wait and completion fence even
-  // in this fault test; simulate only the returned WSI rejection afterward.
-  if(R.secondaryInjectPresentLoss.exchange(false) &&
-      (status==VK_SUCCESS || status==VK_SUBOPTIMAL_KHR))return VK_ERROR_SURFACE_LOST_KHR;
-  return status;
-}
-static void finish_secondary_present(SecondaryPresentResult result) {
-  R.secondaryPresentPending=false;
-  if(result.acquisition) {
-    R.secondaryAcquirePending=false;
-    auto& timing=screenTiming[1].acquire;
-    ++timing.count;timing.ns+=result.elapsedNs;
-    secondaryAcquireFencePending=result.fencePending || result.status==VK_SUCCESS || result.status==VK_SUBOPTIMAL_KHR;
-    secondaryAcquired=result;
-    return;
-  }
-  auto& timing=screenTiming[1].present;
-  ++timing.count;timing.ns+=result.elapsedNs;
-  if(result.status==VK_SUCCESS || result.status==VK_SUBOPTIMAL_KHR)++R.drc.presented;
-  else if(result.status==VK_ERROR_OUT_OF_DATE_KHR)R.drc.resize=true;
-  else if(result.status==VK_ERROR_SURFACE_LOST_KHR) {
-    secondary_surface_lost();
-  } else vk_check(result.status,"secondary worker presentation");
-}
-static void poll_secondary_present() {
-  if(R.secondaryPresentPending) {
-    if(auto result=secondaryPresentWorker->poll())finish_secondary_present(*result);
-  }
-}
-static void finish_isolated_secondary(AndroidIsolatedPresenter::Result result);
-static void wait_secondary_present() {
-  if(isolatedSecondary) {
-    if(isolatedSecondary->busy())finish_isolated_secondary(isolatedSecondary->wait());
-    R.secondaryPresentPending=R.secondaryAcquirePending=false;
-    return;
-  }
-  // Explicit drain/shutdown paths may wait; normal frames only poll.
-  if(R.secondaryPresentPending)finish_secondary_present(secondaryPresentWorker->wait());
-  if(secondaryAcquireFencePending) {
-    vk_check(vkWaitForFences(R.device,1,&secondaryAcquireFence,VK_TRUE,UINT64_MAX),"drain secondary acquisition");
-    secondaryAcquireFencePending=false;
-  }
-}
-static void shutdown_secondary_worker() {
-  isolatedSecondary.reset();isolatedSnapshotSubmission.reset();R.secondaryIsolated=false;
-  // Caller has drained graphics, acquisition and the secondary queue. No
-  // worker request or GPU operation may retain these private resources now.
-  secondaryPresentWorker.reset();
-  secondaryAcquired.reset();secondaryPreparedDraw.reset();
-  auto& drawing=secondaryDrawing;
-  if(drawing.snapshot.image) {
-    destroy_surface_image(&drawing.snapshot);
-    flush(); // retire its deferred image/view/memory ownership
-  }
-  if(drawing.descriptors)vkDestroyDescriptorPool(R.device,drawing.descriptors,nullptr);
-  if(drawing.pool)vkDestroyCommandPool(R.device,drawing.pool,nullptr);
-  if(drawing.fence)vkDestroyFence(R.device,drawing.fence,nullptr);
-  if(drawing.ready)vkDestroySemaphore(R.device,drawing.ready,nullptr);
-  if(secondaryAcquireFence)vkDestroyFence(R.device,secondaryAcquireFence,nullptr);
-  secondaryDrawing={};secondaryAcquireFence=VK_NULL_HANDLE;
-  secondaryAcquireFencePending=false;secondarySnapshotSignal=VK_NULL_HANDLE;
-  R.secondaryAcquirePending=false;R.secondaryPresentPending=false;R.secondaryQueue=VK_NULL_HANDLE;
-  LOG("[vulkan] secondary worker resources released");
-}
-static bool secondary_retirement_available() { return retiredSecondarySwapchains.size() < 4; }
-static void retire_secondary_swapchain(bool surface) {
-  Screen& screen=R.drc;
-  if (!screen.swapchain && !surface) return;
-  if (surface && !screen.swapchain && !screen.surface && !secondaryWindow && !screen.acquired && !screen.finished) return;
-  RetiredSecondarySwapchain old;
-  old.swapchain=std::exchange(screen.swapchain,VK_NULL_HANDLE);
-  old.surface=screen.surface;
-  old.ownsSurface=surface;
-  old.views=take_present_screen_views(screen);
-  old.presentation=std::move(asyncPresent[1]);
-  asyncPresent[1]={};
-  old.presents=secondaryPresentFences;
-  secondaryPresentFences={};
-  nextSecondaryPresentFence=0;
-  for(size_t i=0;i<R.submissions.size();++i)
-    if(R.submissions[i].pending)old.submissions.emplace_back(i,R.submissions[i].serial);
-  if(surface) {
-    screen.surface=VK_NULL_HANDLE;
-    old.window=std::exchange(secondaryWindow,nullptr);
-    old.acquired=std::exchange(screen.acquired,VK_NULL_HANDLE);
-    old.finished=std::exchange(screen.finished,VK_NULL_HANDLE);
-  }
-  retiredSecondarySwapchains.push_back(std::move(old));
-  R.secondaryRetirementPending=retiredSecondarySwapchains.size();
-}
-static void collect_secondary_swapchains() {
-  if (R.secondaryRetirementHeld) return; // only set by the authored display diagnostic
-  auto ready=[](VkFence fence) {
-    VkResult status=timed_call(fenceStatusTiming,[&] { return vkGetFenceStatus(R.device,fence); });
-    if(status==VK_NOT_READY)return false;
-    vk_check(status,"secondary retirement fence");return true;
-  };
-  for(auto it=retiredSecondarySwapchains.begin();it!=retiredSecondarySwapchains.end();) {
-    bool complete=true;
-    for(auto [index,serial]:it->submissions) {
-      auto& slot=R.submissions[index];
-      if(slot.pending && slot.serial==serial && !ready(slot.fence))complete=false;
-    }
-    for(auto present:it->presents)if(present.pending && !ready(present.fence))complete=false;
-    // A replaced surface remains owned until all older resize generations of
-    // that same surface have retired their swapchains too.
-    if(it->ownsSurface)for(auto& other:retiredSecondarySwapchains)
-      if(&other!=&*it && other.surface==it->surface && it->surface)complete=false;
-    if(!complete){++it;continue;}
-    for(auto view:it->views)vkDestroyImageView(R.device,view,nullptr);
-    if(it->swapchain)vkDestroySwapchainKHR(R.device,it->swapchain,nullptr);
-    for(auto sem:it->presentation.acquire)if(sem)vkDestroySemaphore(R.device,sem,nullptr);
-    for(auto sem:it->presentation.finished)vkDestroySemaphore(R.device,sem,nullptr);
-    for(auto present:it->presents)if(present.fence)vkDestroyFence(R.device,present.fence,nullptr);
-    if(it->acquired)vkDestroySemaphore(R.device,it->acquired,nullptr);
-    if(it->finished)vkDestroySemaphore(R.device,it->finished,nullptr);
-    if(it->ownsSurface && it->surface)vkDestroySurfaceKHR(R.instance,it->surface,nullptr);
-    if(it->window)ANativeWindow_release(it->window);
-    it=retiredSecondarySwapchains.erase(it);++R.secondaryRetired;
-  }
-  R.secondaryRetirementPending=retiredSecondarySwapchains.size();
-}
-
-static void finish_isolated_secondary(AndroidIsolatedPresenter::Result result) {
-  R.secondaryPresentPending=R.secondaryAcquirePending=false;
-  if(result.operation==AndroidIsolatedPresenter::Operation::Present &&
-      (result.status==VK_SUCCESS || result.status==VK_SUBOPTIMAL_KHR))++R.drc.presented;
-  if(result.status==VK_ERROR_SURFACE_LOST_KHR) { secondary_surface_lost();return; }
-  // Android can continuously report SUBOPTIMAL for a deliberately oriented
-  // pane. As in the existing path, real size events or OUT_OF_DATE trigger resize.
-  if(result.status==VK_ERROR_OUT_OF_DATE_KHR)R.drc.resize=true;
-  else if(result.status!=VK_SUCCESS && result.status!=VK_SUBOPTIMAL_KHR && result.status!=VK_NOT_READY && result.status!=VK_TIMEOUT) {
-    LOG("[vulkan] isolated secondary operation unavailable (%d)",int(result.status));
-    R.drc.visible=false;gfx::g_has_drc_window=false;input::set_touch(false,0,0);return;
-  }
-  if(result.operation==AndroidIsolatedPresenter::Operation::Surface) {
-    std::lock_guard<std::mutex> guard(secondaryMutex);
-    const bool current=!secondaryChanged && activeSecondaryGeneration==secondaryGeneration;
-    R.drc.swapExtent=result.extent;
-    R.drc.visible=current && result.status==VK_SUCCESS && result.extent.width && result.extent.height;
-    gfx::g_has_drc_window=R.drc.visible.load();
-  }
-}
-static void update_isolated_secondary_surface() {
-  if(auto result=isolatedSecondary->poll())finish_isolated_secondary(*result);
-  ANativeWindow* next=nullptr;int width=0,height=0;bool changed=false;
-  {
-    std::lock_guard<std::mutex> guard(secondaryMutex);
-    if(secondaryChanged) {
-      input::set_touch(false,0,0);
-      if(isolatedSecondary->busy() || isolatedSecondary->acquired()) {
-        if(!isolatedSecondary->acquired()) { R.drc.visible=false;gfx::g_has_drc_window=false; }
-        return; // newest native-window event remains in the bounded mailbox
-      }
-      next=pendingSecondary;pendingSecondary=nullptr;width=secondaryWidth;height=secondaryHeight;
-      secondaryChanged=false;activeSecondaryGeneration=secondaryGeneration;changed=true;
-    }
-  }
-  if(changed) {
-    R.drc.width=width;R.drc.height=height;R.drc.visible=false;gfx::g_has_drc_window=false;
-    R.drc.resize=false;R.drc.presentWanted=effective_present_mode();
-    isolatedSecondary->replace_surface(next,std::max(width,0),std::max(height,0),R.drc.presentWanted);
-    R.secondaryPresentPending=true;return;
-  }
-  if(!isolatedSecondary->busy() && !isolatedSecondary->acquired() &&
-      (R.drc.resize || (R.drc.visible && R.drc.presentWanted!=effective_present_mode()))) {
-    R.drc.resize=false;R.drc.presentWanted=effective_present_mode();
-    isolatedSecondary->resize(R.drc.presentWanted);R.secondaryPresentPending=true;
-  }
-}
-static void update_secondary_surface() {
-  if(isolatedSecondary) { update_isolated_secondary_surface();return; }
-  poll_secondary_present();
-  collect_secondary_swapchains();
-  ANativeWindow* next;
-  int width, height;
-  {
-    std::lock_guard<std::mutex> guard(secondaryMutex);
-    if (!secondaryChanged) return;
-    if(secondaryAcquired) {
-      // Consume the old swapchain's acquired image before applying the latest
-      // surface event. Its semaphore must receive its graphics-queue wait.
-      R.drc.visible=true;
-      gfx::g_has_drc_window=true;
-      input::set_touch(false,0,0);
-      return;
-    }
-    if (R.secondaryPresentPending || (R.secondaryPresentFences && !secondary_retirement_available())) {
-      // Retain the newest mailbox event and skip secondary output while the
-      // bounded retirement queue drains. Main presentation remains available.
-      R.drc.visible = false;
-      gfx::g_has_drc_window = false;
-      input::set_touch(false, 0, 0);
-      return;
-    }
-    next = pendingSecondary;
-    pendingSecondary = nullptr;
-    width = secondaryWidth;
-    height = secondaryHeight;
-    secondaryChanged = false;
-    activeSecondaryGeneration = secondaryGeneration;
-  }
-  Screen& s = R.drc;
-  if (R.secondaryPresentFences) retire_secondary_swapchain(true);
-  else {
-    ++R.secondaryIdleWaits;
-    wait_idle();
-    reset_present_screen(s);
-    if (s.swapchain) vkDestroySwapchainKHR(R.device, s.swapchain, nullptr);
-    if (s.surface) vkDestroySurfaceKHR(R.instance, s.surface, nullptr);
-    s.swapchain = VK_NULL_HANDLE;
-    s.surface = VK_NULL_HANDLE;
-    if (secondaryWindow) ANativeWindow_release(secondaryWindow);
-  }
-  secondaryWindow = next;
-  s.width = width;
-  s.height = height;
-  s.visible = false;
-  gfx::g_has_drc_window = false;
-  input::set_touch(false, 0, 0);
-  if (!next || width <= 0 || height <= 0) return;
-  auto create = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(
-      vkGetInstanceProcAddr(R.instance, "vkCreateAndroidSurfaceKHR"));
-  if (!create) return;
-  VkAndroidSurfaceCreateInfoKHR info{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
-  info.window = next;
-  VkResult result = create(R.instance, &info, nullptr, &s.surface);
-  if (result != VK_SUCCESS) {
-    LOG("[vulkan] secondary surface unavailable (%d)", int(result));
-    return;
-  }
-  VkBool32 supported = VK_FALSE;
-  result = vkGetPhysicalDeviceSurfaceSupportKHR(R.physicalDevice, R.queueFamily, s.surface, &supported);
-  if(result==VK_SUCCESS && supported && R.secondaryQueue && R.secondaryQueueFamily!=R.queueFamily)
-    result=vkGetPhysicalDeviceSurfaceSupportKHR(R.physicalDevice,R.secondaryQueueFamily,s.surface,&supported);
-  if (result != VK_SUCCESS || !supported) {
-    vkDestroySurfaceKHR(R.instance, s.surface, nullptr);
-    s.surface = VK_NULL_HANDLE;
-    return;
-  }
-  s.resize = true;
-  s.visible = true;
-  // Android attaches this surface after init_device(), which only initializes
-  // semaphores for the startup SDL windows. Captures and the explicit waiting
-  // path still need this pair even when ordinary presentation uses the ring.
-  if (!s.acquired) s.acquired = new_semaphore();
-  if (!s.finished) s.finished = new_semaphore();
-  gfx::g_has_drc_window = true;
-}
-#endif
 static bool screen_has_window(const Screen& s) {
-#ifdef __ANDROID__
-  if (&s == &R.drc) return secondaryWindow && s.surface;
-#endif
   return s.window != nullptr;
 }
 static void present(Screen &s) {
-#ifdef __ANDROID__
-  if(&s==&R.drc && isolatedSecondary) {
-    if(isolatedSecondary->busy()) { ++R.secondaryPresentSkipped;return; }
-    if(!isolatedSecondary->acquired() && R.drc.visible && gfx::g_has_drc_window) {
-      isolatedSecondary->acquire();R.secondaryPresentPending=R.secondaryAcquirePending=true;
-    }
-    return;
-  }
-#endif
-#ifdef __ANDROID__
-  const bool workerAcquired=&s==&R.drc && secondaryAcquired.has_value();
-#else
   constexpr bool workerAcquired=false;
-#endif
-#ifdef __ANDROID__
-  if (&s == &R.tv && s.window) {
-    if (surfaceRecreate.exchange(false))
-      recreate_surface(s);
-    if (surfaceLost || !s.surface)
-      return;
-  }
-#endif
-#ifdef __ANDROID__
-  if (&s == &R.drc && R.secondaryPresentPending) { ++R.secondaryPresentSkipped;return; }
-  if (&s == &R.drc && !workerAcquired && R.secondaryPresentFences && !secondary_retirement_available() &&
-      (s.resize || !s.swapchain || s.presentWanted != effective_present_mode())) return;
-#endif
   // Presentation changed (settings overlay): a new swapchain, as for a resize (also for a window that
   // is not shown right now, so the next frame it shows uses the new mode)
   if (!workerAcquired && screen_has_window(s) && s.swapchain && s.presentWanted != effective_present_mode())
@@ -1773,76 +1069,19 @@ static void present(Screen &s) {
                      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
                         ? VK_FILTER_LINEAR
                         : VK_FILTER_NEAREST;
-#ifndef WWHD_SDL_HOST
-  if (s.swapchain && (s.swapFormat == VK_FORMAT_B8G8R8A8_SRGB) != s.srgb.load())
-    s.resize = true;  // the scan buffer's encoding changed (GX2SetTVBuffer)
-#endif
-#ifdef __ANDROID__
-  if (!workerAcquired && (s.resize || !s.swapchain)) {
-    try {
-      make_swapchain(s);
-    } catch (const std::exception &e) {
-      if (&s != &R.tv) {
-        LOG("[vulkan] secondary swapchain unavailable (%s)", e.what());
-        if(const auto* failure=dynamic_cast<const VulkanFailure*>(&e)) {
-          if(failure->result==VK_ERROR_SURFACE_LOST_KHR) {
-            secondary_surface_lost();
-            return;
-          }
-          if(failure->result==VK_ERROR_OUT_OF_DATE_KHR) {
-            s.resize=true;
-            return;
-          }
-        }
-        s.visible = false;
-        gfx::g_has_drc_window = false;
-        return;
-      }
-      LOG("[vulkan] no swapchain (%s); waiting for a new surface", e.what());
-      // Fast Activity replacement can coalesce pause/resume without a new
-      // foreground event. Retry against SDL's current native surface ourselves.
-      recover_primary_surface();
-      return;
-    }
-  }
-#else
   if (s.resize || !s.swapchain)
     make_swapchain(s);
-#endif
   uint32_t index;
   auto& timing = screenTiming[&s == &R.tv ? 0 : 1];
   bool async = async_present() && !present_capture_requested();
-#ifdef __ANDROID__
-  if(&s==&R.drc && secondaryPreparedDraw)async=true;
-#endif
   // The GamePad may run at a different refresh rate or stop consuming images
   // entirely. Never wait for its compositor on the main render thread.
   const bool secondary = &s == &R.drc;
   AsyncPresentState &ap = asyncPresent[&s == &R.tv ? 0 : 1];
-#ifdef __ANDROID__
-  SecondaryPresentFence* presentFence=nullptr;
-  if (secondary && R.secondaryPresentFences) {
-    auto& candidate=secondaryPresentFences[nextSecondaryPresentFence];
-    if(candidate.pending) {
-      VkResult status=timed_call(fenceStatusTiming,[&] { return vkGetFenceStatus(R.device,candidate.fence); });
-      if(status==VK_NOT_READY)return;
-      vk_check(status,"secondary presentation completion");candidate.pending=false;
-    }
-    if(!candidate.fence) {
-      VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-      vk_check(vkCreateFence(R.device,&info,nullptr,&candidate.fence),"secondary present fence");
-    }
-    presentFence=&candidate;
-  }
-#endif
   VkSemaphore acquireSemaphore = s.acquired;
   unsigned acquireIndex = 0;
   if (async || workerAcquired) {
-#ifdef __ANDROID__
-    acquireIndex = workerAcquired ? secondaryAcquireIndex : ap.next;
-#else
     acquireIndex = ap.next;
-#endif
     if(!workerAcquired)ap.next = (ap.next + 1) % ap.acquire.size();
     if (!ap.acquire[acquireIndex])
       ap.acquire[acquireIndex] = new_semaphore();
@@ -1860,54 +1099,7 @@ static void present(Screen &s) {
     acquireSemaphore = ap.acquire[acquireIndex];
   }
   VkResult ar;
-#ifdef __ANDROID__
-  if(workerAcquired) {
-    ar=secondaryAcquired->status;index=secondaryAcquired->image;
-    secondaryAcquired.reset();
-  } else if(secondary && async && secondaryPresentWorker) {
-    if(!secondaryAcquireFence) {
-      VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-      vk_check(vkCreateFence(R.device,&info,nullptr,&secondaryAcquireFence),"secondary acquisition fence");
-    }
-    secondaryAcquireIndex=acquireIndex;
-    const VkDevice device=R.device;
-    const VkSwapchainKHR swapchain=s.swapchain;
-    const VkFence fence=secondaryAcquireFence;
-    const bool fencePending=secondaryAcquireFencePending;
-    secondaryPresentWorker->submit([device,swapchain,acquireSemaphore,fence,fencePending] {
-      while(R.secondaryAcquireHeld.load()) {
-        R.secondaryAcquireWaiting=true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-      }
-      R.secondaryAcquireWaiting=false;
-      if(secondaryDrawing.pending) {
-        VkResult ready=vkGetFenceStatus(device,secondaryDrawing.fence);
-        if(ready==VK_NOT_READY)return SecondaryPresentResult{VK_NOT_READY,0,true,0,fencePending};
-        vk_check(ready,"secondary drawing completion");secondaryDrawing.pending=false;
-      }
-      if(fencePending) {
-        VkResult ready=vkGetFenceStatus(device,fence);
-        if(ready==VK_NOT_READY)return SecondaryPresentResult{VK_NOT_READY,0,true,0,true};
-        vk_check(ready,"secondary acquisition fence");
-      }
-      if(R.secondaryInjectAcquireLoss.exchange(false))
-        return SecondaryPresentResult{VK_ERROR_SURFACE_LOST_KHR,0,true,0,false};
-      vk_check(vkResetFences(device,1,&fence),"reset secondary acquisition fence");
-      uint32_t image=0;
-      const auto start=std::chrono::steady_clock::now();
-      VkResult status=vkAcquireNextImageKHR(device,swapchain,0,acquireSemaphore,fence,&image);
-      return SecondaryPresentResult{status,uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now()-start).count()),true,image};
-    });
-    R.secondaryPresentPending=true;
-    R.secondaryAcquirePending=true;
-    return;
-  } else
-#endif
   ar = timed_call(timing.acquire, [&] {
-#ifdef __ANDROID__
-    if(secondary && R.secondaryInjectAcquireLoss.exchange(false))return VK_ERROR_SURFACE_LOST_KHR;
-#endif
     return vkAcquireNextImageKHR(R.device, s.swapchain, secondary ? 0 : UINT64_MAX,
                                 acquireSemaphore, VK_NULL_HANDLE, &index);
   });
@@ -1919,78 +1111,8 @@ static void present(Screen &s) {
     s.resize = true;
     return;
   }
-#ifdef __ANDROID__
-  if (ar == VK_ERROR_SURFACE_LOST_KHR) {
-    if (&s == &R.tv) recover_primary_surface();
-    else secondary_surface_lost();
-    return;
-  }
-#endif
   if (ar != VK_SUBOPTIMAL_KHR)
     vk_check(ar, "acquire scan image");
-#ifdef __ANDROID__
-  if(secondary && async && secondaryPresentWorker) {
-    auto draw=std::exchange(secondaryPreparedDraw,{});
-    if(draw) {
-      // The worker's drawing waits on the snapshot's readiness semaphore, so its
-      // signal must be submitted first (a binary semaphore wait may not precede
-      // its signal). The TV presentation normally submitted it, but it returns
-      // without a submission while its surface is lost or being recreated, or no
-      // image was acquired; the end-of-frame flush would then come only after the
-      // worker's wait and present. On the emulator's gfxstream host that present
-      // blocked every queue until its 3 s release-fence timeout, after which the
-      // graphics queue never went idle again.
-      if(secondarySnapshotSignal)submit(VK_NULL_HANDLE,VK_NULL_HANDLE,true);
-      // Acquire semaphore consumption belongs to the worker's drawing fence,
-      // not to the graphics submission that merely copied the snapshot.
-      ap.serial[acquireIndex]=0;
-      if(ap.finished.size()!=s.images.size()) {
-        for(auto semaphore:ap.finished)vkDestroySemaphore(R.device,semaphore,nullptr);
-        ap.finished.clear();
-        for(size_t i=0;i<s.images.size();++i)ap.finished.push_back(new_semaphore());
-      }
-      const VkSemaphore finished=ap.finished[index];
-      const VkSwapchainKHR swapchain=s.swapchain;
-      const VkFence presentCompletion=presentFence->fence;
-      presentFence->pending=true;
-      nextSecondaryPresentFence=(nextSecondaryPresentFence+1)%secondaryPresentFences.size();
-      s.layouts[index]=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-      const VkQueue queue=R.secondaryQueue;
-      secondaryPresentWorker->submit([draw=*draw,acquireSemaphore,finished,swapchain,presentCompletion,index,queue] {
-        auto& state=secondaryDrawing;
-        vk_check(vkResetCommandPool(draw.device,state.pool,0),"reset secondary command pool");
-        vk_check(vkResetDescriptorPool(draw.device,state.descriptors,0),"reset secondary descriptor pool");
-        vk_check(vkResetFences(draw.device,1,&state.fence),"reset secondary drawing fence");
-        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        begin.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vk_check(vkBeginCommandBuffer(state.cmd,&begin),"begin secondary drawing");
-        record_present_image(draw,state.cmd,state.descriptors);
-        vk_check(vkEndCommandBuffer(state.cmd),"end secondary drawing");
-        const VkSemaphore waits[]={acquireSemaphore,state.ready};
-        const VkPipelineStageFlags stages[]={VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
-        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submit.waitSemaphoreCount=2;submit.pWaitSemaphores=waits;submit.pWaitDstStageMask=stages;
-        submit.commandBufferCount=1;submit.pCommandBuffers=&state.cmd;
-        submit.signalSemaphoreCount=1;submit.pSignalSemaphores=&finished;
-        vk_check(vkQueueSubmit(queue,1,&submit,state.fence),"submit secondary drawing");
-        state.pending=true;
-        while(R.secondaryPresentHeld.load())std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        vk_check(vkResetFences(draw.device,1,&presentCompletion),"reset secondary presentation fence");
-        VkSwapchainPresentFenceInfoEXT fences{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT};
-        fences.swapchainCount=1;fences.pFences=&presentCompletion;
-        VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};present.pNext=&fences;
-        present.waitSemaphoreCount=1;present.pWaitSemaphores=&finished;
-        present.swapchainCount=1;present.pSwapchains=&swapchain;present.pImageIndices=&index;
-        const auto start=std::chrono::steady_clock::now();
-        VkResult status=secondary_present_result(vkQueuePresentKHR(queue,&present));
-        return SecondaryPresentResult{status,uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now()-start).count())};
-      });
-      R.secondaryPresentPending=true;
-      return;
-    }
-  }
-#endif
   bool composed=false;
   timed_call(timing.compose, [&] {
     composed=draw_present_screen(s,index);
@@ -2051,12 +1173,7 @@ static void present(Screen &s) {
   VkSemaphore finishedSemaphore = s.finished;
   if (async || workerAcquired) {
     if (ap.finished.size() != s.images.size()) {  // new swapchain
-#ifdef __ANDROID__
-      if (!secondary) vk_check(vkQueueWaitIdle(R.queue), "primary presentation semaphores idle");
-      else if (!R.secondaryPresentFences) vk_check(device_wait_idle(), "presentation semaphores idle");
-#else
       vk_check(device_wait_idle(), "presentation semaphores idle");
-#endif
       for (VkSemaphore f : ap.finished)
         vkDestroySemaphore(R.device, f, nullptr);
       ap.finished.clear();
@@ -2078,65 +1195,16 @@ static void present(Screen &s) {
   pi.swapchainCount = 1;
   pi.pSwapchains = &s.swapchain;
   pi.pImageIndices = &index;
-#ifdef __ANDROID__
-  VkSwapchainPresentFenceInfoEXT fenceInfo{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT};
-  if(presentFence) {
-    vk_check(timed_call(fenceResetTiming,[&] { return vkResetFences(R.device,1,&presentFence->fence); }),"reset secondary present fence");
-    fenceInfo.swapchainCount=1;fenceInfo.pFences=&presentFence->fence;
-    pi.pNext=&fenceInfo;presentFence->pending=true;
-    nextSecondaryPresentFence=(nextSecondaryPresentFence+1)%secondaryPresentFences.size();
-  }
-#endif
-#ifdef __ANDROID__
-  if(secondary && async && secondaryPresentWorker) {
-    const VkSwapchainKHR swapchain=s.swapchain;
-    const VkFence fence=presentFence ? presentFence->fence : VK_NULL_HANDLE;
-    const VkQueue queue=R.secondaryQueue;
-    secondaryPresentWorker->submit([swapchain,fence,finishedSemaphore,index,queue] {
-      // The diagnostic holds this operation exactly where a blocking WSI call
-      // would occupy the worker. No renderer/mailbox lock is held here.
-      while(R.secondaryPresentHeld.load())std::this_thread::sleep_for(std::chrono::milliseconds(2));
-      VkPresentInfoKHR info{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-      info.waitSemaphoreCount=1;info.pWaitSemaphores=&finishedSemaphore;
-      info.swapchainCount=1;info.pSwapchains=&swapchain;info.pImageIndices=&index;
-      VkSwapchainPresentFenceInfoEXT fences{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT};
-      if(fence){fences.swapchainCount=1;fences.pFences=&fence;info.pNext=&fences;}
-      const auto started=std::chrono::steady_clock::now();
-      VkResult result=secondary_present_result(vkQueuePresentKHR(queue,&info));
-      return SecondaryPresentResult{result,uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now()-started).count())};
-    });
-    R.secondaryPresentPending=true;
-    return;
-  }
-#endif
   VkResult pr = timed_call(timing.present, [&] {
     VkResult result=vkQueuePresentKHR(R.queue, &pi);
-#ifdef __ANDROID__
-    if(secondary)result=secondary_present_result(result);
-#endif
     return result;
   });
   if (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR)
     ++s.presented;
-#ifdef __ANDROID__
-  // SUBOPTIMAL here only says the compositor rotates the picture (identity pre-transform, see
-  // make_swapchain); size changes come as window events. Rebuilding would happen every frame.
-  if (pr == VK_ERROR_OUT_OF_DATE_KHR)
-    s.resize = true;
-  else if (pr == VK_SUBOPTIMAL_KHR) {
-  } else if (pr == VK_ERROR_SURFACE_LOST_KHR) {
-    if (&s == &R.tv) recover_primary_surface();
-    else secondary_surface_lost();
-  }
-  else
-    vk_check(pr, "present scan buffer");
-#else
   if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR)
     s.resize = true;
   else
     vk_check(pr, "present scan buffer");
-#endif
   if (!async)
     vk_check(timed_call(timing.idle, [&] { return vkQueueWaitIdle(R.queue); }),
              "present completion");
@@ -2190,20 +1258,6 @@ static void frame_dumps(uint64_t frame) {
     if (getenv("WWHD_DUMP_PRESENT"))
       request_present_dump("frame_" + std::to_string(frame) + "_present.png");
   }
-  // Test captures relative to the completed full-state load, whose actual
-  // renderer frame can vary even when WWHD_STATE_LOAD_AT is fixed.
-  static const auto loadFrames = gfx::capture_schedule::parse(getenv("WWHD_DUMP_LOAD_FRAMES"));
-  const uint64_t loaded = loadFrames.empty() ? 0 : ss::last_load_frame();
-  if (gfx::capture_schedule::relative_due(loadFrames, frame, loaded)) {
-    const auto stem = gfx::capture_schedule::stem(frame - loaded, true);
-    dump_scan(R.tv, stem + ".png");
-    dump_scan(R.drc, stem + "_drc.png");
-    if (getenv("WWHD_DUMP_PRESENT")) request_present_dump(stem + "_present.png");
-    LOG("[gfx] load-relative capture: load frame %llu, frame %llu, offset %llu, load step %llu, step %llu",
-        (unsigned long long)loaded, (unsigned long long)frame,
-        (unsigned long long)(frame - loaded), (unsigned long long)ss::last_load_step(),
-        (unsigned long long)interp::logic_steps());
-  }
   // P / F12 (Graphics menu): the pictures of this frame in captures/<time>/ (WWHD_CAPTURE=<frame>
   // scripts it when WWHD_CAPTURE_PATH is not used); the Metal renderer also writes a draw log
   static const uint64_t scripted = getenv("WWHD_CAPTURE") && !getenv("WWHD_CAPTURE_PATH")
@@ -2238,143 +1292,28 @@ std::vector<PendingShot> pendingShots;
 std::mutex shotBuffersMu;
 std::vector<Buffer> shotBuffersDone;
 }  // namespace
-static void take_screenshots(const gfx::PresentPlan &plan) {
-  std::string tvPath, drcPath;
-  if (!R.tv.scan || !R.tv.scan->image || !screenshot::take(R.frame + 1, tvPath, drcPath))
-    return;
-  auto shoot = [&](Screen &s, const std::string &path, bool tv) {
-    PendingShot p;
-    p.path = path;
-    p.tv = tv;
-    p.frame = R.frame + 1;
-    try {
-      if (!record_screenshot(s, p.buffer, p.width, p.height, p.bgra)) {
-        screenshot::write_async(path, 0, 0, 0, nullptr, nullptr, p.frame, tv);
-        return;
-      }
-    } catch (const std::exception &e) {
-      LOG("[screenshot] %s: %s", path.c_str(), e.what());
-      screenshot::write_async(path, 0, 0, 0, nullptr, nullptr, p.frame, tv);
-      return;
-    }
-    p.slot = R.activeSubmission;
-    pendingShots.push_back(std::move(p));
-  };
-  const auto t0 = std::chrono::steady_clock::now();
-  shoot(R.tv, tvPath, true);
-  // the GamePad picture while it is shown (GamePad window, picture-in-picture, GamePad only)
-  if (!drcPath.empty() && R.drc.scan && R.drc.scan->image && (plan.drc_window || plan.pip_on || plan.drc_only))
-    shoot(R.drc, drcPath, false);
-  else if (!drcPath.empty()) {
-    LOG("[screenshot] GamePad picture not shown: only the TV picture saved");
-    screenshot::write_async(drcPath, 0, 0, 0, nullptr, nullptr, R.frame + 1, false);
-  }
-  LOG("[screenshot] frame %llu: recorded in %.2f ms (render thread)", (unsigned long long)(R.frame + 1),
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-}
-static void service_screenshots() {
-  {
-    std::lock_guard<std::mutex> lk(shotBuffersMu);
-    for (auto &b : shotBuffersDone)
-      defer_buffer(b);
-    shotBuffersDone.clear();
-  }
-  for (auto it = pendingShots.begin(); it != pendingShots.end();) {
-    auto &slot = R.submissions[it->slot];
-    if (!it->serial) {  // recorded in this swap: the submission of that slot holds it now
-      it->serial = slot.serial;
-      ++it;
-      continue;
-    }
-    // a slot reused for a newer submission retired ours first
-    const bool done = !slot.pending || slot.serial != it->serial || vkGetFenceStatus(R.device, slot.fence) == VK_SUCCESS;
-    if (!done) {
-      ++it;
-      continue;
-    }
-    Buffer b = it->buffer;
-    std::shared_ptr<const void> owner(nullptr, [b](const void *) {
-      std::lock_guard<std::mutex> lk(shotBuffersMu);
-      shotBuffersDone.push_back(b);
-    });
-    screenshot::write_async(it->path, it->width, it->height, size_t(it->width) * 4, static_cast<const uint8_t *>(b.mapped),
-                            std::move(owner), it->frame, it->tv, it->bgra);
-    it = pendingShots.erase(it);
-  }
-}
 void swap() {
-  service_screenshots();
   const auto swapPhaseStarted=std::chrono::steady_clock::now();
-#ifdef __ANDROID__
-  update_secondary_surface();
-  {
-    std::lock_guard<std::mutex> guard(secondaryMutex);
-    bool wanted = gfx::g_has_drc_window && dual_display::requested_swap;
-    if (dual_display::active_swap.exchange(wanted) != wanted) {
-      secondaryTouchBox = primaryTouchBox = {};
-      ++touchLayoutGeneration;
-      input::set_touch(false, 0, 0);
-    }
-  }
-#endif
   service_captures();
   frame_dumps(R.frame + 1);
   // the layout of both pictures (GamePad window, picture-in-picture, automatic overlay, GamePad only)
   // comes from gfx/display_modes.cpp, which both window hosts and the Metal renderer share
   Surface *tvScan = R.tv.scan && R.tv.scan->image ? R.tv.scan.get() : nullptr;
   Surface *drcScan = R.drc.scan && R.drc.scan->image ? R.drc.scan.get() : nullptr;
-#ifdef WWHD_SDL_HOST
   gfx::g_filter = scale_filter();  // the SDL host keeps the scaling filter with the Vulkan settings
   const float layerW = float(R.tv.width.load()), layerH = float(R.tv.height.load());
-#else
-  const float layerW = float(R.tv.swapExtent.width), layerH = float(R.tv.swapExtent.height);
-#endif
   gfx::PresentPlan plan = gfx::display_plan(
       tvScan, tvScan ? float(tvScan->extent.width) : 0, tvScan ? float(tvScan->extent.height) : 0,
       drcScan, drcScan ? float(drcScan->extent.width) : 0, drcScan ? float(drcScan->extent.height) : 0,
       layerW, layerH, R.frame + 1);
-#ifdef __ANDROID__
-  // A physical second display owns the GamePad picture. Keep the requested
-  // single-screen mode intact so disconnecting restores its normal fallback.
-  if (gfx::g_has_drc_window) {
-    plan.drc_window = true;
-    plan.pip_on = false;
-    plan.pip_wanted = false;
-    plan.drc_only = false;
-    plan.sample_auto = false;
-    plan.tv = gfx::display_layout(layerW, layerH,
-        tvScan ? float(tvScan->extent.width) : 1280,
-        tvScan ? float(tvScan->extent.height) : 720);
-    if (drcScan && R.drc.width > 0 && R.drc.height > 0) {
-      bool swapped = dual_display::active_swap;
-      float w = swapped ? layerW : float(R.drc.width.load());
-      float h = swapped ? layerH : float(R.drc.height.load());
-      gfx::Box box = gfx::display_layout(w, h, float(drcScan->extent.width), float(drcScan->extent.height));
-      std::lock_guard<std::mutex> guard(secondaryMutex);
-      if (!secondaryChanged) {
-        auto& touchBox = swapped ? primaryTouchBox : secondaryTouchBox;
-        touchBox = {box.x / w, box.y / h, box.w / w, box.h / h};
-      }
-    }
-  }
-  // the view button's dot: 60 fps chosen (long press), green while drawn, yellow while paused
-  if (perf_hint::fps60_chosen())
-    plan.button_dot = interp::mode() != 0 ? 1 : 2;
-#endif
   set_present_plan(&plan);
-  // settings overlay: built once, drawn into the TV window and its present dumps
-  if(overlay::guesthud::active())overlay::guesthud::set_tv_region(plan.tv.x,plan.tv.y,plan.tv.w,plan.tv.h,!plan.drc_only);
-  set_overlay_draw(overlay::frame(plan.dw > 0 ? plan.dw : layerW, plan.dh > 0 ? plan.dh : layerH, overlay_renderer_init));
+  set_overlay_draw(nullptr);  // no overlay drawn yet (the host menu will be)
   compose_headless_diagnostic(R.tv);
-  take_screenshots(plan);
   bool sampled[2] = {};
   if (plan.sample_auto && drcScan) {
     sampled[0] = record_signature(0, *drcScan, R.drc.srgb.load());
     sampled[1] = sampled[0] && tvScan && record_signature(1, *tvScan, R.tv.srgb.load());
   }
-#ifdef __ANDROID__
-  prepare_secondary_snapshot();
-#endif
   if(perf_enabled()) {
     ++swapPhaseTiming[0].count;
     swapPhaseTiming[0].ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2392,22 +1331,6 @@ void swap() {
     else flush();
     return VK_SUCCESS;
   });
-#ifdef __ANDROID__
-  if(isolatedSecondary && isolatedSecondary->published() && isolatedSnapshotSubmission) {
-    const auto [index,serial]=*isolatedSnapshotSubmission;
-    const auto& producer=R.submissions[index];
-    // Do not export a pending sync FD while the driver may serialize export
-    // against later primary submissions. Poll on this thread; a retired/reused
-    // slot also proves that this snapshot's original submission completed.
-    const VkResult complete=!producer.pending || producer.serial!=serial ? VK_SUCCESS :
-        vkGetFenceStatus(R.device,producer.fence);
-    if(complete==VK_SUCCESS) {
-      isolatedSecondary->present(isolatedSourceLinear,scale_filter(),fxaa_enabled());
-      isolatedSnapshotSubmission.reset();
-      R.secondaryPresentPending=true;R.secondaryAcquirePending=false;
-    } else if(complete!=VK_NOT_READY)vk_check(complete,"isolated snapshot producer completion");
-  }
-#endif
   const auto swapBookkeepingStarted=std::chrono::steady_clock::now();
   if (sampled[0]) {
     std::vector<float> d = read_signature(0), t = sampled[1] ? read_signature(1) : std::vector<float>{};
@@ -2422,10 +1345,8 @@ void swap() {
       // the GamePad window's size: its swapchain, or (SDL host test runs with hidden windows, which
       // present nothing) the window's pixel size
       uint32_t drcW = R.drc.swapchain ? R.drc.swapExtent.width : 0, drcH = R.drc.swapchain ? R.drc.swapExtent.height : 0;
-#ifdef WWHD_SDL_HOST
       if (!R.drc.swapchain && R.drc.window)
         drcW = uint32_t(std::max(0, R.drc.width.load())), drcH = uint32_t(std::max(0, R.drc.height.load()));
-#endif
       if (plan.drc_window && drcScan && drcW && drcH) {
         std::string p = path;
         size_t dot = p.rfind(".png");
@@ -2438,15 +1359,10 @@ void swap() {
     }
   }
   set_present_plan(nullptr);
-  service_screenshots();  // this frame's: the submission that holds them
   std::atomic_ref<uint64_t>(R.frame).fetch_add(1);
   R.completed = R.frame;
-#ifdef __ANDROID__
-  if (tvScan) drivers::frame_done();
-#endif
   buffer_cache_end_frame();
   report_gpu_timestamps();
-  perf_hint::frame_done();
   checkpoint_pipeline_cache();
   vk::checkpoint_shader_cache(R.frame);
   latch_res_scale();
@@ -2474,14 +1390,12 @@ void swap() {
     static Renderer::CpuPreparationStats previousPreparation;
     static SparseHashStats previousSparse;
     static gx2::ShaderKeyDirtyStats previousShaderDirty;
-#ifndef _WIN32
     auto threadCpuNs = []() -> uint64_t {
       timespec time{};
       if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time)) return 0;
       return uint64_t(time.tv_sec) * 1000000000ull + uint64_t(time.tv_nsec);
     };
     static uint64_t previousThreadCpu = threadCpuNs();
-#endif
     auto now=std::chrono::steady_clock::now();
     if (havePreviousSwap && intervalCount < swapIntervals.size()) {
       double ms = std::chrono::duration<double, std::milli>(now-previousSwap).count();
@@ -2491,13 +1405,11 @@ void swap() {
     previousSwap=now;havePreviousSwap=true;
     if (R.frame-frame>=120) {
       double seconds=std::chrono::duration<double>(now-start).count();
-#ifndef _WIN32
       const uint64_t currentThreadCpu = threadCpuNs();
       if (previousThreadCpu && currentThreadCpu >= previousThreadCpu)
         LOG("[vulkan thread CPU] %.3f ms/frame (excludes sleeping and GPU waits)",
             double(currentThreadCpu - previousThreadCpu) / 1e6 / (R.frame - frame));
       previousThreadCpu = currentThreadCpu;
-#endif
       LOG("[vulkan perf] frame %llu %.2f fps, %.1f draws/frame, %.2f MiB uploads/frame, %llu new upload blocks, %.1f passes/frame",
           (unsigned long long)R.frame,(R.frame-frame)/seconds,
           double(R.drawCount-draws)/(R.frame-frame),double(R.uploadBytes-bytes)/(R.frame-frame)/(1<<20),
@@ -2721,19 +1633,19 @@ static std::string version_text(uint32_t v) {
          std::to_string(VK_API_VERSION_PATCH(v));
 }
 // driverVersion: vendor-specific packing, decoded as vulkaninfo does (report_header.cpp)
-#ifdef _WIN32
-static constexpr bool kWindows = true;
-#else
 static constexpr bool kWindows = false;
-#endif
 static std::string driver_version_text(const VkPhysicalDeviceProperties &p) {
-  return reporthdr::driver_version(p.vendorID, p.driverVersion, kWindows);
+  char text[32];  // the standard Vulkan version encoding (Mesa's RADV uses it for its driver version)
+  std::snprintf(text, sizeof text, "%u.%u.%u", VK_API_VERSION_MAJOR(p.driverVersion), VK_API_VERSION_MINOR(p.driverVersion),
+                VK_API_VERSION_PATCH(p.driverVersion));
+  return text;
 }
 // the GPU line of the performance report header: name, driver, Vulkan version ("" before init)
 std::string device_description() {
   if (!R.properties.deviceName[0]) return "";
-  return reporthdr::vulkan_gpu(R.properties.deviceName, R.properties.vendorID, R.properties.driverVersion,
-                               R.properties.apiVersion, kWindows);
+  char api[32];
+  std::snprintf(api, sizeof api, "%u.%u", VK_API_VERSION_MAJOR(R.properties.apiVersion), VK_API_VERSION_MINOR(R.properties.apiVersion));
+  return std::string(R.properties.deviceName) + ", driver " + driver_version_text(R.properties) + ", Vulkan " + api;
 }
 // How a GPU provides dynamic rendering, the renderer's only way of drawing: Vulkan 1.3 core, or
 // VK_KHR_dynamic_rendering on a Vulkan 1.1 / 1.2 driver. Shaders are SPIR-V 1.3 (Vulkan 1.1).
@@ -2766,16 +1678,8 @@ static DynamicRendering dynamic_rendering(VkPhysicalDevice device, const VkPhysi
   return fdr.dynamicRendering ? DynamicRendering::KHR : DynamicRendering::None;
 }
 static const char kUpdateDriver[] =
-#ifdef _WIN32
-    "Install the newest graphics driver for this GPU (from the AMD, Intel or NVIDIA website, or through "
-    "Windows Update) and start the game again. "
-#elif defined(__APPLE__)
-    "Vulkan on a Mac needs MoltenVK and the Vulkan loader (the release ships both next to the game; "
-    "source builds: brew install vulkan-loader molten-vk). "
-#else
     "Install the newest graphics driver for this GPU (on Linux: an up-to-date Mesa, or the vendor's "
     "driver) and start the game again. "
-#endif
     "If no newer driver exists, this GPU cannot run the game's Vulkan renderer.";
 // The Vulkan layers the loader offers, once in the log (so also in a crash log's last lines).
 // Overlays install implicit layers that load into every Vulkan program (Steam, Discord, RivaTuner,
@@ -2821,15 +1725,6 @@ static void log_instance_layers() {
 static void init_device(std::vector<const char *> extensions,
                         const std::function<void()> &create_surfaces) {
   reset_pipeline_lookup_cache();
-#ifdef __APPLE__
-  // This draw-heavy workload is faster with direct Metal resource bindings.
-  // Respect an explicit MoltenVK override for devices/scenes needing larger
-  // argument-buffer resource limits. Set before the loader loads the driver.
-  setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 0);
-  // Immediate encoding overlaps recording with submitted GPU work. Every
-  // recording entrypoint has a host autorelease pool; explicit overrides win.
-  setenv("MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS", "3", 0);
-#endif
   uint32_t n;
   uint32_t loaderVersion = VK_API_VERSION_1_0;
   if (vkEnumerateInstanceVersion)
@@ -2855,14 +1750,6 @@ static void init_device(std::vector<const char *> extensions,
     extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
     ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
   }
-#ifdef __ANDROID__
-  const bool surfaceMaintenance = has_extension(ies,VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME) &&
-      has_extension(ies,VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
-  if(surfaceMaintenance) {
-    extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
-    extensions.push_back(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
-  }
-#endif
   VkDebugUtilsMessengerCreateInfoEXT debug{
       VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
   const char *layer = "VK_LAYER_KHRONOS_validation";
@@ -2997,12 +1884,6 @@ static void init_device(std::vector<const char *> extensions,
   if (R.portabilitySubset) {
     *tail = &portability;tail=&portability.pNext;
   }
-#ifdef __ANDROID__
-  VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintenance{
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
-  const bool hasMaintenance=surfaceMaintenance && has_extension(des,VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
-  if(hasMaintenance)*tail=&maintenance;
-#endif
   vkGetPhysicalDeviceFeatures2(R.physicalDevice, &features);
   if (R.portabilitySubset) {
     R.imageViewSwizzle = portability.imageViewFormatSwizzle;
@@ -3055,15 +1936,6 @@ static void init_device(std::vector<const char *> extensions,
   }
   if (R.portabilitySubset)
     *tail = &portability;
-#ifdef __ANDROID__
-  R.secondaryPresentFences=hasMaintenance && maintenance.swapchainMaintenance1;
-  if(R.secondaryPresentFences) {
-    if(R.portabilitySubset)tail=&portability.pNext;
-    *tail=&maintenance;
-    de.push_back(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
-  }
-  LOG("[vulkan] secondary fence retirement %s",R.secondaryPresentFences ? "enabled" : "unavailable; idle compatibility path");
-#endif
   float priorities[2]={1.0f,0.5f};
   VkDeviceQueueCreateInfo queues[2]={{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO},
                                    {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
@@ -3071,39 +1943,6 @@ static void init_device(std::vector<const char *> extensions,
   queues[0].queueCount=1;
   queues[0].pQueuePriorities=priorities;
   uint32_t requestedFamilies=1;
-#ifdef __ANDROID__
-  R.secondaryQueueFamily=R.queueFamily;
-  uint32_t queueFamilies=0;
-  vkGetPhysicalDeviceQueueFamilyProperties(R.physicalDevice,&queueFamilies,nullptr);
-  std::vector<VkQueueFamilyProperties> queueProperties(queueFamilies);
-  vkGetPhysicalDeviceQueueFamilyProperties(R.physicalDevice,&queueFamilies,queueProperties.data());
-  std::vector<PresentationQueueFamily> candidates(queueFamilies);
-  for(uint32_t family=0;family<queueFamilies;++family) {
-    VkBool32 present=VK_FALSE;
-    const VkResult support=vkGetPhysicalDeviceSurfaceSupportKHR(R.physicalDevice,family,R.tv.surface,&present);
-    candidates[family]={queueProperties[family].queueCount,
-        bool(queueProperties[family].queueFlags&VK_QUEUE_GRAPHICS_BIT),support==VK_SUCCESS && bool(present)};
-  }
-  const bool forceIsolated=getenv("WWHD_VK_ISOLATED_SECONDARY") && !strcmp(getenv("WWHD_VK_ISOLATED_SECONDARY"),"1");
-  const auto secondary=R.secondaryPresentFences && !forceIsolated ? secondary_presentation_queue(candidates,R.queueFamily) : std::nullopt;
-  const bool isolateSecondary=!secondary &&
-      has_extension(des,"VK_ANDROID_external_memory_android_hardware_buffer") &&
-      has_extension(des,"VK_KHR_external_semaphore_fd") && has_extension(des,"VK_EXT_queue_family_foreign");
-  if(isolateSecondary) {
-    de.push_back("VK_ANDROID_external_memory_android_hardware_buffer");
-    de.push_back("VK_KHR_external_semaphore_fd");de.push_back("VK_EXT_queue_family_foreign");
-  }
-  if(secondary) {
-    R.secondaryQueueFamily=secondary->family;
-    if(secondary->family==R.queueFamily)queues[0].queueCount=2;
-    else {
-      requestedFamilies=2;
-      queues[1].queueFamilyIndex=secondary->family;
-      queues[1].queueCount=1;
-      queues[1].pQueuePriorities=&priorities[1];
-    }
-  }
-#endif
   R.primaryRequestedQueues=queues[0].queueCount;
   VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   di.pNext = chain;
@@ -3116,24 +1955,6 @@ static void init_device(std::vector<const char *> extensions,
            "create Vulkan device");
   load_device_functions(R.device, R.dynamicRenderingKHR);
   vkGetDeviceQueue(R.device, R.queueFamily, 0, &R.queue);
-#ifdef __ANDROID__
-  if(secondary) {
-    vkGetDeviceQueue(R.device,secondary->family,secondary->index,&R.secondaryQueue);
-    secondaryPresentWorker=std::make_unique<PresentWorker<SecondaryPresentResult>>();
-  }
-  if(isolateSecondary) {
-    try {
-      isolatedSecondary=std::make_unique<AndroidIsolatedPresenter>(R.instance,R.physicalDevice,R.device,R.queueFamily,R.dynamicRenderingKHR);
-      R.secondaryQueue=isolatedSecondary->queue();R.secondaryIsolated=true;R.secondaryPresentFences=false;
-      LOG("[vulkan] isolated secondary logical device enabled; queue index 0 on each device");
-    } catch(const std::exception& error) {
-      LOG("[vulkan] isolated secondary logical device unavailable: %s",error.what());
-    }
-  }
-  LOG("[vulkan] secondary presentation worker %s (primary family %u, secondary family %u)",
-      R.secondaryQueue ? "dedicated queue" : "unavailable; shared queue compatibility path",
-      R.queueFamily,R.secondaryQueueFamily);
-#endif
   init_pipeline_cache();
   for (auto& slot:R.submissions) {
   VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -3186,7 +2007,6 @@ static void init_device(std::vector<const char *> extensions,
   }
 }
 
-#ifdef WWHD_SDL_HOST
 static bool hidden_windows() {
   static const bool hidden = [] { const char* e = getenv("WWHD_HIDDEN_WINDOWS"); return e && *e && strcmp(e, "0"); }();
   return hidden;
@@ -3197,14 +2017,8 @@ void init(SDL_Window* window) {
   // the Vulkan loader (libvulkan.so.1), loaded here rather than imported (loader.h); the window uses the same one
   if (!SDL_Vulkan_LoadLibrary(nullptr))
     throw std::runtime_error(std::string("Vulkan is not installed on this computer: the Vulkan runtime "
-#ifdef _WIN32
-                                         "(vulkan-1.dll) "
-#endif
                                          "could not be loaded (") + SDL_GetError() + ").\n\n" + kUpdateDriver);
   auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
-#ifdef __ANDROID__
-  if (auto custom = drivers::open_custom()) gipa = custom;
-#endif
   load_global_functions(gipa);
   R.tv.window = window;  // the TV picture; no GamePad window (the host shows one screen)
   uint32_t n;
@@ -3224,16 +2038,11 @@ void init(SDL_Window* window) {
       throw std::runtime_error(SDL_GetError());
   });
 }
-#endif
 void save_renderer_caches() {
   // Called during orderly shutdown under the renderer execution lock.
   reset_feedback_images();
   wait_idle();
   bc_decode_shutdown();
-#ifdef __ANDROID__
-  collect_secondary_swapchains();
-  shutdown_secondary_worker();
-#endif
   destroy_gpu_timestamp_queries();
   vk::save_shader_cache();
   save_pipeline_cache();

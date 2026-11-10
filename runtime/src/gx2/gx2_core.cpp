@@ -18,16 +18,18 @@
 #include <vector>
 
 #include "gx2.h"
+
+// the GX2 render thread, for the host loop's slow-frame sampler (host/window.cpp)
+#include <pthread.h>
+std::atomic<pthread_t> g_gpu_thread{};
 #include "gx2_cmd.h"
 #include "gx2_regs.h"
 #include "register_blocks.h"
 #include "register_class.h"
 #include "thread_identity.h"
 #include "gx2_texture_regs.h"
-#ifdef WWHD_HAS_VULKAN
 #include "shader_key_dirty.h"
 #include "gfx/vulkan/api.h"
-#endif
 #include "hle.h"
 #include "guest_addr.h"
 #include "gfx/renderer.h"
@@ -53,12 +55,8 @@ extern "C" { uint64_t g_shader_state_gen = 1; }
 // shader_irrelevant_reg (register_class.h); WWHD_VK_SHADER_ADDRESS_MEMO=1 (Vulkan) adds the texture
 // address words, which bind_stage resolves freshly
 static bool shader_address_memo() {
-#ifdef WWHD_HAS_VULKAN
     const char* e = getenv("WWHD_VK_SHADER_ADDRESS_MEMO");
     return render::vulkan() && e && !strcmp(e, "1");
-#else
-    return false;
-#endif
 }
 
 // ---------------------------------------------------------------- register classes
@@ -71,14 +69,10 @@ static bool shader_address_memo() {
 static RegisterClasses g_reg_classes;
 static const uint8* const g_reg_class = g_reg_classes.cls;
 static bool g_reg_tables_ready = false;
-#ifdef WWHD_HAS_VULKAN
 static ShaderKeyBits g_vk_key_bits;   // vulkan_shader_key_mask with WWHD_VK_SHADER_KEY_DIRTY=1
 static bool g_fused_small = false;    // Vulkan: the per-word path for writes of up to 16 words
 static bool g_key_dirty = false;      // WWHD_VK_SHADER_KEY_DIRTY=1 (Vulkan)
 static bool g_collect_stats = false;  // WWHD_VK_STATS (Vulkan)
-#else
-static constexpr bool g_collect_stats = false;
-#endif
 
 static void build_reg_tables() {
     MetalKeyOptions o;
@@ -87,7 +81,6 @@ static void build_reg_tables() {
     o.allTex = getenv("WWHD_SHADER_KEY_ALL_TEX") != nullptr;
     o.allRegs = getenv("WWHD_SHADER_KEY_ALL_REGS") != nullptr;
     g_reg_classes.build(shader_address_memo(), o, [](uint32) { return false; });
-#ifdef WWHD_HAS_VULKAN
     const char* e = getenv("WWHD_VK_FUSE_SMALL_REGS");
     // Enabled by default; explicit zero retains the original bulk path.
     g_fused_small = render::vulkan() && (!e || strcmp(e, "0") != 0);
@@ -95,7 +88,6 @@ static void build_reg_tables() {
     g_key_dirty = render::vulkan() && e && !strcmp(e, "1");
     g_collect_stats = render::vulkan() && getenv("WWHD_VK_STATS") != nullptr;
     if (g_key_dirty) g_vk_key_bits.build(vulkan_shader_key_mask);
-#endif
     g_reg_tables_ready = true;
 }
 static inline void ensure_reg_tables() {
@@ -104,9 +96,7 @@ static inline void ensure_reg_tables() {
 // a write (old != value) can change a shader key
 static inline bool key_changes(uint32 reg, uint32 old, uint32 value) {
     if (g_reg_class[reg] & kRcShaderIrrelevant) return false;
-#ifdef WWHD_HAS_VULKAN
     if (render::vulkan()) return !g_key_dirty || g_vk_key_bits.changed(reg, old, value);
-#endif
     return g_reg_classes.metal_key_changes(reg, old, value, g_regs);
 }
 
@@ -141,7 +131,6 @@ static void note_gen_bump(uint32 reg) {
 static ShaderKeyDirtyStats shaderKeyDirtyStats;
 ShaderKeyDirtyStats shader_key_dirty_stats() { return shaderKeyDirtyStats; }
 
-#ifdef WWHD_HAS_VULKAN
 static void apply_small_regs(uint32 first, const uint32* v, uint32 n) {
     const bool keyDirty = g_key_dirty, collectStats = g_collect_stats;
     bool changed = false, baselineBump = false, actualBump = false;
@@ -172,7 +161,6 @@ static void apply_small_regs(uint32 first, const uint32* v, uint32 n) {
         shaderKeyDirtyStats.maskedWords += maskedWords;
     }
 }
-#endif
 
 static void apply_regs(uint32 first, const uint32* v, uint32 n) {
     if (first >= kNumRegs || n > kNumRegs - first) return;
@@ -189,15 +177,12 @@ static void apply_regs(uint32 first, const uint32* v, uint32 n) {
         if (g_shadow && g_shadow != v) copy_words(&g_shadow[first], v, n);
         return;
     }
-#ifdef WWHD_HAS_VULKAN
     // Vulkan renderer only (the Metal renderer keeps the original bulk path)
     if (g_fused_small && n <= 16) {
         apply_small_regs(first, v, n);
         return;
     }
-#endif
     if (memcmp(&g_regs[first], v, n * 4) != 0) {
-#ifdef WWHD_HAS_VULKAN
         if(g_key_dirty || g_collect_stats) {
             const bool collectStats = g_collect_stats;
             bool baselineBump = false, actualBump = false;
@@ -221,7 +206,6 @@ static void apply_regs(uint32 first, const uint32* v, uint32 n) {
             }
             memcpy(&g_regs[first], v, n * 4);
         } else
-#endif
         {
             // one pass over the changed span: the shader-generation check (by table) and only the
             // changed words copied
@@ -313,6 +297,7 @@ static uint64_t g_fence_issued = 0;
 static std::atomic<uint64_t> g_fence_done{0};
 
 static void render_thread_main() {
+    ::g_gpu_thread = pthread_self();
     botw_set_thread_name("GX2 render");
     botw_place_thread(1);  // the GPU pair's cpus (6-7) and priority, as Latte's GPU thread had
     for (;;) {
@@ -397,7 +382,6 @@ static void emit_host(Op op, std::initializer_list<uint32> payload) {
     enqueue(op, payload.begin(), (uint32)payload.size());
 }
 
-#ifdef WWHD_HAS_VULKAN
 void checkpoint_vulkan_caches() {
     // Wait for queued work, then exclude further renderer mutations while the
     // SDL thread writes the final cache checkpoint during orderly shutdown.
@@ -406,7 +390,6 @@ void checkpoint_vulkan_caches() {
     gfxvk::wait_idle();
     gfxvk::save_renderer_caches();
 }
-#endif
 
 void set_regs(uint32 first, const uint32* values, uint32 count) {
     if (!count) return;
@@ -529,7 +512,6 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
     case OP_SET_CONTEXT: set_context(p[0]); break;
     case OP_INVALIDATE: render::invalidate(p[0], p[1], p[2]); break;
     case OP_EXPAND_COLOR: case OP_EXPAND_DEPTH: break;  // MSAA/HiZ decompression: nothing to do on the host
-    case OP_PEEK_Z: render::peek_z(p, n); break;
     case OP_FLUSH: render::guest_flush(); break;  // Vulkan: asynchronous submission
     case OP_DRAW_DONE:
         // The Vulkan renderer writes GPU results back to guest memory only for linear surfaces (guest data is copied
@@ -840,7 +822,7 @@ HLE_EXPORT(gx2, GX2DrawIndexedEx2) {  // (prim, count, indexType, indices, baseV
 }
 
 // ---------------------------------------------------------------- clears and copies
-static float farg(PPCContext* c, int i) { return (float)c->f[1 + i].ps0; }
+static float farg(PPCContext* c, int i) { return (float)c->f[1 + i]; }
 // Struct parameters are copied into the command (as GX2 encodes them into the command buffer):
 // games reuse one GX2ColorBuffer/GX2DepthBuffer and change its view between calls, also while
 // recording display lists that run later.

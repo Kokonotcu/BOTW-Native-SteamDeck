@@ -5,9 +5,7 @@
 #include "backend.h"
 #include "shaders.h"
 #include "settings.h"
-#include "overlay/guest_hud.h"
 #include "gfx/display_modes.h"
-#include "platform/dual_display.h"
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -311,10 +309,7 @@ void compose(VkImage image,VkImageView view,VkImageLayout& layout,VkExtent2D ext
  ImDrawData* gamepadOverlay=nullptr;
  // The GamePad scan may also be shown inside the TV composition (PIP or Off-TV).
  if(R.tv.scan&&R.drc.scan&&!quads.empty()&&quads.front().image==R.tv.scan.get())for(const auto& q:quads)
-  if(q.image==R.drc.scan.get()) {
-   gamepadOverlay=overlay::guesthud::gamepad_region(float(extent.width),float(extent.height),q.box.x,q.box.y,q.box.w,q.box.h,q.alpha);
-   break;
-  }
+  if(q.image==R.drc.scan.get()) break;
  if(gamepadOverlay)overlay_prepare(gamepadOverlay);
  if(overlay)overlay_prepare(overlay);
  for(auto& q:quads)
@@ -372,13 +367,7 @@ namespace { ImDrawData* overlayDraw=nullptr; }
 void set_overlay_draw(ImDrawData* draw) { overlayDraw=draw; }
 
 Screen& presentation_source_screen(Screen& physical) {
-#ifdef __ANDROID__
- int index=dual_display::source_index(&physical==&R.drc ? 1 : 0,
-                                     gfx::g_has_drc_window,dual_display::active_swap);
- return index==1 ? R.drc : R.tv;
-#else
  return physical;
-#endif
 }
 
 std::vector<ComposeQuad> screen_quads(Screen& screen,VkExtent2D target,int& filter) {
@@ -386,13 +375,6 @@ std::vector<ComposeQuad> screen_quads(Screen& screen,VkExtent2D target,int& filt
  filter=scale_filter();
  Screen& source=presentation_source_screen(screen);
  if(!source.scan||!source.scan->image)return quads;
-#ifdef __ANDROID__
- if(gfx::g_has_drc_window) {
-  ComposeQuad q;q.image=source.scan.get();q.sourceLinear=source.srgb.load();
-  q.box=gfx::display_layout(float(target.width),float(target.height),float(q.image->extent.width),float(q.image->extent.height));
-  quads.push_back(q);return quads;
- }
-#endif
  if(currentPlan) {
   // both window hosts (gfx/display_modes.cpp): the same layout as the Metal renderer
   filter=currentPlan->filter;
@@ -463,7 +445,7 @@ bool draw_present_screen(Screen& screen,uint32_t imageIndex) {
  if(fxaa_enabled()&&!linear)throw std::runtime_error("FXAA requires linear scan-buffer filtering");
  int filter=0;auto quads=screen_quads(screen,screen.swapExtent,filter);
  compose(screen.images.at(imageIndex),found->second.views.at(imageIndex),screen.layouts.at(imageIndex),screen.swapExtent,screen.swapFormat,
-         quads,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,filter,fxaa_enabled(),&screen==&R.tv?overlayDraw:overlay::guesthud::gamepad_frame(screen.swapExtent.width,screen.swapExtent.height),&screen.imageUses.at(imageIndex));
+         quads,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,filter,fxaa_enabled(),&screen==&R.tv?overlayDraw:nullptr,&screen.imageUses.at(imageIndex));
  return true;
 }
 
@@ -601,7 +583,7 @@ std::vector<uint8_t> compose_offscreen(Screen& screen,uint32_t width,uint32_t he
  try {
   int filter=0;auto quads=screen_quads(screen,VkExtent2D{width,height},filter);
   compose(target.image,target.view,target.layout,VkExtent2D{width,height},target.fmt.pixel,quads,
-          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,filter,fxaa_enabled(),&screen==&R.tv?overlayDraw:overlay::guesthud::gamepad_frame(width,height),&target.use);
+          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,filter,fxaa_enabled(),&screen==&R.tv?overlayDraw:nullptr,&target.use);
   rgba=read_surface_rgba(target,false);  // display-encoded already (sRGB target, or encoded values)
  }catch(...){destroy_surface_image(&target);throw;}
  destroy_surface_image(&target);

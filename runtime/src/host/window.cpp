@@ -24,7 +24,7 @@
 
 #include <cstdio>
 
-extern std::atomic<pthread_t> g_gpu_thread;  // cemu_shims/overlay_menu.cpp: Cemu's GPU thread
+extern std::atomic<pthread_t> g_gpu_thread;  // gx2/gx2_core.cpp: the GX2 render thread
 #include "menu.h"
 #include "../settings.h"
 #include "swkbd_host.h"

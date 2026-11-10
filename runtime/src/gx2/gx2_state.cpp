@@ -7,7 +7,7 @@
 using namespace Latte;
 
 namespace gx2 {
-static float fa(PPCContext* c, int i) { return (float)c->f[1 + i].ps0; }  // i-th float argument
+static float fa(PPCContext* c, int i) { return (float)c->f[1 + i]; }  // i-th float argument
 }  // namespace gx2
 
 using gx2::fa;

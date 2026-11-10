@@ -10,7 +10,26 @@
 #include "hle.h"
 #include "thread.h"
 
-void LatteCP_idleUntilWrite(const void* addr, uint32_t seen);  // MONITORX/MWAITX wait (LatteCommandProcessor.cpp)
+// Waiting threads watch the word with AMD's MONITORX/MWAITX: the core sleeps until the cache line is written or
+// ~20 us pass (on the Deck the CPU and GPU share one power limit, so a pause loop would cost GPU clock).
+#if defined(__x86_64__)
+#include <cpuid.h>
+#include <x86intrin.h>
+static const bool g_cpu_has_mwaitx = [] {
+    unsigned a, b, c, d;
+    return __get_cpuid(0x80000001, &a, &b, &c, &d) && (c & (1u << 29)) != 0;
+}();
+__attribute__((target("mwaitx"))) static void mwaitx_until_write(const void* addr, uint32_t seen) {
+    _mm_monitorx(const_cast<void*>(addr), 0, 0);
+    if (*(const volatile uint32_t*)addr == seen) _mm_mwaitx(2, 0, 50000);  // bit 1: wake after 50000 reference clocks at the latest
+}
+static void idle_until_write(const void* addr, uint32_t seen) {
+    if (g_cpu_has_mwaitx) mwaitx_until_write(addr, seen);
+    else _mm_pause();
+}
+#else
+static void idle_until_write(const void*, uint32_t) {}
+#endif
 
 using threads::g_klock;
 using threads::GuestThread;
@@ -212,7 +231,7 @@ bool spin_until(const uint32_t* word, GuestThread* me, Ready ready) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(spin_ns);
     do {
         if (ready()) return true;
-        LatteCP_idleUntilWrite(word, __atomic_load_n(word, __ATOMIC_ACQUIRE));  // until written, ~20 us at most
+        idle_until_write(word, __atomic_load_n(word, __ATOMIC_ACQUIRE));  // until written, ~20 us at most
     } while (std::chrono::steady_clock::now() < deadline);
     return ready();
 }

@@ -1,4 +1,5 @@
 #include "bench.h"
+#include "latte/latte.h"
 
 #include "botw_target.h"
 #if defined(_WIN32)
@@ -25,7 +26,6 @@
 #include "../thread.h"
 
 extern std::atomic<pthread_t> g_gpu_thread;
-void LatteTiming_setCustomVsyncFrequency(int32_t frequency);
 
 namespace bench {
 namespace {
@@ -281,7 +281,7 @@ bool tick() {
                 g_frame_ms.reserve(g_opt.seconds * 240);
                 g_last_swap = Clock::now();
             }
-            if (g_opt.uncap_hz > 0) LatteTiming_setCustomVsyncFrequency(g_opt.uncap_hz);
+            if (g_opt.uncap_hz > 0) latte::set_vsync_frequency(g_opt.uncap_hz);
             threads::main_wait_report();  // reset wait counters at the start of the window
             g_phase_t0 = Clock::now();
             g_phase = Phase::Measure;

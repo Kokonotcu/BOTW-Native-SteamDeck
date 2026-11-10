@@ -1,4 +1,3 @@
-#include "gfx/depth_peek.h"
 #include "hle.h"
 #include "backend.h"
 #include "gx2/gx2.h"
@@ -14,53 +13,6 @@
 #include <vector>
 
 namespace gfxvk {
-// Adapted from the fork's peek_z readback; answers retire with the GPU submission.
-void peek_z(const uint32_t* cells, uint32_t n) {
-    Surface* depth = nullptr;
-    auto range = R.surfaces.equal_range(R.mainDepthAddr);
-    for (auto it = range.first; it != range.second; ++it) {
-        auto* s = it->second.get();
-        if (s->isDepth && s->width == 1280 && s->height == 720 && s->image &&
-            (!depth || s->writeSeq > depth->writeSeq)) depth = s;
-    }
-    uint32_t points = std::min(n / 3, 64u);
-    if (!depth || !points) return;
-    VkFormat format = depth->fmt.pixel;
-    if (format != VK_FORMAT_D32_SFLOAT && format != VK_FORMAT_D32_SFLOAT_S8_UINT &&
-        format != VK_FORMAT_D16_UNORM) return;
-    Buffer staging = create_readback_buffer(points * 4);
-    std::vector<VkBufferImageCopy> regions(points);
-    std::vector<uint32_t> destinations(points);
-    for (uint32_t i = 0; i < points; i++) {
-        auto& r = regions[i];
-        r.bufferOffset = i * 4;
-        r.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT,0,0,1};
-        r.imageOffset = {::gfx::depth_peek::pixel(cells[i*3],depth->extent.width,640),
-            ::gfx::depth_peek::pixel(cells[i*3+1],depth->extent.height,480),0};
-        r.imageExtent = {1,1,1};
-        destinations[i] = cells[i*3+2];
-    }
-    transition_image(depth,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
-    vkCmdCopyImageToBuffer(command_buffer(),depth->image,depth->layout,staging.buffer,points,regions.data());
-    derive_dependency(staging.use,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
-    transition_buffer(staging,VK_PIPELINE_STAGE_HOST_BIT,VK_ACCESS_HOST_READ_BIT);
-    uint64_t ticket = ::gfx::depth_peek::next_ticket();
-    R.completions.push_back([staging, destinations, points, format, ticket] {
-        const auto* raw = static_cast<const uint8_t*>(staging.mapped);
-        std::vector<uint32_t> depths(points);
-        for (uint32_t i = 0; i < points; i++) {
-            if (format == VK_FORMAT_D16_UNORM) {
-                uint16_t v; memcpy(&v,raw+i*4,2);
-                depths[i] = v == 0xFFFF ? 0xFFFFFF : uint32_t(v) << 8;
-            } else {
-                float v; memcpy(&v,raw+i*4,4);
-                depths[i] = ::gfx::depth_peek::from_float(v);
-            }
-        }
-        ::gfx::depth_peek::publish(ticket,destinations,depths);
-    });
-    defer_buffer(staging);
-}
 
 uint64_t frame_count();
 namespace {

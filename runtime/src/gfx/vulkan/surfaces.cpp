@@ -1,6 +1,5 @@
 #include "gfx/render_mips.h"
 #include "bc_decode.h"
-#include "mods/cemu_pack.h"
 // Guest surfaces backed by Vulkan images. LatteAddrLib supplies guest tiling geometry.
 #include "backend.h"
 #include "buffer_cache.h"
@@ -146,10 +145,6 @@ bool target_aspect_factors(uint32_t w, uint32_t h, float& kx, float& ky) {
     return on;
 }
 static void target_aspect(const Surface* s, float& kx, float& ky) {
-    uint32_t width,height;
-    if(!s->fmt.compressed&&s->mips==1&&mods::cemu::texture_extent(s->width,s->height,s->format,s->slices,s->tileMode,width,height)){
-        kx=float(width)/s->width;ky=float(height)/s->height;return;
-    }
     bool on = screen_shaped(s->width, s->height, s->fmt.compressed, s->mips, s->slices);
     kx = on ? g_aspect_kx : 1.0f;
     ky = on ? g_aspect_ky : 1.0f;
@@ -162,8 +157,6 @@ static void target_aspect(const Surface* s, float& kx, float& ky) {
 // shadow-mask softening samples (restored in v0.2.9); since then both sizes give practically the
 // same soft edges, the larger maps only a hair crisper.
 static float target_scale(const Surface* s) {
-    uint32_t width,height;
-    if(!s->fmt.compressed&&s->mips==1&&mods::cemu::texture_extent(s->width,s->height,s->format,s->slices,s->tileMode,width,height))return 1.0f;
     if (s->fmt.compressed || s->mips > 1) return 1.0f;
     static const float shadow = getenv("WWHD_SHADOW_SCALE") ? parse_scale(getenv("WWHD_SHADOW_SCALE")) : 0.0f;
     static const bool shadow_logged = [] {  // issue #67: show that the switch was picked up

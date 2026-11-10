@@ -8,7 +8,6 @@
 struct SDL_Window;
 
 namespace gfxvk {
-void peek_z(const uint32_t*, uint32_t);
 void init(SDL_Window* window);   // device and swapchain on the host window (host/window.cpp)
 void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr,
           uint32_t baseVertex, uint32_t instances);

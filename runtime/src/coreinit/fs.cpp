@@ -31,7 +31,7 @@
 std::string botw_ios_fix_case(const std::string& host);
 #endif
 
-void LatteBufferCache_notifyDCFlush(uint32_t address, uint32_t size);  // vendored Cemu GPU
+#include "gfx/write_watch.h"  // file reads into pages the renderer write-protects
 
 namespace {
 enum : int32_t {
@@ -190,12 +190,13 @@ Handle* get(uint32_t h) { return h && h < g_handles.size() ? &g_handles[h] : nul
 // still sees the user-mode store.
 size_t read_guest_raw(FILE* f, uint32_t dst, size_t want);
 
-// File data lands in guest memory like a DMA write: the GPU-side caches (Cemu's buffer cache, the cross-frame index
-// cache) learn about it the way they learn about DCFlushRange. Without this, memory reused for a new file could
-// keep serving the previous file's vertex/index data.
+// File data lands in guest memory like a DMA write. The renderer's write tracker unprotects the range first (a
+// kernel read into a write-protected page fails instead of faulting into the tracker) and marks it written, so
+// memory reused for a new file does not keep serving the previous file's textures or vertex/index data.
 size_t read_guest(FILE* f, uint32_t dst, size_t want) {
+    wwatch::host_write_begin(dst, (uint32_t)want);
     const size_t got = read_guest_raw(f, dst, want);
-    if (got) LatteBufferCache_notifyDCFlush(dst, (uint32_t)got);
+    wwatch::host_write_end(dst, (uint32_t)want);
     return got;
 }
 

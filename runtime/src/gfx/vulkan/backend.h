@@ -1,9 +1,7 @@
 #pragma once
 #include "loader.h"
 #include "barrier_state.h"
-#ifdef WWHD_SDL_HOST
 #include <SDL3/SDL.h>
-#endif
 #include <atomic>
 #include <array>
 #include <cstdint>
@@ -43,11 +41,7 @@ struct Surface {
 };
 struct SurfaceDesc { uint32_t addr=0,mipAddr=0,width=0,height=0,slices=1,pitch=0,mips=1,format=0,dim=1,tileMode=0,swizzle=0; bool isDepth=false; };
 struct Screen {
-#ifdef WWHD_SDL_HOST
  SDL_Window* window=nullptr;
-#else
- void* window=nullptr; // CAMetalLayer of the AppKit view (display.mm)
-#endif
  VkSurfaceKHR surface=VK_NULL_HANDLE; VkSwapchainKHR swapchain=VK_NULL_HANDLE;
  VkFormat swapFormat=VK_FORMAT_UNDEFINED; VkExtent2D swapExtent{};
  std::vector<VkImage> images; std::vector<VkImageLayout> layouts;

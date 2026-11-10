@@ -7,7 +7,6 @@
 #include "gx2_surface_calc.h"
 #include "gx2_texture_regs.h"
 #include "hle.h"
-#include "../aspect.h"
 
 using namespace Latte;
 using gx2::set_reg;
@@ -15,7 +14,7 @@ using gx2::set_regs;
 
 template <typename T>
 static T* gp(uint32 addr) { return (T*)mem::host(addr); }
-static float fa(PPCContext* c, int i) { return (float)c->f[1 + i].ps0; }
+static float fa(PPCContext* c, int i) { return (float)c->f[1 + i]; }
 
 // ---------------------------------------------------------------- surfaces
 HLE_EXPORT(gx2, GX2CalcSurfaceSizeAndAlignment) { gx2calc::CalcSurfaceSizeAndAlignment(gp<GX2Surface>(ARG(0))); }
@@ -305,13 +304,6 @@ static void uniform_regs(uint32 stageBase, uint32 offset, uint32 count, uint32 v
     if (offset + count > 0x400) count = 0x400 - std::min<uint32>(offset, 0x400);
     uint32 tmp[0x400];  // on the stack: several cores record display lists at once
     for (uint32 i = 0; i < count; i++) tmp[i] = mem::r32(values + 4 * i);
-    if (stageBase == 0x400 && count == 16 && aspect::tagged_projection()) {  // a layout projection (aspect.cpp)
-        uint32 w[17];
-        w[0] = mmSQ_ALU_CONSTANT0_0 + stageBase + offset;
-        memcpy(w + 1, tmp, 16 * 4);
-        gx2::emit(gx2::OP_SET_PROJ_REGS, w, 17);
-        return;
-    }
     set_regs(mmSQ_ALU_CONSTANT0_0 + stageBase + offset, tmp, count);
 }
 HLE_EXPORT(gx2, GX2SetVertexUniformReg) { uniform_regs(0x400, ARG(0), ARG(1), ARG(2)); }

@@ -230,7 +230,7 @@ target_include_directories(BotWRecomp PRIVATE runtime/include runtime/src genera
 file(GLOB_RECURSE NATIVE_GPU_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/runtime/src/gx2/*.cpp ${CMAKE_SOURCE_DIR}/runtime/src/gfx/*.cpp)
 set_source_files_properties(${NATIVE_GPU_SOURCES} PROPERTIES
   COMPILE_OPTIONS "-include;${CMAKE_SOURCE_DIR}/runtime/cemu/cemu_shim.h"
-  COMPILE_DEFINITIONS "WWHD_HAS_VULKAN=1;WWHD_SDL_HOST=1;VK_NO_PROTOTYPES")  # the renderer loads Vulkan itself (loader.h)
+  COMPILE_DEFINITIONS "VK_NO_PROTOTYPES")  # the renderer loads Vulkan itself (loader.h)
 if(APPLE)
   target_compile_options(BotWRecomp PRIVATE -Wall -Wno-unused-function -Wno-unused-variable -fwrapv -mcpu=apple-m1
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
@@ -269,6 +269,11 @@ if(BOTW_ENABLE_VULKAN)
   else()
     message(FATAL_ERROR "glslang target not found (need glslang 15.x)")
   endif()
+  if(TARGET glslang::glslang-default-resource-limits)
+    list(APPEND _botw_glslang glslang::glslang-default-resource-limits)
+  elseif(TARGET glslang-default-resource-limits)
+    list(APPEND _botw_glslang glslang-default-resource-limits)
+  endif()
   if(TARGET glslang::SPIRV)
     list(APPEND _botw_glslang glslang::SPIRV)
   elseif(TARGET SPIRV)
@@ -278,15 +283,8 @@ if(BOTW_ENABLE_VULKAN)
   endif()
 endif()
 
-# cemu_gpu is an OBJECT library, so usage requirements (glslang's include path) have to be
-# attached here. $<TARGET_OBJECTS> does not carry them onto the executable.
-if(_botw_glslang)
-  target_link_libraries(cemu_gpu PUBLIC ${_botw_glslang})
-endif()
-# Shims under cemu_gpu include the host headers (SDL events for the touch overlay).
-target_link_libraries(cemu_gpu PUBLIC SDL3::SDL3)
-# The glslang build tree exposes <glslang/Public/...> but Cemu includes <glslang/SPIRV/...>,
-# which is how an installed glslang lays the headers out.
+# The glslang build tree exposes <glslang/Public/...> but the renderer (gfx/vulkan/shaders.cpp, GLSL -> SPIR-V)
+# includes <glslang/SPIRV/...>, which is how an installed glslang lays the headers out.
 if(BOTW_ENABLE_VULKAN AND DEFINED glslang_SOURCE_DIR)
   set(_glslang_inc ${CMAKE_BINARY_DIR}/glslang-include)
   file(MAKE_DIRECTORY ${_glslang_inc}/glslang)
@@ -300,7 +298,7 @@ if(BOTW_ENABLE_VULKAN AND DEFINED glslang_SOURCE_DIR)
       file(CREATE_LINK ${_src} ${_glslang_inc}/glslang/${_sub} SYMBOLIC)
     endif()
   endforeach()
-  target_include_directories(cemu_gpu PUBLIC ${_glslang_inc})
+  target_include_directories(BotWRecomp PRIVATE ${_glslang_inc})
 endif()
 
 target_link_libraries(BotWRecomp PRIVATE
