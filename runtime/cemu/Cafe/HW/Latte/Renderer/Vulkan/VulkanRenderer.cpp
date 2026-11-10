@@ -38,6 +38,8 @@ void VkDefer_Install();  // VulkanDeferred.cpp
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <set>
+#include <tuple>
 #include <mutex>
 #include <unordered_map>
 #include <glslang/Public/ShaderLang.h>
@@ -2765,19 +2767,46 @@ void VulkanRenderer::PipelineCacheSaveThread(size_t cache_size)
 			}
 		}
 
-		// always prioritize the compiler threads over this thread
-		// avoid calling stalling lock() since it will block other threads from entering even when the lock is currently held in shared mode
-		while (!m_pipeline_cache_save_mutex.try_lock())
-			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+		// BotW-Native: serialize a snapshot instead of the live cache. Upstream held m_pipeline_cache_save_mutex
+		// exclusively across two vkGetPipelineCacheData calls on the live cache (41 MB on the Deck): every pipeline the
+		// GPU thread had to create meanwhile waited 25-50 ms (session 20261110-044318: one pipeline, 48 ms). Merging
+		// into an empty cache takes object references only (Mesa vk_pipeline_cache), so the live cache is held briefly
+		// and the long serialization runs on the snapshot, which nothing else uses.
+		VkPipelineCache snapshot = VK_NULL_HANDLE;
+		{
+			VkPipelineCacheCreateInfo snapInfo{};
+			snapInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+			if (vkCreatePipelineCache(m_logicalDevice, &snapInfo, nullptr, &snapshot) != VK_SUCCESS)
+				snapshot = VK_NULL_HANDLE;
+		}
+		m_pipeline_cache_semaphore.reset();  // pipelines created from here on trigger the next save
+		if (snapshot != VK_NULL_HANDLE && vkMergePipelineCaches(m_logicalDevice, snapshot, 1, &m_pipeline_cache) != VK_SUCCESS)
+		{
+			vkDestroyPipelineCache(m_logicalDevice, snapshot, nullptr);
+			snapshot = VK_NULL_HANDLE;
+		}
+		if (snapshot == VK_NULL_HANDLE)
+		{
+			// fallback: the upstream way. Always prioritize the compiler threads over this thread; avoid calling
+			// stalling lock() since it will block other threads from entering even when the lock is held in shared mode
+			while (!m_pipeline_cache_save_mutex.try_lock())
+				std::this_thread::sleep_for(std::chrono::milliseconds(250));
+		}
+		const VkPipelineCache saveCache = snapshot != VK_NULL_HANDLE ? snapshot : m_pipeline_cache;
 
 		size_t size = 0;
-		VkResult res = vkGetPipelineCacheData(m_logicalDevice, m_pipeline_cache, &size, nullptr);
+		VkResult res = vkGetPipelineCacheData(m_logicalDevice, saveCache, &size, nullptr);
 		if (res == VK_SUCCESS && size > 0 && size != cache_size)
 		{
 			std::vector<uint8_t> cacheData(size);
-			res = vkGetPipelineCacheData(m_logicalDevice, m_pipeline_cache, &size, cacheData.data());
-			m_pipeline_cache_semaphore.reset();
-			m_pipeline_cache_save_mutex.unlock();
+			res = vkGetPipelineCacheData(m_logicalDevice, saveCache, &size, cacheData.data());
+			if (snapshot != VK_NULL_HANDLE)
+				vkDestroyPipelineCache(m_logicalDevice, snapshot, nullptr);
+			else
+			{
+				m_pipeline_cache_semaphore.reset();
+				m_pipeline_cache_save_mutex.unlock();
+			}
 
 			if (res == VK_SUCCESS)
 			{
@@ -2803,8 +2832,13 @@ void VulkanRenderer::PipelineCacheSaveThread(size_t cache_size)
 		}
 		else
 		{
-			m_pipeline_cache_semaphore.reset();
-			m_pipeline_cache_save_mutex.unlock();
+			if (snapshot != VK_NULL_HANDLE)
+				vkDestroyPipelineCache(m_logicalDevice, snapshot, nullptr);
+			else
+			{
+				m_pipeline_cache_semaphore.reset();
+				m_pipeline_cache_save_mutex.unlock();
+			}
 		}
 		if (m_destructionRequested)
 			return;
@@ -4009,11 +4043,27 @@ void VulkanRenderer::texture_loadSlice(LatteTexture* hostTexture, sint32 width, 
 
 	draw_endRenderPass();
 
-	VkMemoryRequirements memRequirements;
-	vkGetImageMemoryRequirements(m_logicalDevice, vkImageObj->m_image, &memRequirements);
-
 	uint32 uploadSize = compressedImageSize;// memRequirements.size;
-	uint32 uploadAlignment = memRequirements.alignment;
+	// BotW-Native: the staging offset only has to be a multiple of the texel block size (and 4), and the ring aligns
+	// to 128 anyway. Upstream used the IMAGE's memory alignment (64 KB for tiled images on RADV): every small mip of a
+	// load took 64 KB of ring, a 4000-upload area load grew staging by ~230 MB (new 32 MB buffers mid-burst).
+	// 3-byte-multiple formats keep the old alignment (128 is not a multiple of their texel size).
+	uint32 uploadAlignment = 128;
+	switch (vkImageObj->m_format)
+	{
+	case VK_FORMAT_R8G8B8_UNORM: case VK_FORMAT_R8G8B8_SNORM: case VK_FORMAT_R8G8B8_SRGB: case VK_FORMAT_R8G8B8_UINT: case VK_FORMAT_R8G8B8_SINT:
+	case VK_FORMAT_B8G8R8_UNORM: case VK_FORMAT_B8G8R8_SNORM: case VK_FORMAT_B8G8R8_SRGB: case VK_FORMAT_B8G8R8_UINT: case VK_FORMAT_B8G8R8_SINT:
+	case VK_FORMAT_R16G16B16_UNORM: case VK_FORMAT_R16G16B16_SNORM: case VK_FORMAT_R16G16B16_UINT: case VK_FORMAT_R16G16B16_SINT: case VK_FORMAT_R16G16B16_SFLOAT:
+	case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32_SINT: case VK_FORMAT_R32G32B32_SFLOAT:
+	{
+		VkMemoryRequirements memRequirements;
+		vkGetImageMemoryRequirements(m_logicalDevice, vkImageObj->m_image, &memRequirements);
+		uploadAlignment = memRequirements.alignment;
+		break;
+	}
+	default:
+		break;
+	}
 
 	VKRSynchronizedRingAllocator& vkMemAllocator = memoryManager->getStagingAllocator();
 
@@ -4134,12 +4184,18 @@ void VulkanRenderer::texture_endUploadBatch()
 	barrier_calcStageAndMask<ANY_TRANSFER>(postSrc, postSrcAccess);
 	barrier_calcStageAndMask<ANY_TRANSFER | IMAGE_READ | IMAGE_WRITE>(postDst, postDstAccess);
 	std::vector<VkImageMemoryBarrier> pre, post;
+	// the slices of a 3D texture share one barrier range: one barrier per (texture, mip, layer), first occurrence.
+	// Large batches (83-slice terrain arrays, ~900 uploads) use a set instead of the quadratic scan.
+	std::set<std::tuple<LatteTextureVk*, uint32, uint32>> seenSet;
 	for (size_t i = 0; i < batch.size(); i++)
 	{
 		const PendingUpload& u = batch[i];
-		bool seen = false;  // the slices of a 3D texture share one barrier range
-		for (size_t j = 0; j < i && !seen; j++)
-			seen = batch[j].tex == u.tex && batch[j].range.baseMipLevel == u.range.baseMipLevel && batch[j].range.baseArrayLayer == u.range.baseArrayLayer;
+		bool seen = false;
+		if (batch.size() > 32)
+			seen = !seenSet.emplace(u.tex, u.range.baseMipLevel, u.range.baseArrayLayer).second;
+		else
+			for (size_t j = 0; j < i && !seen; j++)
+				seen = batch[j].tex == u.tex && batch[j].range.baseMipLevel == u.range.baseMipLevel && batch[j].range.baseArrayLayer == u.range.baseArrayLayer;
 		if (seen)
 			continue;
 		VkImageSubresourceRange r = u.range;

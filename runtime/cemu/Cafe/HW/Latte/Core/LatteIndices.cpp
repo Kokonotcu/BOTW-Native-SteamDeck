@@ -65,8 +65,20 @@ namespace
 			return (size_t)(h ^ (h >> 29));
 		}
 	};
+	using PersistentByAddr = std::multimap<uintptr_t, PersistentKey>;
+	PersistentByAddr s_persistByAddr;  // source start -> key, for range invalidation
+	constexpr uint32 kNoEntry = 0xFFFFFFFF;
 	struct PersistentEntry
 	{
+		PersistentKey key;
+		// the entry looked up right after this one last time: BotW issues nearly the same draws in the same order every
+		// frame, so that entry is checked (full key compare) and prefetched before the hash table, whose lookups missed
+		// cache on most of the ~6000 draws a frame (robin_hood find ~6% of the GPU thread in heavy Kakariko views)
+		uint32 next;
+		bool live;
+		// this entry's s_persistByAddr node (end() for AUTO: no source); multimap iterators stay valid until erased.
+		// Erasing by equal_range scan made each over-budget trim (~6800 erases) a 16-20 ms GPU-thread spike every ~44 s.
+		PersistentByAddr::iterator addrIt;
 		uint64 lastUsed;
 		uint32 inputBytes;
 		uint32 outputBytes;
@@ -77,10 +89,13 @@ namespace
 	};
 	// converted index bytes kept (host-visible GTT memory); TEST: BOTW_INDEX_CACHE_KB=<n> to force trims
 	const uint64 kPersistentBudget = getenv("BOTW_INDEX_CACHE_KB") ? atoll(getenv("BOTW_INDEX_CACHE_KB")) * 1024ull : 32ull * 1024 * 1024;
-	// flat (entries inline): the node-based std::unordered_map lookup was 9.4% of LatteThread (PC call stacks, b76)
-	using PersistentMap = robin_hood::unordered_flat_map<PersistentKey, PersistentEntry, PersistentKeyHash>;
+	// key -> index into s_entries (stable: the successor links and the prefetch need indices that do not move)
+	// flat: the node-based std::unordered_map lookup was 9.4% of LatteThread (PC call stacks, b76)
+	using PersistentMap = robin_hood::unordered_flat_map<PersistentKey, uint32, PersistentKeyHash>;
 	PersistentMap s_persist;
-	std::multimap<uintptr_t, PersistentKey> s_persistByAddr;  // source start -> key, for range invalidation
+	std::vector<PersistentEntry> s_entries;
+	std::vector<uint32> s_freeEntries;
+	uint32 s_lastEntry = kNoEntry;  // the entry the previous draw used
 	uint64 s_persistBytes = 0;
 	uint32 s_persistMaxInput = 0;  // largest cached source range: bounds the invalidation lookback
 	uintptr_t s_persistLo = UINTPTR_MAX, s_persistHi = 0;  // span of cached sources (quick reject)
@@ -101,29 +116,31 @@ namespace
 		return on;
 	}
 
-	void PersistentErase(PersistentMap::iterator it)
+	void PersistentErase(uint32 idx)
 	{
-		auto range = s_persistByAddr.equal_range((uintptr_t)it->first.ptr);
-		for (auto a = range.first; a != range.second; ++a)
-		{
-			if (a->second == it->first)
-			{
-				s_persistByAddr.erase(a);
-				break;
-			}
-		}
-		if (it->second.indexAllocation.rendererInternal)
-			g_renderer->indexData_releaseIndexMemory(it->second.indexAllocation);
-		s_persistBytes -= it->second.outputBytes;
-		s_persist.erase(it);
+		PersistentEntry& e = s_entries[idx];
+		if (e.addrIt != s_persistByAddr.end())
+			s_persistByAddr.erase(e.addrIt);
+		if (e.indexAllocation.rendererInternal)
+			g_renderer->indexData_releaseIndexMemory(e.indexAllocation);
+		s_persistBytes -= e.outputBytes;
+		s_persist.erase(e.key);
+		e.live = false;  // links from other entries to this index fail the live/key check
+		e.next = kNoEntry;
+		s_freeEntries.push_back(idx);
+		if (s_lastEntry == idx)
+			s_lastEntry = kNoEntry;
 	}
 
 	void PersistentClear()
 	{
-		for (auto& [k, e] : s_persist)
-			if (e.indexAllocation.rendererInternal)
+		for (auto& e : s_entries)
+			if (e.live && e.indexAllocation.rendererInternal)
 				g_renderer->indexData_releaseIndexMemory(e.indexAllocation);
 		s_persist.clear();
+		s_entries.clear();
+		s_freeEntries.clear();
+		s_lastEntry = kNoEntry;
 		s_persistByAddr.clear();
 		s_persistBytes = 0;
 		s_persistMaxInput = 0;
@@ -140,10 +157,10 @@ namespace
 		{
 			auto it = s_persist.find(a->second);
 			++a;
-			if (it != s_persist.end() && (uintptr_t)it->first.ptr + it->second.inputBytes > lo)
+			if (it != s_persist.end() && (uintptr_t)it->first.ptr + s_entries[it->second].inputBytes > lo)
 			{
 				// PersistentErase removes the multimap node of this key; `a` already points past it
-				PersistentErase(it);
+				PersistentErase(it->second);
 				s_statInvalidated++;
 			}
 		}
@@ -156,20 +173,17 @@ namespace
 			return;
 		std::vector<uint64> ages;
 		ages.reserve(s_persist.size());
-		for (auto& [k, e] : s_persist)
-			ages.push_back(e.lastUsed);
+		for (auto& e : s_entries)
+			if (e.live)
+				ages.push_back(e.lastUsed);
 		std::nth_element(ages.begin(), ages.begin() + ages.size() / 2, ages.end());
 		const uint64 cut = ages[ages.size() / 2];
 		static uint32 s_trims = 0;
 		if ((++s_trims & (s_trims - 1)) == 0)  // 1st, 2nd, 4th, 8th... trim
 			cemuLog_log(LogType::Force, "index cache: trim #{} at {} KB, {} entries", s_trims, s_persistBytes / 1024, s_persist.size());
-		// a flat map erase moves other entries: collect first, erase after
-		std::vector<PersistentKey> drop;
-		for (auto& [k, e] : s_persist)
-			if (e.lastUsed <= cut && !(k == keep))
-				drop.push_back(k);
-		for (auto& k : drop)
-			PersistentErase(s_persist.find(k));
+		for (uint32 i = 0; i < (uint32)s_entries.size(); i++)
+			if (s_entries[i].live && s_entries[i].lastUsed <= cut && !(s_entries[i].key == keep))
+				PersistentErase(i);
 	}
 }
 
@@ -826,14 +840,34 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
 		// flushes the game made before submitting this draw invalidate cached indices first (upstream processed the
 		// queue only after the index decode, in LatteBufferCache_Sync)
 		LatteBufferCache_processDCFlushQueue();
-		auto hit = s_persist.find(PersistentKey{indexData, count, primitiveMode, indexType});
-		if (hit != s_persist.end())
+		const PersistentKey key{indexData, count, primitiveMode, indexType};
+		uint32 idx = kNoEntry;
+		const uint32 predicted = s_lastEntry != kNoEntry ? s_entries[s_lastEntry].next : kNoEntry;
+		if (predicted != kNoEntry && s_entries[predicted].live && s_entries[predicted].key == key)
+			idx = predicted;
+		else
 		{
-			indexMax = hit->second.indexMax;
-			renderIndexType = hit->second.renderIndexType;
-			outputCount = hit->second.outputCount;
-			indexAllocation = hit->second.indexAllocation;
-			hit->second.lastUsed = LatteIndices_GetNextUsageIndex();
+			auto found = s_persist.find(key);
+			if (found != s_persist.end())
+				idx = found->second;
+			if (idx != kNoEntry && s_lastEntry != kNoEntry)
+				s_entries[s_lastEntry].next = idx;
+		}
+		if (idx != kNoEntry)
+		{
+			PersistentEntry& hit = s_entries[idx];
+			indexMax = hit.indexMax;
+			renderIndexType = hit.renderIndexType;
+			outputCount = hit.outputCount;
+			indexAllocation = hit.indexAllocation;
+			hit.lastUsed = LatteIndices_GetNextUsageIndex();
+			s_lastEntry = idx;
+			if (hit.next != kNoEntry)
+			{
+				const char* p = (const char*)&s_entries[hit.next];
+				__builtin_prefetch(p);
+				__builtin_prefetch(p + sizeof(PersistentEntry) - 1);
+			}
 			if (telem::on())  // statistics: telemetry only
 			{
 				s_statHits++;
@@ -1044,11 +1078,27 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
 		const bool hasSource = indexType != LatteIndexType::AUTO;  // AUTO: generated indices, no guest data to watch
 		const uint32 inputBytes = !hasSource ? 0 : count * (indexType == LatteIndexType::U32_BE || indexType == LatteIndexType::U32_LE ? 4 : 2);
 		const PersistentKey key{indexData, count, primitiveMode, indexType};
-		s_persist[key] = PersistentEntry{LatteIndices_GetNextUsageIndex(), inputBytes, indexOutputSize, indexMax,
+		uint32 idx;
+		if (!s_freeEntries.empty())
+		{
+			idx = s_freeEntries.back();
+			s_freeEntries.pop_back();
+		}
+		else
+		{
+			idx = (uint32)s_entries.size();
+			s_entries.emplace_back();
+		}
+		s_entries[idx] = PersistentEntry{key, kNoEntry, true,
+		                                 hasSource ? s_persistByAddr.emplace((uintptr_t)indexData, key) : s_persistByAddr.end(),
+		                                 LatteIndices_GetNextUsageIndex(), inputBytes, indexOutputSize, indexMax,
 		                                 renderIndexType, outputCount, indexAllocation};
+		s_persist[key] = idx;
+		if (s_lastEntry != kNoEntry)
+			s_entries[s_lastEntry].next = idx;
+		s_lastEntry = idx;
 		if (hasSource)
 		{
-			s_persistByAddr.emplace((uintptr_t)indexData, key);
 			s_persistMaxInput = std::max(s_persistMaxInput, inputBytes);
 			s_persistLo = std::min(s_persistLo, (uintptr_t)indexData);
 			s_persistHi = std::max(s_persistHi, (uintptr_t)indexData + inputBytes);

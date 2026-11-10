@@ -647,6 +647,8 @@ void LatteTextureLoader_UpdateTextureSliceData(LatteTexture* tex, uint32 sliceIn
 	{
 		texDecoder->decode(&textureLoader, pixelData);
 	}
+	else
+		memset(pixelData, 0, imageSize);  // the upload buffer is reused without clearing; upstream uploaded zeros here
 #ifdef BENCHMARK_TEXTURE_DECODING
 	QueryPerformanceCounter(&benchmark_end);
 	QueryPerformanceFrequency(&benchmark_freq);
@@ -704,6 +706,9 @@ namespace
 	class TextureDecodeTeam
 	{
 	public:
+		// The caller waits only for helpers that joined this job: one still asleep when the caller has taken the
+		// last item finds the job closed and skips it (the caller no longer waits out helper wake-up latency, which
+		// made the team useless for small textures).
 		void run(size_t count, const std::function<void(size_t)>& fn)
 		{
 			{
@@ -714,13 +719,15 @@ namespace
 				m_fn = &fn;
 				m_count = count;
 				m_next = 0;
-				m_busy = kHelpers;
+				m_active = 0;
+				m_open = true;
 				m_generation++;
 			}
 			m_wake.notify_all();
 			work();
 			std::unique_lock lock(m_mutex);
-			m_idle.wait(lock, [this] { return m_busy == 0; });
+			m_open = false;  // every item is taken: no helper may join any more
+			m_idle.wait(lock, [this] { return m_active == 0; });
 		}
 
 	private:
@@ -746,10 +753,13 @@ namespace
 			{
 				m_wake.wait(lock, [&] { return m_generation != seen; });
 				seen = m_generation;
+				if (!m_open)
+					continue;  // woke after the caller took the last item
+				m_active++;
 				lock.unlock();
 				work();
 				lock.lock();
-				if (--m_busy == 0)
+				if (--m_active == 0 && !m_open)
 					m_idle.notify_one();
 			}
 		}
@@ -760,7 +770,8 @@ namespace
 		const std::function<void(size_t)>* m_fn{};
 		size_t m_count{};
 		std::atomic<size_t> m_next{};
-		int m_busy{};
+		int m_active{};
+		bool m_open{};
 		uint64 m_generation{};
 	};
 	TextureDecodeTeam* s_textureDecodeTeam = new TextureDecodeTeam();  // never destroyed: the helpers run until exit
@@ -794,7 +805,7 @@ void LatteTextureLoader_UpdateTextureSlices(LatteTexture* tex, const std::vector
 		imageSize[i] = texDecoder->calculateImageSize(&c);
 		offset[i + 1] = offset[i] + ((imageSize[i] + 63) & ~(size_t)63);
 	}
-	if (offset.back() < 256 * 1024)
+	if (offset.back() < 64 * 1024)  // was 256 KB while the caller had to wait for every helper to wake up
 	{
 		oneByOne();
 		return;

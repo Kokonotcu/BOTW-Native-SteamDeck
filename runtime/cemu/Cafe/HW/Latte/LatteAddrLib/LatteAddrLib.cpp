@@ -998,7 +998,41 @@ namespace LatteAddrLib
 		return COMPUTE_SURFACE_RESULT::RESULT_OK;
 	}
 
+	static void GX2CalculateSurfaceInfoUncached(Latte::E_GX2SURFFMT surfaceFormat, uint32 surfaceWidth, uint32 surfaceHeight, uint32 surfaceDepth, E_DIM surfaceDim, E_GX2TILEMODE surfaceTileMode, uint32 surfaceAA, uint32 level, AddrSurfaceInfo_OUT* pSurfOut, bool optimizeForDepthBuffer, bool optimizeForScanBuffer);
+
+	// BotW-Native: memoized (the function is pure). CalculateMipAndSliceAddr / CalculateMipOffset recompute every lower
+	// mip level for each (slice, mip) they are asked about: quadratic in mips times slices per texture load.
 	void GX2CalculateSurfaceInfo(Latte::E_GX2SURFFMT surfaceFormat, uint32 surfaceWidth, uint32 surfaceHeight, uint32 surfaceDepth, E_DIM surfaceDim, E_GX2TILEMODE surfaceTileMode, uint32 surfaceAA, uint32 level, AddrSurfaceInfo_OUT* pSurfOut, bool optimizeForDepthBuffer, bool optimizeForScanBuffer)
+	{
+		struct Key
+		{
+			uint32 format, width, height, depth, dim, tileMode, aa, level, flags;
+			bool operator==(const Key& o) const { return memcmp(this, &o, sizeof(Key)) == 0; }
+		};
+		struct Entry
+		{
+			Key key;
+			bool valid;
+			AddrSurfaceInfo_OUT out;
+		};
+		static thread_local Entry s_cache[64];
+		const Key key{(uint32)surfaceFormat, surfaceWidth, surfaceHeight, surfaceDepth, (uint32)surfaceDim, (uint32)surfaceTileMode, surfaceAA, level,
+		              (optimizeForDepthBuffer ? 1u : 0u) | (optimizeForScanBuffer ? 2u : 0u)};
+		uint32 h = key.format * 0x9E3779B1u ^ key.width * 0x85EBCA77u ^ key.height * 0xC2B2AE3Du ^ key.depth * 0x27D4EB2Fu ^
+		           key.dim * 0x165667B1u ^ key.tileMode * 0xD3A2646Cu ^ key.aa * 0xFD7046C5u ^ key.level * 0xB55A4F09u ^ key.flags;
+		Entry& e = s_cache[(h ^ (h >> 15)) & 63];
+		if (e.valid && e.key == key)
+		{
+			*pSurfOut = e.out;
+			return;
+		}
+		GX2CalculateSurfaceInfoUncached(surfaceFormat, surfaceWidth, surfaceHeight, surfaceDepth, surfaceDim, surfaceTileMode, surfaceAA, level, pSurfOut, optimizeForDepthBuffer, optimizeForScanBuffer);
+		e.key = key;
+		e.out = *pSurfOut;
+		e.valid = true;
+	}
+
+	static void GX2CalculateSurfaceInfoUncached(Latte::E_GX2SURFFMT surfaceFormat, uint32 surfaceWidth, uint32 surfaceHeight, uint32 surfaceDepth, E_DIM surfaceDim, E_GX2TILEMODE surfaceTileMode, uint32 surfaceAA, uint32 level, AddrSurfaceInfo_OUT* pSurfOut, bool optimizeForDepthBuffer, bool optimizeForScanBuffer)
 	{
 		AddrSurfaceInfo_IN surfInfoIn = { 0 };
 		Latte::E_HWFMT hwFormat = Latte::GetHWFormat(surfaceFormat);

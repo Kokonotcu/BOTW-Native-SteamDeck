@@ -9,6 +9,10 @@
 #include <glslang/Public/ShaderLang.h>
 #include <glslang/SPIRV/GlslangToSpv.h>
 #include "util/helpers/helpers.h"
+#if BOOST_OS_LINUX
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 bool s_isLoadingShadersVk{ false };
 class FileCache* s_spirvCache{nullptr};
@@ -159,6 +163,13 @@ public:
 	void CompilerThreadFunc()
 	{
 		SetThreadName("vkShaderComp");
+#if BOOST_OS_LINUX
+		// BotW-Native: as the pipeline compile threads (VulkanPipelineCompiler.cpp): all but one below normal, so a new
+		// area's compile burst yields to the game's worker threads
+		static std::atomic<uint32> s_threadIndex{0};
+		if (s_threadIndex.fetch_add(1) != 0)
+			setpriority(PRIO_PROCESS, (id_t)gettid(), 5);
+#endif
 		while (m_threadsActive.load(std::memory_order::relaxed))
 		{
 			s_compilationQueueCount.decrementWithWait();

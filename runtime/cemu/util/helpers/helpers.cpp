@@ -4,6 +4,10 @@
 #include <functional> 
 #include <cctype>
 #include <random>
+#include <fstream>
+#include <set>
+#include <string>
+#include <thread>
 
 #include "config/ActiveSettings.h"
 
@@ -279,6 +283,21 @@ uint32_t GetPhysicalCoreCount()
 
 	s_core_count = core_count;
 	return core_count;
+#elif BOOST_OS_LINUX
+	// BotW-Native: physical cores (distinct SMT sibling sets), as on Windows. Upstream returned the logical count, so
+	// the Steam Deck ran 7 pipeline + 4 shader compile threads on 4 cores; a new area's compile burst then took the
+	// game's worker CPUs (session 20261110-045652: main waited 15-22 ms on workers for half a second).
+	uint32_t logical = std::thread::hardware_concurrency();
+	std::set<std::string> siblings;
+	for (uint32_t i = 0; i < logical; i++)
+	{
+		std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(i) + "/topology/thread_siblings_list");
+		std::string s;
+		if (f && std::getline(f, s) && !s.empty())
+			siblings.insert(s);
+	}
+	s_core_count = (!siblings.empty() && siblings.size() <= logical) ? (uint32_t)siblings.size() : logical;
+	return s_core_count;
 #else
 	return std::thread::hardware_concurrency();
 #endif

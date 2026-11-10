@@ -288,10 +288,28 @@ void VKRSynchronizedHeapAllocator::GetStats(uint32& numBuffers, size_t& totalBuf
 VkTextureChunkedHeap::~VkTextureChunkedHeap()
 {
 	VkDevice device = VulkanRenderer::GetInstance()->GetLogicalDevice();
+	if (m_spareThread.joinable())
+		m_spareThread.join();
+	if (m_spareMem != VK_NULL_HANDLE)
+		vkFreeMemory(device, m_spareMem, nullptr);
 	for (auto& i : m_list_chunkInfo)
 	{
 		vkFreeMemory(device, i.mem, nullptr);
 	}
+}
+
+// memory types to try for a chunk, in order: device local first, unless that would overflow the VRAM carve-out
+void VkTextureChunkedHeap::chooseMemoryTypes(uint32 allocationSize, std::vector<uint32>& deviceLocalMemoryTypeIndices, std::vector<uint32>& hostLocalMemoryTypeIndices)
+{
+	deviceLocalMemoryTypeIndices = m_vkrMemoryManager->FindMemoryTypes(m_typeFilter, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+	hostLocalMemoryTypeIndices = m_vkrMemoryManager->FindMemoryTypes(m_typeFilter, 0);
+	// remove device local memory types from host local vector
+	auto pred = [&deviceLocalMemoryTypeIndices](const uint32& v) -> bool {
+		return std::find(deviceLocalMemoryTypeIndices.begin(), deviceLocalMemoryTypeIndices.end(), v) != deviceLocalMemoryTypeIndices.end();
+	};
+	hostLocalMemoryTypeIndices.erase(std::remove_if(hostLocalMemoryTypeIndices.begin(), hostLocalMemoryTypeIndices.end(), pred), hostLocalMemoryTypeIndices.end());
+	if (!hostLocalMemoryTypeIndices.empty() && !deviceLocalMemoryTypeIndices.empty() && m_vkrMemoryManager->VramWouldOverflow(deviceLocalMemoryTypeIndices[0], allocationSize))
+		std::swap(deviceLocalMemoryTypeIndices, hostLocalMemoryTypeIndices);
 }
 
 uint32 VkTextureChunkedHeap::allocateNewChunk(uint32 chunkIndex, uint32 minimumAllocationSize)
@@ -302,7 +320,8 @@ uint32 VkTextureChunkedHeap::allocateNewChunk(uint32 chunkIndex, uint32 minimumA
 	// pad minimumAllocationSize to 32KB alignment
 	minimumAllocationSize = (minimumAllocationSize + (32 * 1024 - 1)) & ~(32 * 1024 - 1);
 
-	uint32 allocationSize = 1024 * 1024 * 128;
+	constexpr uint32 kChunkSize = 1024 * 1024 * 128;
+	uint32 allocationSize = kChunkSize;
 	if (chunkIndex == 0)
 	{
 		// make the first allocation smaller, this decreases wasted memory when there are textures that require specific flags (and thus separate heaps)
@@ -310,20 +329,56 @@ uint32 VkTextureChunkedHeap::allocateNewChunk(uint32 chunkIndex, uint32 minimumA
 	}
 	if (allocationSize < minimumAllocationSize)
 		allocationSize = minimumAllocationSize;
-	// get available memory types/heaps
-	std::vector<uint32> deviceLocalMemoryTypeIndices = m_vkrMemoryManager->FindMemoryTypes(m_typeFilter, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-	std::vector<uint32> hostLocalMemoryTypeIndices = m_vkrMemoryManager->FindMemoryTypes(m_typeFilter, 0);
-	// remove device local memory types from host local vector
-	auto pred = [&deviceLocalMemoryTypeIndices](const uint32& v) -> bool {
-		return std::find(deviceLocalMemoryTypeIndices.begin(), deviceLocalMemoryTypeIndices.end(), v) != deviceLocalMemoryTypeIndices.end();
+
+	VkDevice device = VulkanRenderer::GetInstance()->GetLogicalDevice();
+	// the next full-size chunk, allocated on a helper thread ahead of need
+	auto startSpare = [this, device]() {
+		std::vector<uint32> first, second;
+		chooseMemoryTypes(kChunkSize, first, second);
+		if (first.empty())
+			return;
+		const uint32 type = first[0];
+		m_spareThread = std::thread([this, device, type]() {
+			VkMemoryAllocateInfo allocInfo{};
+			allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+			allocInfo.allocationSize = kChunkSize;
+			allocInfo.memoryTypeIndex = type;
+			VkDeviceMemory mem;
+			if (vkAllocateMemory(device, &allocInfo, nullptr, &mem) == VK_SUCCESS)
+			{
+				m_spareMem = mem;
+				m_spareSize = kChunkSize;
+				m_spareType = type;
+			}
+		});
 	};
-	hostLocalMemoryTypeIndices.erase(std::remove_if(hostLocalMemoryTypeIndices.begin(), hostLocalMemoryTypeIndices.end(), pred), hostLocalMemoryTypeIndices.end());
+	if (m_spareThread.joinable())
+		m_spareThread.join();
+	if (m_spareMem != VK_NULL_HANDLE)
+	{
+		// a device-local spare already counts in the carve-out usage: check the policy without adding it again
+		VkPhysicalDeviceMemoryProperties memProperties;
+		vkGetPhysicalDeviceMemoryProperties(VulkanRenderer::GetInstance()->GetPhysicalDevice(), &memProperties);
+		const bool spareIsVram = (memProperties.memoryTypes[m_spareType].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+		std::vector<uint32> first, second;
+		chooseMemoryTypes(spareIsVram ? 0 : allocationSize, first, second);
+		const VkDeviceMemory spare = m_spareMem;
+		m_spareMem = VK_NULL_HANDLE;
+		if (m_spareSize == allocationSize && !first.empty() && first[0] == m_spareType)
+		{
+			m_list_chunkInfo[chunkIndex].mem = spare;
+			startSpare();
+			return allocationSize;
+		}
+		vkFreeMemory(device, spare, nullptr);
+	}
+	// get available memory types/heaps
 	// BotW-Native: keep VRAM under its budget. On the Deck "VRAM" is a 1 GB carve-out of the same RAM as system memory;
 	// RADV lets allocations exceed it and the kernel then moves buffers between VRAM and system memory during
 	// submissions, which stalled the GPU in bursts (frames at half speed with the same work, VRAM at 990 of 1024 MB).
-	// Texture chunks that would not fit go to system memory up front instead. BOTW_VRAM_SPILL=0 off.
-	if (!hostLocalMemoryTypeIndices.empty() && !deviceLocalMemoryTypeIndices.empty() && m_vkrMemoryManager->VramWouldOverflow(deviceLocalMemoryTypeIndices[0], allocationSize))
-		std::swap(deviceLocalMemoryTypeIndices, hostLocalMemoryTypeIndices);
+	// Texture chunks that would not fit go to system memory up front instead (chooseMemoryTypes). BOTW_VRAM_SPILL=0 off.
+	std::vector<uint32> deviceLocalMemoryTypeIndices, hostLocalMemoryTypeIndices;
+	chooseMemoryTypes(allocationSize, deviceLocalMemoryTypeIndices, hostLocalMemoryTypeIndices);
 	// allocate chunk memory
 	for (sint32 t = 0; t < 3; t++)
 	{
@@ -340,6 +395,8 @@ uint32 VkTextureChunkedHeap::allocateNewChunk(uint32 chunkIndex, uint32 minimumA
 			if (r != VK_SUCCESS)
 				continue;
 			m_list_chunkInfo[chunkIndex].mem = imageMemory;
+			if (allocationSize == kChunkSize)
+				startSpare();
 			return allocationSize;
 		}
 		// attempt to allocate from host-local memory
@@ -355,6 +412,8 @@ uint32 VkTextureChunkedHeap::allocateNewChunk(uint32 chunkIndex, uint32 minimumA
 			if (r != VK_SUCCESS)
 				continue;
 			m_list_chunkInfo[chunkIndex].mem = imageMemory;
+			if (allocationSize == kChunkSize)
+				startSpare();
 			return allocationSize;
 		}
 		// retry with smaller size if possible

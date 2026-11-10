@@ -46,7 +46,9 @@ uint32 VulkanPipelineStableCache::BeginLoading(uint64 cacheTitleId)
 	m_compilationQueue.clear();
 
 	// get core count
-	uint32 cpuCoreCount = GetPhysicalCoreCount();
+	// BotW-Native: logical CPUs here (boot-time precompile behind the loading screen, threads end with EndLoading);
+	// GetPhysicalCoreCount now counts physical cores on Linux, which only the in-game compile pools should use
+	uint32 cpuCoreCount = std::max(1u, std::thread::hardware_concurrency());
 	m_numCompilationThreads = std::clamp(cpuCoreCount, 1u, 8u);
 	if (VulkanRenderer::GetInstance()->GetDisableMultithreadedCompilation())
 		m_numCompilationThreads = 1;

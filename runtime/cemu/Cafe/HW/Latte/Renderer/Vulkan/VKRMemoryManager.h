@@ -3,6 +3,7 @@
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
 #include "util/ChunkedHeap/ChunkedHeap.h"
 #include "util/helpers/MemoryPool.h"
+#include <thread>
 
 enum class VKR_BUFFER_TYPE
 {
@@ -87,10 +88,17 @@ public:
 
   private:
 	uint32 allocateNewChunk(uint32 chunkIndex, uint32 minimumAllocationSize) override;
+	void chooseMemoryTypes(uint32 allocationSize, std::vector<uint32>& first, std::vector<uint32>& second);
 
 	uint32 m_typeFilter{ 0xFFFFFFFF };
 	class VKRMemoryManager* m_vkrMemoryManager;
 	std::vector<ChunkInfo> m_list_chunkInfo;
+	// BotW-Native: the next 128 MB chunk is allocated ahead on a helper thread (the kernel clears the memory: 10-20 ms
+	// of GPU-thread time when a streaming burst needed a new chunk). Used only if size and memory type still match.
+	std::thread m_spareThread;
+	VkDeviceMemory m_spareMem{ VK_NULL_HANDLE };
+	uint32 m_spareSize{ 0 };
+	uint32 m_spareType{ 0xFFFFFFFF };
 };
 
 class VkBufferChunkedHeap : private ChunkedHeap<>
@@ -282,7 +290,8 @@ public:
 	void TextureUploadBufferRelease(uint8* mem)
 	{
 		cemu_assert_debug(m_textureUploadBuffer.data() == mem);
-		m_textureUploadBuffer.clear();
+		// BotW-Native: size kept: clear() made every acquire's resize() zero-fill the whole image before the decoder
+		// overwrote it (one memset per uploaded slice). Decoders write every byte, as the parallel path relies on.
 	}
 
 	VKRSynchronizedRingAllocator& getStagingAllocator() { return m_stagingBuffer; }; // allocator for texture/attribute/uniform uploads
