@@ -38,7 +38,7 @@ const char* const kModeNames[kDrcModeCount] = {"window", "pip", "auto", "off", "
 const char* const kCornerNames[4] = {"tl", "tr", "bl", "br"};
 const char* const kFilterNames[3] = {"smooth", "sharp", "integer"};
 
-std::atomic<int> g_mode{kDrcWindow};
+std::atomic<int> g_mode{kDrcOff};  // TV picture only
 std::atomic<int> g_corner{3};
 std::atomic<float> g_pip_size{0.25f};
 std::atomic<float> g_pip_opacity{1.0f};
@@ -157,7 +157,7 @@ static std::atomic<double> g_plus_at{-1};      // display_now() of the last +, -
 // (render thread; Metal: a completion handler), read by the hosts when they save the view
 static std::atomic<int> g_pause_restore{-1};
 static std::atomic<double> g_pause_since{0};
-static bool pause_switchable(int mode) { return mode == kDrcPip || mode == kDrcOff || mode == kDrcAuto; }
+static bool pause_switchable(int mode) { return mode == kDrcPip || mode == kDrcAuto; }
 void display_plus_pressed() {
     // only when the view can switch (or the switch is up: + resumes); other views never sample
     if (g_pause_view && (pause_switchable(g_mode) || g_pause_restore >= 0)) g_plus_at = display_now();

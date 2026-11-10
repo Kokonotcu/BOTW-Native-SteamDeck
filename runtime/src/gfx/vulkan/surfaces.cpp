@@ -1161,11 +1161,11 @@ void upload_surface(Surface* s) {
             packed=std::move(data);
             VkBufferImageCopy copy{};copy.imageSubresource={s->aspect,level,0,layers};copy.imageExtent={w,h,threeD?slices:1};copies.push_back(copy);
         }
-        Buffer staging=create_buffer(packed.size(),VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if(!staging.mapped){defer_buffer(staging);throw std::runtime_error("Vulkan texture staging allocation is not mapped");}
+        UploadSlice staging=allocate_upload(packed.size(),16);
+        if(!staging.mapped)throw std::runtime_error("Vulkan texture staging allocation is not mapped");
         memcpy(staging.mapped,packed.data(),packed.size());
+        for(auto& c:copies)c.bufferOffset+=staging.offset;
         vkCmdCopyBufferToImage(command_buffer(),staging.buffer,s->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,uint32_t(copies.size()),copies.data());
-        defer_buffer(staging);
     }
     transition_image(s,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     s->contentHash=hash;s->writeSeq=next_write_seq();s->dirty=false;++g_stat_uploads;
@@ -1389,6 +1389,8 @@ void copy_surface(uint32_t src,uint32_t srcMip,uint32_t srcSlice,uint32_t dst,ui
 void invalidate(uint32_t flags,uint32_t addr,uint32_t size) {
     buffer_cache_guest_invalidate(flags,addr,size);
     ++g_stat_invalidates;if(!(flags&2)||size>=0x10000000)return;
+    // write tracking sees every CPU write into an uploaded texture (upload_surface): nothing to mark
+    if(wwatch::active())return;
     uint64_t end=uint64_t(addr)+size;
     for(auto& [base,s]:R.surfaces) {
         if(s->gpuWritten||(base>=0xF4000000&&base<0xF6000000))continue;

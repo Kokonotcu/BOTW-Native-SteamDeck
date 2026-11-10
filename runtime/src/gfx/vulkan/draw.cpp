@@ -1421,9 +1421,10 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
     feedbackStats.stencil+=bool(source->aspect&VK_IMAGE_ASPECT_STENCIL_BIT);
     feedbackStats.compressed+=source->fmt.compressed;
   }
+  // WWHD_VK_REUSE_FEEDBACK_IMAGES=0: a new image per copy (each one a driver memory allocation)
   static const bool reuse = [] {
     const char* e = std::getenv("WWHD_VK_REUSE_FEEDBACK_IMAGES");
-    return e && !std::strcmp(e, "1");
+    return !e || std::strcmp(e, "0");
   }();
   Surface temporary;
   Surface* copy = &temporary;
@@ -1539,6 +1540,17 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
   VkImageView view = sampled_texture_view(copy, textureWords);
   destroy_surface_image(&temporary); // Temporary snapshots remain fence-retired.
   return view;
+}
+// images this draw samples while rendering into them (bind_stage): attached and sampled in GENERAL layout
+std::array<VkImage, 18> generalImages{};
+uint32_t generalCount = 0;
+bool feedback_general(const Surface* s) {
+  for (uint32_t i = 0; i < generalCount; i++) if (generalImages[i] == s->image) return true;
+  return false;
+}
+bool feedback_copies() {
+  static const bool on = [] { const char* e = std::getenv("WWHD_VK_FEEDBACK_COPY"); return e && !std::strcmp(e, "1"); }();
+  return on;
 }
 StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                           VkDescriptorSetLayout layout, bool dynamicUniforms, float sx, float sy,
@@ -1702,9 +1714,15 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     for (auto *color : colors)
       if (color && s->image == color->image)
         aliases = true;
+    const bool general = aliases && !feedback_copies();
+    if (general) {
+      if (!feedback_general(s) && generalCount < generalImages.size()) generalImages[generalCount++] = s->image;
+      transition_image(s, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                       VK_ACCESS_SHADER_READ_BIT);
+    }
     VkImageView sampledView =
-        aliases ? feedback_view(s, r + texbase + unit * 7, sh->vertex, unit, feedbackProbe)
-                : sampled_texture_view(s, r + texbase + unit * 7);
+        aliases && !general ? feedback_view(s, r + texbase + unit * 7, sh->vertex, unit, feedbackProbe)
+                            : sampled_texture_view(s, r + texbase + unit * 7);
     if (!aliases)
       transition_image(s, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        narrow_barriers()
@@ -1735,7 +1753,7 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                    s->fmt.kind != FormatInfo::FLOAT,
                    !s->gpuWritten && s->mips > 1),
                              sampledView,
-                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                             general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     auto &write = appendWrite(rankPlan.textures[unit]);
     write.dstBinding = binding;
     write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -2043,6 +2061,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   if(vertex_window_stats_enabled()) report_vertex_window_stats();
   FeedbackStatsProbe feedbackProbe;
   auto* probe=feedback_stats_enabled()?&feedbackProbe:nullptr;
+  generalCount = 0;
   auto vres = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, sx, sy, colors, depth, probe);
   auto pres = bind_stage(r, ps, p.sets[1], p.dynamicUniforms, sx, sy, colors, depth, probe);
   // Texture uploads, feedback copies, and sampling transitions above may have
@@ -2053,9 +2072,9 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
                    R.passDepth == depth && R.passDepthSlice == depthSlice &&
                    R.passWidth == width && R.passHeight == height;
   for (auto *color : colors)
-    if (color && color->layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+    if (color && color->layout != (feedback_general(color) ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL))
       reusePass = false;
-  if (depth && depth->layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+  if (depth && depth->layout != (feedback_general(depth) ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL))
     reusePass = false;
   struct DrawStateCache {
     VkPipeline pipeline = VK_NULL_HANDLE;
@@ -2100,7 +2119,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
       if (colors[i]) {
         upload_surface(colors[i]);
-        transition_image(colors[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        if (feedback_general(colors[i])) attachments[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        transition_image(colors[i], attachments[i].imageLayout,
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                          VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
                              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
@@ -2111,13 +2131,13 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     if (depth) {
       upload_surface(depth);
-      transition_image(depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      da.imageLayout = feedback_general(depth) ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+      transition_image(depth, da.imageLayout,
                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
       da.imageView = layer_view(depth, depthSlice);
-      da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
       da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
       da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     }
