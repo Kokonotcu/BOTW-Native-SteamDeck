@@ -431,6 +431,17 @@ Surface* sampled_texture(const uint32_t* w, bool isDepthSampler) {
 }
 
 
+// one element of a texture: a fixed-size copy (inlined) for the element sizes there are
+static inline void copy_element(uint8_t* d, const uint8_t* s, uint32_t n) {
+    switch (n) {
+        case 1: *d = *s; return;
+        case 2: memcpy(d, s, 2); return;
+        case 4: memcpy(d, s, 4); return;
+        case 8: memcpy(d, s, 8); return;
+        case 16: memcpy(d, s, 16); return;
+        default: memcpy(d, s, n);
+    }
+}
 static void decode_level(Surface* s, uint32_t level, uint32_t base, std::vector<uint8_t>& out, uint32_t& outW,
                          uint32_t& outH, uint32_t& outSlices) {
     const FormatInfo& f = s->fmt;
@@ -478,7 +489,7 @@ static void decode_level(Surface* s, uint32_t level, uint32_t base, std::vector<
                             static int bad = 0;
                             if (slow != off && bad < 20) { ++bad; LOG("[detile] mismatch %ux%u fmt %X bpp %u slice %u at %u,%u: %X vs %X", w, h, s->format, bpp, z, x, y, off, slow); }
                         }
-                        memcpy(&raw[((size_t)y * fullW + x) * B], src + off, B);
+                        copy_element(&raw[((size_t)y * fullW + x) * B], src + off, B);
                     }
                 }
         }
@@ -496,7 +507,7 @@ static void decode_level(Surface* s, uint32_t level, uint32_t base, std::vector<
                     off = LatteAddrLib::ComputeSurfaceAddrFromCoordMicroTiled(x, y, z, bpp, pitch, height, tm, depthData);
                 else
                     off = LatteAddrLib::ComputeSurfaceAddrFromCoordMacroTiledCached(x, y, &ci);
-                memcpy(&row[x * B], src + off, B);
+                copy_element(&row[x * B], src + off, B);
             }
             uint8_t* dst = &out[((size_t)z * bh + y) * bw * f.hostBytesPerBlock];
             if (f.convert == Convert::NONE) memcpy(dst, row.data(), row.size());

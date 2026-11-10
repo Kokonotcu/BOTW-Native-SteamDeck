@@ -510,7 +510,7 @@ struct PipelineKey {
   std::array<uint32_t, 8> formats{};
   uint32_t depthFormat = 0, strideCount = 0;
   std::array<uint32_t, kMaxPipelineStrides> strides{};
-  uint32_t reserved = 0;  // no padding bytes: the key is hashed and compared as bytes
+  uint32_t alphaToMask = 0;  // DB_ALPHA_TO_MASK enable; also keeps the key free of padding bytes
   bool operator==(const PipelineKey& other) const {
     return !std::memcmp(this, &other, sizeof *this);
   }
@@ -573,6 +573,7 @@ PipelineKey pipeline_key(const uint32_t* r, const vk::Shader* vs, const vk::Shad
   }
   const uint32_t mode = r[REGADDR::PA_SU_SC_MODE_CNTL];
   key.raster = mode & 0x807;  // cull front/back, front face, depth bias enable
+  key.alphaToMask = r[mmDB_ALPHA_TO_MASK] & 1;
   if (mode & 0x800)
     key.depthBias = {r[REGADDR::PA_SU_POLY_OFFSET_FRONT_SCALE], r[REGADDR::PA_SU_POLY_OFFSET_FRONT_OFFSET],
                      r[REGADDR::PA_SU_POLY_OFFSET_CLAMP]};
@@ -804,6 +805,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   VkPipelineMultisampleStateCreateInfo ms{
       VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
   ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  ms.alphaToCoverageEnable = (r[mmDB_ALPHA_TO_MASK] & 1) ? VK_TRUE : VK_FALSE;
   LATTE_DB_DEPTH_CONTROL dc;
   std::memcpy(&dc, r + REGADDR::DB_DEPTH_CONTROL, 4);
   VkPipelineDepthStencilStateCreateInfo ds{
