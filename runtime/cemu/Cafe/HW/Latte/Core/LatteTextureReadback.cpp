@@ -99,6 +99,8 @@ void LatteTextureReadback_Initate(LatteTextureView* textureView)
 	sTextureScheduledReadbacks.emplace_back(queueEntry);
 }
 
+void LatteTextureLoader_JoinAsyncDecodes();  // LatteTextureLoader.cpp
+
 void LatteTextureReadback_UpdateFinishedTransfers(bool forceFinish)
 {
 	if (forceFinish)
@@ -145,6 +147,9 @@ void LatteTextureReadback_UpdateFinishedTransfers(bool forceFinish)
 		}
 #endif
 		uint8* pixelData = readbackInfo->GetData();
+		// BotW-Native: a pending asynchronous texture decode may still be reading guest memory this write overlaps
+		// (LatteTextureLoader.cpp); the synchronous decode always read it before or after, never during
+		LatteTextureLoader_JoinAsyncDecodes();
 		LatteTextureLoader_writeReadbackTextureToMemory(&readbackInfo->hostTextureCopy, readbackInfo->m_firstSlice, readbackInfo->m_firstMip, pixelData, readbackInfo->m_rowPitch);
 		readbackInfo->ReleaseData();
 		// get the original texture if it still exists and invalidate the current data hash

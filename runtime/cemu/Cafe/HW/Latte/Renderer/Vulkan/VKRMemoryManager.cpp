@@ -352,6 +352,15 @@ uint32 VkTextureChunkedHeap::allocateNewChunk(uint32 chunkIndex, uint32 minimumA
 		if (first.empty())
 			return;
 		const uint32 type = first[0];
+		// only system-memory chunks: the kernel clears those on the allocating thread (the GPU-thread hitch), while a
+		// device-local chunk is cleared by the GPU; an idle device-local spare would also hold 128 MB of the VRAM
+		// carve-out and move other allocations to system memory earlier than before
+		{
+			VkPhysicalDeviceMemoryProperties memProperties;
+			vkGetPhysicalDeviceMemoryProperties(VulkanRenderer::GetInstance()->GetPhysicalDevice(), &memProperties);
+			if (memProperties.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+				return;
+		}
 		m_spareThread = std::thread([this, device, type]() {
 			VkMemoryAllocateInfo allocInfo{};
 			allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;

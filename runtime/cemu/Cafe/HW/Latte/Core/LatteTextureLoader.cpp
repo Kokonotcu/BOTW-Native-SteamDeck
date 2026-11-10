@@ -643,7 +643,8 @@ namespace
 					lock.unlock();
 					run(job);
 					lock.lock();
-					m_pending.fetch_sub(1, std::memory_order_release);
+					if (m_pending.fetch_sub(1, std::memory_order_release) == 1)
+						m_doneCv.notify_all();  // another joiner may be waiting (today all joins are on the GPU thread)
 					continue;
 				}
 				if (m_pending.load(std::memory_order_acquire) == 0)
