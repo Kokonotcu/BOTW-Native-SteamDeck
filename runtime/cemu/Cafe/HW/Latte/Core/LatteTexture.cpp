@@ -150,8 +150,14 @@ void LatteTexture_RemoveTexMemOccupancyInterval(LatteTexture* texture, LatteText
 	}
 }
 
+// BotW-Native: the buckets of all slices/mips are collected first and each is filtered once. Upstream called
+// LatteTexture_RemoveTexMemOccupancyInterval per slice/mip, whose first call already removes every entry of the texture
+// from a bucket; the remaining calls rescanned the same crowded 2 MB buckets (an 83-slice x 11-mip array: 913 scans).
+// Texture deletions (the first wave ~120 s after an area load) cost 8+ ms of one GPU-thread frame there. Same entries
+// removed, the others keep their order.
 void LatteTexture_UnregisterTextureMemoryOccupancy(LatteTexture* texture)
 {
+	boost::container::small_vector<sint32, 16> buckets;
 	sint32 mipLevels = texture->mipLevels;
 	sint32 sliceCount = texture->depth;
 	for (sint32 mipIndex = 0; mipIndex < mipLevels; mipIndex++)
@@ -164,9 +170,15 @@ void LatteTexture_UnregisterTextureMemoryOccupancy(LatteTexture* texture)
 		for (sint32 sliceIndex = 0; sliceIndex < mipSliceCount; sliceIndex++)
 		{
 			LatteTextureSliceMipInfo* sliceMipInfo = texture->sliceMipInfo + texture->GetSliceMipArrayIndex(sliceIndex, mipIndex);
-			LatteTexture_RemoveTexMemOccupancyInterval(texture, sliceMipInfo);
+			loopItrMemOccupancyBuckets(sliceMipInfo->addrStart, sliceMipInfo->addrEnd)
+			{
+				if (std::find(buckets.begin(), buckets.end(), bucketIndex) == buckets.end())
+					buckets.push_back(bucketIndex);
+			}
 		}
 	}
+	for (sint32 bucketIndex : buckets)
+		std::erase_if(list_texMemOccupancyBucket[bucketIndex], [texture](const TexMemOccupancyEntry& e) { return e.sliceMipInfo->texture == texture; });
 }
 
 void LatteTexture_Invalidate(uint32 physAddr, uint32 size)
