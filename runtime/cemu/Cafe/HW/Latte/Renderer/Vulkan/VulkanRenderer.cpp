@@ -4668,6 +4668,14 @@ void VulkanRenderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 buffe
 	m_transferBarrierPending = true;  // was barrier_sequentializeTransfer(); issued before the next render pass
 }
 
+// The new node of a merge may sit on memory freed from other nodes that earlier draws still read; its RAM upload used
+// to carry this dependency for the whole range, now only the gaps between the merged nodes are uploaded
+void VulkanRenderer::bufferCache_beforeWrite(uint32 bufferOffset, uint32 size)
+{
+	draw_endRenderPass();
+	barrier_bufferRange<ANY_TRANSFER | BUFFER_SHADER_READ, TRANSFER_WRITE>(m_bufferCache, bufferOffset, size);
+}
+
 void VulkanRenderer::bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32 size)
 {
 	cemu_assert_debug(!m_useHostMemoryForCache);

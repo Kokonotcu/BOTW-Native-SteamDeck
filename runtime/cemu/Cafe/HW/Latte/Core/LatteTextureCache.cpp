@@ -286,15 +286,16 @@ void LatteTC_ResolvePendingHash(LatteTexture* tex, bool apply)
 	HashJobRelease(job);
 }
 
-void LatteTC_ResolvePendingHash(LatteTexture* tex)
+// for callers that store a new texDataHash2 right after (a reload's reset): the pending value is not needed
+void LatteTC_DiscardPendingHash(LatteTexture* tex)
 {
-	LatteTC_ResolvePendingHash(tex, true);
+	LatteTC_ResolvePendingHash(tex, false);
 }
 
 // LatteTC_ResetTextureChangeTracker(tex, true) with the hash queued for the decode helpers
 void LatteTC_ResetTextureChangeTrackerAsync(LatteTexture* tex)
 {
-	LatteTC_ResolvePendingHash(tex, true);
+	LatteTC_ResolvePendingHash(tex, false);  // (terrain arrays, which compare with the old value, never have one)
 	if (tex->depth == 83 && tex->width == 1024 && tex->height == 1024)
 	{
 		// BotW's terrain array: its _botwLargeTexHax bookkeeping (LatteTC_HasTextureChanged) is done at once
@@ -355,7 +356,7 @@ void LatteTC_SwitchToLightHash(LatteTexture* hostTexture)
 {
 	if (hostTexture->useLightHash)
 		return;
-	LatteTC_ResolvePendingHash(hostTexture, true);
+	LatteTC_ResolvePendingHash(hostTexture, false);  // texDataHash2 is replaced just below
 	hostTexture->useLightHash = true;
 	hostTexture->texDataHash2 = LatteTexture_CalculateTextureDataHash(hostTexture);
 }

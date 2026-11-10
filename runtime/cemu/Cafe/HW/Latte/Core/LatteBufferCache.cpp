@@ -1551,6 +1551,8 @@ public:
 		// the whole range first ("possible small optimization" note). And a caller that syncs right away rechecks only
 		// the copied parts: the rest was hashed from RAM a moment ago. A new area's big nodes were hashed twice and
 		// uploaded once more than needed in one GPU-thread frame (10-15 ms of hashing, castle 98.7 s / load-ins).
+		if (std::any_of(overlappingObjects.begin(), overlappingObjects.end(), [](BufferCacheNode* n) { return n != nullptr; }))
+			g_renderer->bufferCache_beforeWrite(newRange->getBufferOffset(rangeBegin), rangeEnd - rangeBegin);
 		MPTR ramFrom = rangeBegin;
 		for (auto itr : overlappingObjects)  // address order, no overlaps among them
 		{

@@ -390,6 +390,7 @@ public:
 	void bufferCache_init(const sint32 bufferSize) override;
 	void bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset) override;
 	void bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32 size) override;
+	void bufferCache_beforeWrite(uint32 bufferOffset, uint32 size) override;
 
 	void buffer_bindVertexBuffers(std::span<BindBufferParam> bindings) override;
 	void buffer_bindVertexStrideWorkaroundBuffer(VkBuffer fixedBuffer, uint32 offset, uint32 bufferIndex, uint32 size);

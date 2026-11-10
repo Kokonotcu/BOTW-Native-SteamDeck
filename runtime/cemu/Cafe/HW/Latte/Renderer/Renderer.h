@@ -142,6 +142,8 @@ public:
 	virtual void bufferCache_init(const sint32 bufferSize) = 0;
 	virtual void bufferCache_upload(uint8* buffer, sint32 size, uint32 bufferOffset) = 0;
 	virtual void bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32 size) = 0;
+	// BotW-Native: earlier reads of [bufferOffset, +size) finish before copies/uploads write it (a merged buffer node)
+	virtual void bufferCache_beforeWrite(uint32 bufferOffset, uint32 size) {}
 	virtual void bufferCache_copyStreamoutToMainBuffer(uint32 srcOffset, uint32 dstOffset, uint32 size) = 0;
 
 	struct BindBufferParam
