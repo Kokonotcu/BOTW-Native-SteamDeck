@@ -12,7 +12,7 @@ import re
 from . import ppc
 from .analyze import Function, bo_always
 from .image import Image
-from .regctx import ALL_HELD, Sync
+from .regctx import ALL_HELD, ARG_NAMES, LOCAL_ARGS, RET_NAMES, Sync
 
 # Condition register in locals. A function keeps the CR bits it uses in `cr_` (registers, after clang's SROA),
 # so a compare feeding a branch is a compare and a jump instead of four byte stores to the context. c->cr is
@@ -70,8 +70,41 @@ def local_cr(prologue: list[str], body: list[str]) -> list[str]:
 # storing every change to c before a call and reloading after it. r1 is written through (see local_regs). Hooks, probes and traps see
 # (and hooks/probes may change) every register: all written locals are stored before them and reloaded after.
 # Argument/return registers r3-r10/f1-f8 and r2/r13 stay in c. BOTW_LOCAL_REGS=0 = everything in c.
-_LOCAL_GPR = frozenset([0, 1, 11, 12] + list(range(14, 32)))
-_LOCAL_FPR = frozenset([0] + list(range(9, 32)))
+_LOCAL_GPR = frozenset([0, 1, 11, 12] + list(range(14, 32)) + (list(range(3, 11)) if LOCAL_ARGS else []))
+_LOCAL_FPR = frozenset([0] + list(range(9, 32)) + (list(range(1, 9)) if LOCAL_ARGS else []))
+# BOTW_LOCAL_ARGS: r3-r10/f1-f8/XER[CA] ("A" names) are locals as well. Their stores follow a per-site "dirty" set
+# (gen_function arg_dirty: A locals written since they last matched c), written into the text as /*D ...*/ markers
+# before each call/exit: a direct call stores the dirty ones its callee reads or delivers (regctx li|exp), an
+# indirect/HLE call or a native all dirty ones (and reloads every A local after), a return the dirty EABI results
+# RET plus what callers read (exp). BOTW_ARGS_POISON=1 (checking build): at returns, the A registers the function
+# wrote that no caller may read get garbage in c.
+_A_NAMES = ARG_NAMES + ["ca"]
+_A_SET = frozenset(_A_NAMES)
+_A_BIT = {n: 1 << k for k, n in enumerate(_A_NAMES)}
+_RET = frozenset(RET_NAMES)
+_ARGS_POISON = os.environ.get("BOTW_ARGS_POISON") == "1"
+_RE_AEV = re.compile(
+    r"(?P<tail>\[\[clang::musttail\]\] return f_(?P<tc>[0-9a-f]{8})\(c\);)"
+    r"|(?<!return )(?P<call>\bf_(?P<cc>[0-9a-f]{8})\(c\);)"
+    r"|(?P<sync>HLE_CALL\(|rt_call\(c, )"
+    r"|(?P<exit>HLE_TAIL\(|RETURN\(\);|RETURN_TAIL\(\);)"
+    r"|c->r\[(?P<wr>\d+)\] (?:=|\|=)(?!=)"
+    r"|c->(?:f|ps1)\[(?P<wf>\d+)\] =(?!=)"
+    r"|psq_load\w*\(c->f\[(?P<wp>\d+)\]"
+    r"|(?P<wca>c->ca = (?!=)|adde_r\(c->ca)")
+_MK = r"(?:/\*D([^*]*)\*/ )?"  # the dirty-set marker before a call or exit
+_RE_MK = re.compile(r"/\*D[^*]*\*/ ")
+
+
+def _abits(names) -> int:
+    b = 0
+    for n in names:
+        b |= _A_BIT.get(n, 0)
+    return b
+
+
+def _anames(b: int) -> list[str]:
+    return [n for n in _A_NAMES if b & _A_BIT[n]]
 _GPR_NV = frozenset(f"r{n}" for n in range(14, 32))
 _RE_GPR = re.compile(r"c->r\[(\d+)\]")
 _RE_FPR = re.compile(r"c->(f|ps1)\[(\d+)\]")
@@ -79,7 +112,7 @@ _RE_LOCAL_WRITE = re.compile(r"\b(r|f|p)(\d+)_ (?:=|\|=)(?!=)|\b(ctr)_(?: =(?!=)
 
 
 def local_regs(prologue: list[str], body: list[str], keep=frozenset(), sync=None,
-               exp=frozenset()) -> tuple[list[str], list[str]]:
+               exp=frozenset(), natives=frozenset()) -> tuple[list[str], list[str]]:
     """Rewrites one function to keep the registers above in locals; returns (prologue, body). keep: registers
     ("r0", "f12", "ctr"...) this function keeps in the context. Registers exchanged with a caller or callee outside
     the EABI (cafe/regctx.py) are synced at the exchange: sync {callee entry: Sync} (before a call or tail call the
@@ -101,17 +134,22 @@ def local_regs(prologue: list[str], body: list[str], keep=frozenset(), sync=None
     fprs = sorted(({int(n) for _, n in _RE_FPR.findall(text)} | {int(x[1:]) for x in carried if x[0] == "f"})
                   & local_fpr)
     ctr = ("c->ctr" in text or "ctr" in carried) and "ctr" not in keep
-    if not gprs and not fprs and not ctr:
-        return prologue, body
+    ca = LOCAL_ARGS and ("c->ca" in text or "ca" in carried) and "ca" not in keep
+    if not gprs and not fprs and not ctr and not ca:
+        return prologue, [_RE_MK.sub("", x) for x in body] if LOCAL_ARGS else body
     text = _RE_GPR.sub(lambda m: f"r{m.group(1)}_" if int(m.group(1)) in local_gpr else m.group(0), text)
     text = _RE_FPR.sub(lambda m: (("f" if m.group(1) == "f" else "p") + f"{m.group(2)}_")
                        if int(m.group(2)) in local_fpr else m.group(0), text)
     if ctr:
         text = text.replace("c->ctr", "ctr_")
+    if ca:
+        text = re.sub(r"c->ca\b", "ca_", text)
     written = set()
     for m in _RE_LOCAL_WRITE.finditer(text):
         written.add("ctr" if m.group(3) else f"{'f' if m.group(1) == 'p' else m.group(1)}{m.group(2)}")
     written.update(f"f{n}" for n in re.findall(r"psq_load(?:_f32)?r\(f(\d+)_,", text))  # by reference
+    if ca and re.search(r"\bca_ =(?!=)|adde_r\(ca_", text):
+        written.add("ca")
     decl = []
     store_all, load_all = [], []
     for n in gprs:
@@ -126,6 +164,10 @@ def local_regs(prologue: list[str], body: list[str], keep=frozenset(), sync=None
         decl.append("uint32_t ctr_ = c->ctr;")
         load_all.append("ctr_ = c->ctr;")
         store_all.append("c->ctr = ctr_;")
+    if ca:
+        decl.append("uint8_t ca_ = c->ca;")
+        load_all.append("ca_ = c->ca;")
+        store_all.append("c->ca = ca_;")
     # every local, written or not: since the entry load a callee may have stored another value to c
     sa, la = " ".join(store_all), " ".join(load_all)
     # r1 is written through to c (a few writes per function: prologue, epilogue), so calls need no store and
@@ -138,8 +180,8 @@ def local_regs(prologue: list[str], body: list[str], keep=frozenset(), sync=None
 
     def wrap(m: re.Match, before: str, after: str = "") -> str:
         if not before and not after:
-            return m.group(0)
-        return "{ " + " ".join(x for x in (before, m.group(0), after) if x) + " }"
+            return m.group("s")
+        return "{ " + " ".join(x for x in (before, m.group("s"), after) if x) + " }"
 
     def st(names) -> str:  # store the locals among names to c
         out = [f"c->r[{x[1:]}] = {x}_;" for x in sorted(names) if x[0] == "r" and int(x[1:]) in gprs]
@@ -147,6 +189,8 @@ def local_regs(prologue: list[str], body: list[str], keep=frozenset(), sync=None
                 if x[0] == "f" and int(x[1:]) in fprs]
         if ctr and "ctr" in names:
             out.append("c->ctr = ctr_;")
+        if ca and "ca" in names:
+            out.append("c->ca = ca_;")
         return " ".join(out)
 
     def ld(names) -> str:  # reload the locals among names from c
@@ -155,29 +199,106 @@ def local_regs(prologue: list[str], body: list[str], keep=frozenset(), sync=None
                 if x[0] == "f" and int(x[1:]) in fprs]
         if ctr and "ctr" in names:
             out.append("ctr_ = c->ctr;")
+        if ca and "ca" in names:
+            out.append("ca_ = c->ca;")
         return " ".join(out)
 
     _none = Sync(False, frozenset(), frozenset())
 
-    def callee(m: re.Match):
-        return sync.get(int(_RE_CALLEE.search(m.group(0)).group(1), 16), _none)
+    def callee_at(m: re.Match) -> int:
+        return int(_RE_CALLEE.search(m.group("s")).group(1), 16)
 
-    st_exp = st(exp)
+    def callee(m: re.Match):
+        return sync.get(callee_at(m), _none)
+
+    def dirty(m: re.Match) -> set:  # the A locals that may differ from c here (no marker: all of them)
+        return set(_A_SET) if m.group(1) is None else set(m.group(1).split())
+
+    def old(names) -> set:
+        return set(names) - _A_SET
+
+    def native(m: re.Match) -> bool:
+        return LOCAL_ARGS and callee_at(m) in natives
+
+    exp_ret = set(exp) | _RET
+    poison = ""
+    if _ARGS_POISON:
+        bad = sorted((written & _A_SET) - exp_ret)
+        poison = " ".join([f"c->r[{x[1:]}] = 0xDEADBEEFu;" for x in bad if x[0] == "r"]
+                          + [f"c->f[{x[1:]}] = c->ps1[{x[1:]}] = __builtin_nan(\"\");" for x in bad if x[0] == "f"]
+                          + ["c->ca = 2;" for x in bad if x == "ca"])
+
+    def ret(m: re.Match) -> str:
+        s = m.group("s")
+        if s.startswith("HLE_TAIL("):
+            return wrap(m, st(old(exp) | (dirty(m) & _A_SET)))
+        return wrap(m, " ".join(x for x in (st(old(exp) | (dirty(m) & exp_ret)), poison) if x))
+
+    def tail(m: re.Match) -> str:
+        s = callee(m)
+        if native(m):
+            return wrap(m, st(old(s.li | s.exp | exp) | (dirty(m) & _A_SET)))
+        return wrap(m, st(old(s.li | s.exp | exp) | (dirty(m) & (s.li | s.exp | exp_ret))))
+
+    def call(m: re.Match) -> str:
+        s = callee(m)
+        if native(m):
+            return wrap(m, st(old(s.li | s.exp) | (dirty(m) & _A_SET)), " ".join(x for x in (ld(s.exp), la_a) if x))
+        return wrap(m, st(old(s.li | s.exp) | (dirty(m) & (s.li | s.exp))), ld(s.exp))
+
+    la_a = ld(_A_SET)  # after code outside the analysis: every A local again
     # an indirect call's target is unknown: it gets the scratch registers this function wrote, in case it reads one
     sp_ind = st(written & {"r0", "r11", "r12", "f0", "f9", "f10", "f11", "f12", "f13", "ctr"})
-    text = _RE_HOST.sub(lambda m: wrap(m, sa, la), text)
-    text = _RE_TRAP.sub(lambda m: wrap(m, sa), text)
-    text = _RE_HLE_CALL.sub(lambda m: wrap(m, "", sp_load), text)
-    text = _RE_RT_CALL.sub(lambda m: wrap(m, sp_ind, sp_load), text)
-    text = _RE_TAIL.sub(lambda m: wrap(m, st(callee(m).li | callee(m).exp | exp)), text)
-    text = _RE_CALL.sub(lambda m: wrap(m, st(callee(m).li | callee(m).exp), ld(callee(m).exp)), text)
-    text = _RE_RETURN.sub(lambda m: wrap(m, st_exp), text)
+    after_ext = " ".join(x for x in (sp_load, la_a) if x)
+    text = _RE_HOST.sub(lambda m: wrap_plain(m, sa, la), text)
+    text = _RE_TRAP.sub(lambda m: wrap_plain(m, sa), text)
+    text = _RX_HLE_CALL.sub(lambda m: wrap(m, st(dirty(m) & _A_SET), after_ext), text)
+    text = _RX_RT_CALL.sub(lambda m: wrap(m, " ".join(x for x in (sp_ind, st(dirty(m) & _A_SET)) if x), after_ext),
+                           text)
+    text = _RX_TAIL.sub(tail, text)
+    text = _RX_CALL.sub(call, text)
+    text = _RX_RETURN.sub(ret, text)
+    if LOCAL_ARGS:
+        text = _RE_MK.sub("", text)
     return prologue + ["  " + " ".join(decl)], text.split("\n")
+
+
+def wrap_plain(m: re.Match, before: str, after: str = "") -> str:
+    if not before and not after:
+        return m.group(0)
+    return "{ " + " ".join(x for x in (before, m.group(0), after) if x) + " }"
+
+
+_RX_HLE_CALL = re.compile(_MK + r"(?P<s>HLE_CALL\([^;]*\);)")
+_RX_RT_CALL = re.compile(_MK + r"(?P<s>rt_call\(c, [^;]*\);)")
+_RX_TAIL = re.compile(_MK + r"(?P<s>\[\[clang::musttail\]\] return f_[0-9a-f]{8}\(c\);)")
+_RX_CALL = re.compile(_MK + r"(?<!return )(?P<s>\bf_[0-9a-f]{8}\(c\);)")
+_RX_RETURN = re.compile(_MK + r"(?P<s>HLE_TAIL\([^;]*\);|RETURN\(\);|RETURN_TAIL\(\);)")
 
 
 _RE_CALLEE = re.compile(r"\bf_([0-9a-f]{8})\(c\);")
 _RE_TRAP = re.compile(r"rt_trap\(c, [^;]*\);|rt_bad_switch\(c, [^;]*\);")
 _RE_RETURN = re.compile(r"HLE_TAIL\([^;]*\);|RETURN\(\);|RETURN_TAIL\(\);")
+
+
+FPCC_DROP = os.environ.get("BOTW_FPCC_DROP", "1") != "0"
+
+
+def _fpscr_reader(i: ppc.Insn) -> None:
+    # fcmp no longer updates FPSCR[FPCC] (ppc.h PPC_FPCC_DROP): no generated code may read the FPSCR
+    raise ValueError(f"BOTW_FPCC_DROP: {i.op} at {i.addr:08x} reads the FPSCR; generate with BOTW_FPCC_DROP=0")
+
+
+def header_defines() -> str:
+    """ppc.h switches for the generated files (each BOTW_* =0: the old header code, byte-identical output)."""
+    out = ""
+    if FPCC_DROP:
+        out += "#define PPC_FPCC_DROP 1\n"
+    if os.environ.get("BOTW_F2F_FAST", "1") != "0":
+        out += "#define PPC_F2F_FAST 1\n"
+    if os.environ.get("BOTW_FRES_INLINE", "1") != "0":
+        out += "#define PPC_FRES_INLINE 1\n"
+    return out
 
 
 def R(n: int) -> str:
@@ -285,9 +406,13 @@ class Generator:
 
     def find_prologue_saves(self, fn: Function) -> set[int]:
         """stmw rN,d(r1) (N >= 14) in the straight-line entry block before any write of rN..r31: the save of the
-        caller's registers, droppable when all of them are locals. Empty with BOTW_LOCAL_REGS=0/BOTW_KEEP_SAVES=1."""
+        caller's registers, droppable when all of them are locals. Empty with BOTW_LOCAL_REGS=0/BOTW_KEEP_SAVES=1.
+        BOTW_FSAVE_DROP (default 1): the same for f14-f31, saved by stfd / psq_st / stfs (stfd + ps_merge10 fN,fN,fN
+        + stfs for a paired single) to r1-based slots (r1, or a register set from r1 by mr/addi in the block)."""
         if os.environ.get("BOTW_LOCAL_REGS", "1") == "0" or os.environ.get("BOTW_KEEP_SAVES", "0") == "1":
             return set()
+        if os.environ.get("BOTW_FSAVE_DROP", "1") != "0":
+            return self._find_prologue_saves_fpr(fn)
         written: set[int] = set()
         a = fn.entry
         while a in fn.insns:
@@ -306,6 +431,53 @@ class Generator:
             a += 4
         return set()
 
+    def _find_prologue_saves_fpr(self, fn: Function) -> set[int]:
+        """find_prologue_saves with f14-f31 saves too. A dropped save only stored the caller's value, which this
+        function never needs (its fN is a local; the epilogue's restore loads are dead, as for stmw)."""
+        out: set[int] = set()
+        written: set[int] = set()  # GPRs
+        fwritten: set[int] = set()  # FPRs written other than by a dropped save swap
+        fsaved: set[int] = set()  # FPRs with a dropped save (their ps_merge10 swap may be dropped too)
+        sp = {1}  # registers holding a stack address
+        stmw_done = False
+        a = fn.entry
+        while a in fn.insns:
+            i = fn.insns[a]
+            if a != fn.entry and a in fn.labels:
+                break
+            if i.op in ("b", "bc", "bclr", "bcctr", "tw", "twi", "sc"):
+                break
+            if i.op == "stmw" and i.rA == 1 and i.rD >= 14 and not stmw_done:
+                stmw_done = True  # as find_prologue_saves: only the first stmw
+                regs = range(i.rD, 32)
+                if not any(n in written for n in regs) and not any(f"r{n}" in self.keep for n in regs):
+                    out.add(a)
+                a += 4
+                continue
+            n = i.rD
+            nv = n >= 14 and f"f{n}" not in self.keep and n not in fwritten
+            if nv and i.rA in sp and (i.op in ("stfd", "stfs") or (i.op == "psq_st" and i.I == 0)):
+                out.add(a)
+                fsaved.add(n)
+                a += 4
+                continue
+            if nv and i.op == "ps_merge10" and i.rA == n and i.rB == n and n in fsaved:
+                out.add(a)  # the half swap between the two stores of a paired-single save
+                a += 4
+                continue
+            code = " ".join(self.insn(fn, i, set(), set())[0])
+            written.update(int(x) for x in re.findall(r"c->r\[(\d+)\] (?:\|)?=(?!=)", code))
+            fwritten.update(int(x) for x in re.findall(r"c->(?:f|ps1)\[(\d+)\] =(?!=)", code))
+            fwritten.update(int(x) for x in re.findall(r"psq_load\w*\(c->f\[(\d+)\]", code))
+            if i.op == "or" and i.rD == i.rB and i.rD in sp:
+                sp.add(i.rA)  # mr rA, r1
+            elif i.op == "addi" and i.rA in sp:
+                sp.add(i.rD)
+            else:
+                sp -= {x for x in sp if x != 1 and f"c->r[{x}] " in code and re.search(rf"c->r\[{x}\] (?:\|)?=(?!=)", code)}
+            a += 4
+        return out
+
     # ---- function ---------------------------------------------------------------------------
     def gen_function(self, fn: Function) -> tuple[str, set[str]]:
         callees: set[str] = set()
@@ -313,8 +485,10 @@ class Generator:
         self.keep = (ALL_HELD if me is not None and me.all else frozenset()) | self.keep_all
         if self.local_range and not self.local_range[0] <= fn.entry < self.local_range[1]:
             self.keep |= _GPR_NV  # TEST bisect: r14-r31 locals only inside BOTW_LOCAL_RANGE
+        if os.environ.get("BOTW_FSAVE_DROP", "1") != "0":
+            self.prologue_saves = set()  # not the previous function's while find_prologue_saves runs insn()
         self.prologue_saves = self.find_prologue_saves(fn)
-        guest = "_guest" if fn.entry in self.natives else ""
+        guest ="_guest" if fn.entry in self.natives else ""
         prologue = [f'extern "C" void f_{fn.entry:08x}{guest}(PPCContext* __restrict c) {{',
                     "  uint8_t* const M = g_mem; (void)M; PPC_SEPARATE(M, c);"]
         if self.check_returns:
@@ -329,9 +503,11 @@ class Generator:
             labels.add(fn.entry)
             out.append(f"  goto L_{fn.entry:08x};")
         body: list[tuple[int, list[str]]] = []
+        falls_at: dict[int, bool] = {}
         for idx, a in enumerate(addrs):
             i = fn.insns[a]
             code, falls = self.insn(fn, i, callees, labels)
+            falls_at[a] = falls
             nxt = addrs[idx + 1] if idx + 1 < len(addrs) else None
             if falls and nxt != a + 4:
                 if a + 4 in fn.insns:
@@ -342,6 +518,9 @@ class Generator:
                 else:
                     code.append(f'rt_trap(c, 0x{a + 4:08x}u, "fell off function");')
             body.append((a, code))
+        if (LOCAL_ARGS and os.environ.get("BOTW_LOCAL_REGS", "1") != "0"
+                and not _A_SET <= self.keep):
+            body = self.arg_dirty(fn, body, falls_at)
         for a, code in body:
             if a in labels:
                 out.append(f"L_{a:08x}:;")
@@ -354,8 +533,103 @@ class Generator:
                 out.append(f"  hook_0x{a:08x}(c);")
                 callees.add(f"hook_0x{a:08x}")
         out.append("}")
-        prologue, out = local_regs(prologue, out, self.keep, self.regctx, me.exp if me is not None else frozenset())
+        prologue, out = local_regs(prologue, out, self.keep, self.regctx, me.exp if me is not None else frozenset(),
+                                   self.natives)
         return "\n".join(local_cr(prologue, out)), callees
+
+    def arg_dirty(self, fn: Function, body: list[tuple[int, list[str]]],
+                  falls_at: dict[int, bool]) -> list[tuple[int, list[str]]]:
+        """BOTW_LOCAL_ARGS: forward may-analysis of the A registers (r3-r10, f1-f8, CA) whose local may differ from
+        c: a write makes one dirty; a direct call cleans what it stores or reloads (callee li|exp), an indirect/HLE
+        call or native cleans all (all dirty stored, all reloaded). A conditional call cleans nothing. Returns the
+        body with a /*D names*/ marker before each call and exit, for local_regs."""
+        none = Sync(False, frozenset(), frozenset())
+        events: dict[int, list] = {}
+        texts: dict[int, str] = {}
+        for a, code in body:
+            s = "\n".join(code)
+            texts[a] = s
+            ev = []
+            for m in _RE_AEV.finditer(s):
+                k = m.lastgroup
+                if m.group("tail") is not None:
+                    ev.append(("x", m.start(), 0))
+                elif m.group("call") is not None:
+                    t = int(m.group("cc"), 16)
+                    cond = "if (" in s[:m.start()]
+                    if t in self.natives:
+                        ev.append(("s", m.start(), cond))
+                    else:
+                        sy = self.regctx.get(t, none)
+                        ev.append(("c", m.start(), (cond, _abits(sy.li | sy.exp))))
+                elif m.group("sync") is not None:
+                    ev.append(("s", m.start(), "if (" in s[:m.start()]))
+                elif m.group("exit") is not None:
+                    ev.append(("x", m.start(), 0))
+                else:
+                    if m.group("wr") is not None:
+                        b = _A_BIT.get(f"r{m.group('wr')}", 0)
+                    elif m.group("wf") is not None:
+                        b = _A_BIT.get(f"f{m.group('wf')}", 0)
+                    elif m.group("wp") is not None:
+                        b = _A_BIT.get(f"f{m.group('wp')}", 0)
+                    else:
+                        b = _A_BIT["ca"]
+                    if b:
+                        ev.append(("w", m.start(), b))
+                del k
+            events[a] = ev
+
+        def run(a: int, d: int, marks: list | None) -> int:
+            for kind, pos, x in events[a]:
+                if kind == "w":
+                    d |= x
+                    continue
+                if marks is not None:
+                    marks.append((pos, d))
+                if kind == "c" and not x[0]:
+                    d &= ~x[1]
+                elif kind == "s" and not x:
+                    d = 0
+            return d
+
+        succ: dict[int, list[int]] = {}
+        for a in texts:
+            i = fn.insns[a]
+            out = []
+            if falls_at[a] and a + 4 in fn.insns:
+                out.append(a + 4)
+            if i.op in ("b", "bc") and not i.LK and i.target in fn.insns and i.target not in fn.tail_targets:
+                out.append(i.target)
+            sw = fn.switches.get(a)
+            if sw is not None:
+                out += [t for t in sw.targets if t in fn.insns]
+            succ[a] = out
+        d_in: dict[int, int] = {}
+        if fn.entry in texts:
+            d_in[fn.entry] = 0
+            work = [fn.entry]
+            while work:
+                a = work.pop()
+                d = run(a, d_in[a], None)
+                for t in succ[a]:
+                    old = d_in.get(t)
+                    if old is None or d & ~old:
+                        d_in[t] = d if old is None else old | d
+                        work.append(t)
+        allb = (1 << len(_A_NAMES)) - 1
+        out_body = []
+        for a, code in body:
+            marks: list = []
+            run(a, d_in.get(a, allb), marks)  # unreached from the entry: everything may be dirty
+            if not marks:
+                out_body.append((a, code))
+                continue
+            s = texts[a]
+            for pos, d in sorted(marks, reverse=True):
+                s = s[:pos] + "/*D" + "".join(" " + n for n in _anames(d)) + "*/ " + s[pos:]
+            out_body.append((a, s.split("\n")))
+        return out_body
 
     def unsup(self, i: ppc.Insn) -> list[str]:
         self.unsupported[i.op] = self.unsupported.get(i.op, 0) + 1
@@ -462,6 +736,8 @@ class Generator:
         lines = self.simple(i)
         if lines is None:
             return self.unsup(i), True
+        if LOCAL_ARGS:
+            lines = [x.replace("adde_(c, ", "adde_r(c->ca, ") for x in lines]
         return lines, True
 
     @staticmethod
@@ -482,6 +758,8 @@ class Generator:
         a = i.addr
         L: list[str] = []
         rec = (lambda v: L.append(f"CR0({v});")) if i.Rc else (lambda v: None)
+        if a in self.prologue_saves and op in ("stfd", "stfs", "psq_st", "ps_merge10"):
+            return [f"/* {op} prologue save of f{d}: a local */"]  # find_prologue_saves
 
         # integer arithmetic (D-form)
         if op == "addi":
@@ -859,6 +1137,8 @@ class Generator:
         L: list[str] = []
         fa, fb, fc = F(a_), F(b), F(c_)
         pa, pb, pc = P(a_), P(b), P(c_)
+        if FPCC_DROP and op in ("mffs", "mcrfs"):
+            _fpscr_reader(i)
 
         def single(expr: str) -> list[str]:
             # result rounded to single; ps1 mirrors ps0 (HID2[PSE] set on Cafe)
@@ -981,6 +1261,8 @@ class Generator:
         else:
             return None
         if i.Rc:
+            if FPCC_DROP:
+                _fpscr_reader(i)
             L.append("c->cr[4] = c->fpscr >> 31; c->cr[5] = (c->fpscr >> 30) & 1; c->cr[6] = (c->fpscr >> 29) & 1; c->cr[7] = (c->fpscr >> 28) & 1;")
         return L
 

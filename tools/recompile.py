@@ -21,14 +21,14 @@ _tools_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path[:] = [p for p in sys.path if os.path.abspath(p or ".") != _tools_dir]
 sys.path.insert(0, os.path.join(_tools_dir, ".."))
 from cafe.analyze import Analyzer  # noqa: E402
-from cafe.codegen import Generator, hle_symbol  # noqa: E402
+from cafe.codegen import Generator, header_defines, hle_symbol  # noqa: E402
 from cafe.image import Image  # noqa: E402
 
 BUCKET = 0x8000  # guest code bytes per translation unit
 BIG_LINES = 30000
 HUGE_LINES = 120000
 
-HEADER = """#include "ppc.h"
+HEADER = header_defines() + """#include "ppc.h"
 #include "hle_decls.h"
 extern "C" PPC_NORETURN void rt_bad_return(PPCContext* c, uint32_t addr, uint32_t lr0);
 #define RETURN() do { if (__builtin_expect(c->lr != lr0, 0)) rt_bad_return(c, __LINE__, lr0); return; } while (0)

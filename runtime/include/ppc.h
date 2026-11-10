@@ -174,6 +174,13 @@ PPC_INLINE uint32_t adde_(PPCContext* c, uint32_t a, uint32_t b, uint32_t cin) {
     return (uint32_t)s;
 }
 
+// adde_ with XER[CA] by reference (codegen BOTW_LOCAL_ARGS: CA may be a local of the generated function)
+PPC_INLINE uint32_t adde_r(uint8_t& ca, uint32_t a, uint32_t b, uint32_t cin) {
+    uint64_t s = (uint64_t)a + b + cin;
+    ca = (uint8_t)(s >> 32);
+    return (uint32_t)s;
+}
+
 PPC_INLINE uint32_t ppc_mask(uint32_t mb, uint32_t me) {
     uint32_t m1 = 0xFFFFFFFFu >> mb;
     uint32_t m2 = me >= 31 ? 0xFFFFFFFFu : ~(0xFFFFFFFFu >> (me + 1));
@@ -199,6 +206,17 @@ PPC_INLINE double f32_to_f64(uint32_t v) {
     return bitsd(((x & 0xC0000000) << 32) | (7ull << 59) | ((x & 0x3FFFFFFF) << 29));
 }
 PPC_INLINE uint32_t f64_to_f32(double d) {
+#ifdef PPC_F2F_FAST
+    // A double that is exactly a float (the common case) converts in hardware: the bit path below gives the same
+    // word (checked over every float widened, +-1 ulp around each and 2^31 random doubles, guest MXCSR).
+    // Denormal results (flushed by FTZ), NaN and out-of-range values compare unequal and take the bit path.
+    float f = (float)d;
+    if (__builtin_expect((double)f == d, 1)) {
+        uint32_t u;
+        memcpy(&u, &f, 4);
+        return u;
+    }
+#endif
     uint64_t x = dbits(d);
     uint32_t exp = (x >> 52) & 0x7FF;
     // Only exponents 874..896 (results in the single denormal range) need the shift; one range test
@@ -227,8 +245,66 @@ PPC_INLINE double ftz_single(double d) {
     return f;
 }
 
+#ifndef PPC_FRES_INLINE
 extern "C" double ppc_fres(double x);
 extern "C" double ppc_frsqrte(double x);
+#else
+// Generated code (codegen BOTW_FRES_INLINE): the same as runtime/src/cpu.cpp ppc_fres / ppc_frsqrte, inline, so a
+// call no longer spills every live xmm register around it. Tables from the Espresso hardware (via Cemu).
+inline constexpr uint32_t kPpcRsqrte[32][2] = {
+    {0x1a7e800, 0x568}, {0x17cb800, 0x4f3}, {0x1552800, 0x48d}, {0x130c000, 0x435}, {0x10f2000, 0x3e7}, {0xeff000, 0x3a2},
+    {0xd2e000, 0x365},  {0xb7c000, 0x32e},  {0x9e5000, 0x2fc},  {0x867000, 0x2d0},  {0x6ff000, 0x2a8},  {0x5ab800, 0x283},
+    {0x46a000, 0x261},  {0x339800, 0x243},  {0x218800, 0x226},  {0x105800, 0x20b},  {0x3ffa000, 0x7a4}, {0x3c29000, 0x700},
+    {0x38aa000, 0x670}, {0x3572000, 0x5f2}, {0x3279000, 0x584}, {0x2fb7000, 0x524}, {0x2d26000, 0x4cc}, {0x2ac0000, 0x47e},
+    {0x2881000, 0x43a}, {0x2665000, 0x3fa}, {0x2468000, 0x3c2}, {0x2287000, 0x38e}, {0x20c1000, 0x35e}, {0x1f12000, 0x332},
+    {0x1d79000, 0x30a}, {0x1bf4000, 0x2e6},
+};
+inline constexpr uint32_t kPpcRes[32][2] = {
+    {0x7ff800, 0x3e1}, {0x783800, 0x3a7}, {0x70ea00, 0x371}, {0x6a0800, 0x340}, {0x638800, 0x313}, {0x5d6200, 0x2ea},
+    {0x579000, 0x2c4}, {0x520800, 0x2a0}, {0x4cc800, 0x27f}, {0x47ca00, 0x261}, {0x430800, 0x245}, {0x3e8000, 0x22a},
+    {0x3a2c00, 0x212}, {0x360800, 0x1fb}, {0x321400, 0x1e5}, {0x2e4a00, 0x1d1}, {0x2aa800, 0x1be}, {0x272c00, 0x1ac},
+    {0x23d600, 0x19b}, {0x209e00, 0x18b}, {0x1d8800, 0x17c}, {0x1a9000, 0x16e}, {0x17ae00, 0x15b}, {0x14f800, 0x15b},
+    {0x124400, 0x143}, {0xfbe00, 0x143},  {0xd3800, 0x12d},  {0xade00, 0x12d},  {0x88400, 0x11a},  {0x65000, 0x11a},
+    {0x41c00, 0x108},  {0x20c00, 0x106},
+};
+PPC_INLINE double ppc_frsqrte(double input) {
+    uint64_t x = dbits(input);
+    if ((x << 1) == 0) return bitsd((x & ~0x7FFFFFFFFFFFFFFFULL) | 0x7FF0000000000000ULL);
+    uint32_t e = (x >> 52) & 0x7FF;
+    if (e == 0x7FF) {
+        if ((x & ((1ull << 52) - 1)) == 0) return (int64_t)x < 0 ? bitsd(0x7FF8000000000000ULL) : 0.0;
+        return input;
+    }
+    if ((int64_t)x < 0) return bitsd(0x7FF8000000000000ULL);
+    uint32_t idx = (x >> 48) & 31;
+    uint32_t stepMul = (x >> 37) & 0x7FF;
+    int32_t sum = (int32_t)(kPpcRsqrte[idx][0] - kPpcRsqrte[idx][1] * stepMul);
+    e = 1023 - ((e - 1021) >> 1);
+    x &= ~(0x7FFULL << 52);
+    x |= (uint64_t)e << 52;
+    x &= ~((1ull << 52) - 1);
+    x += (uint64_t)(int64_t)sum << 26;
+    return bitsd(x);
+}
+PPC_INLINE double ppc_fres(double input) {
+    uint64_t x = dbits(input);
+    uint32_t idx = (x >> 47) & 31;
+    uint32_t stepMul = (x >> 37) & 0x3FF;
+    uint32_t sum = kPpcRes[idx][0] - (kPpcRes[idx][1] * stepMul + 1) / 2;
+    uint32_t e = (x >> 52) & 0x7FF;
+    if (e == 0) return bitsd(x | 0x7FF0000000000000ull);
+    if (e == 0x7FF) {
+        if ((x & ((1ull << 52) - 1)) == 0) return (int64_t)x < 0 ? bitsd(0x8000000000000000ull) : 0.0;
+        return input;
+    }
+    e = 2045 - e;
+    x &= ~(0x7FFULL << 52);
+    x |= (uint64_t)e << 52;
+    x &= ~((1ull << 52) - 1);
+    x += (uint64_t)sum << 29;
+    return bitsd(x);
+}
+#endif
 
 // Branch-free: with a NaN all three ordered compares are false and only `un` is set, otherwise exactly
 // one of lt/gt/eq is (the old if/else chain mispredicted on data-dependent compares).
@@ -238,7 +314,11 @@ PPC_INLINE void set_cr_f(PPCContext* c, int f, double a, double b) {
     c->cr[4 * f + 1] = gt;
     c->cr[4 * f + 2] = eq;
     c->cr[4 * f + 3] = un;
+    // PPC_FPCC_DROP (generated code, codegen BOTW_FPCC_DROP): FPSCR[FPCC] is not kept; the generator refuses
+    // every instruction that reads it (mffs, mcrfs, FP record forms), so nothing can see the dropped bits.
+#ifndef PPC_FPCC_DROP
     c->fpscr = (c->fpscr & 0xFFFF0FFFu) | ((uint32_t)(lt << 3 | gt << 2 | eq << 1 | un) << 12);
+#endif
 }
 PPC_INLINE void crl_f(uint8_t* cr, PPCContext* c, int f, double a, double b) {
     uint8_t lt = a < b, gt = a > b, eq = a == b, un = __builtin_isunordered(a, b);
@@ -246,7 +326,11 @@ PPC_INLINE void crl_f(uint8_t* cr, PPCContext* c, int f, double a, double b) {
     cr[4 * f + 1] = gt;
     cr[4 * f + 2] = eq;
     cr[4 * f + 3] = un;
+#ifndef PPC_FPCC_DROP
     c->fpscr = (c->fpscr & 0xFFFF0FFFu) | ((uint32_t)(lt << 3 | gt << 2 | eq << 1 | un) << 12);
+#else
+    (void)c;
+#endif
 }
 
 // x86 cvttsd2si: truncation; NaN and out-of-range give 0x80000000 (Cemu's recompiler relies on this)

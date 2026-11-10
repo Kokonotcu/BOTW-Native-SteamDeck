@@ -20,11 +20,25 @@ import re
 
 NAMES = (["r0", "r11", "r12", "f0", "f9", "f10", "f11", "f12", "f13", "ctr"]
          + [f"r{n}" for n in range(14, 32)] + [f"f{n}" for n in range(14, 32)])
+# BOTW_LOCAL_ARGS (default 0 until verified): the argument/return registers r3-r10/f1-f8 and XER[CA] are locals too (codegen
+# local_regs). They are scratch registers that calls do pass (arguments) and return (results), so beyond the rules
+# above: an indirect call, HLE call or native may read any argument register (in the LI pass it uses them all) and
+# leaves only the EABI result registers RET defined for its caller (the post pass); every function's exits keep RET
+# (exit_live), for callers that are indirect calls or the host.
+LOCAL_ARGS = os.environ.get("BOTW_LOCAL_ARGS", "0") != "0"
+ARG_NAMES = [f"r{n}" for n in range(3, 11)] + [f"f{n}" for n in range(1, 9)]
+RET_NAMES = ("r3", "r4", "f1", "f2")
+if LOCAL_ARGS:
+    NAMES = NAMES + ARG_NAMES + ["ca"]
 BIT = {n: 1 << i for i, n in enumerate(NAMES)}
 SCRATCH = sum(BIT[n] for n in NAMES[:10])
-NONVOL = sum(BIT[n] for n in NAMES[10:])
-_RE_REF = re.compile(r"c->(r|f|ps1)\[(\d+)\]|c->ctr")
-_RE_DEF = re.compile(r"c->(r|f|ps1)\[(\d+)\] = (?!=)|c->ctr = (?!=)")
+NONVOL = sum(BIT[n] for n in NAMES[10:46])
+ARGS = sum(BIT[n] for n in ARG_NAMES) if LOCAL_ARGS else 0
+ARGCA = ARGS | (BIT["ca"] if LOCAL_ARGS else 0)  # the BOTW_LOCAL_ARGS names
+RET = sum(BIT[n] for n in RET_NAMES) if LOCAL_ARGS else 0
+SCRATCH |= ARGCA
+_RE_REF = re.compile(r"c->(r|f|ps1)\[(\d+)\]|c->ctr|c->ca\b")
+_RE_DEF = re.compile(r"c->(r|f|ps1)\[(\d+)\] = (?!=)|c->ctr = (?!=)|c->ca = (?!=)")
 _RE_DIRECT = re.compile(r"(?<!return )\bf_([0-9a-f]{8})\(c\);")
 _RE_TAIL = re.compile(r"musttail\]\] return f_([0-9a-f]{8})\(c\);")
 _RE_SAVE = re.compile(r"ST32\(\(c->r\[1\] \+ \(uint32_t\)-?\d+\), c->r\[(\d+)\]\)")
@@ -42,6 +56,8 @@ _RE_NV_STORE_VALUE = re.compile(
 def _bit(m: re.Match) -> int:
     if m.group(0).startswith("c->ctr"):
         return BIT["ctr"]
+    if m.group(0).startswith("c->ca"):
+        return BIT.get("ca", 0)
     return BIT.get(("f" if m.group(1) in ("f", "ps1") else "r") + m.group(2), 0)
 
 
@@ -76,6 +92,9 @@ def def_use(text: str) -> tuple[int, int, int]:
             continue
         lhs = 0
         rest = st
+        if "adde_r(c->ca, " in st:  # writes CA through its first (reference) argument, after reading the others
+            lhs |= BIT.get("ca", 0)
+            rest = st.replace("adde_r(c->ca, ", "adde_r(", 1)
         while True:
             m = _RE_DEF.match(rest.lstrip())
             if not m:
@@ -90,7 +109,7 @@ def def_use(text: str) -> tuple[int, int, int]:
 
 
 class _Fn:
-    __slots__ = ("entry", "d", "u", "succ", "kind", "callee", "cond", "writes", "saves", "callees", "indirect")
+    __slots__ = ("entry", "d", "u", "succ", "kind", "callee", "cond", "writes", "saves", "callees", "indirect", "iu")
 
 
 # paired singles are saved as stfd + ps_merge10 fX,fX,fX (swap) + stfs, restored the same way
@@ -107,11 +126,11 @@ def _frame_slots(fn) -> tuple[dict[int, int], int]:
             continue
         if i.op in _FRAME_ST:
             n = f"{_FRAME_ST[i.op]}{i.rD}"
-            if n in BIT:
+            if n in BIT and not BIT[n] & ARGCA:  # an argument register in a slot is a spill, not a preservation
                 stores[a] = (BIT[n], i.imm)
         elif i.op in _FRAME_LD:
             n = f"{_FRAME_LD[i.op]}{i.rD}"
-            if n in BIT:
+            if n in BIT and not BIT[n] & ARGCA:
                 loads.add((BIT[n], i.imm))
     kept = {a: b for a, (b, k) in stores.items() if (b, k) in loads}
     mask = 0
@@ -127,7 +146,7 @@ def _scan(an, gen) -> dict[int, _Fn]:
         f.entry = entry
         addrs = sorted(fn.insns)
         idx = {a: k for k, a in enumerate(addrs)}
-        f.d, f.u, f.succ, f.kind, f.callee, f.cond = [], [], [], [], [], []
+        f.d, f.u, f.succ, f.kind, f.callee, f.cond, f.iu = [], [], [], [], [], [], []
         f.writes = f.saves = 0
         f.callees, f.indirect = set(), False
         save_at, f.saves = _frame_slots(fn)
@@ -169,6 +188,11 @@ def _scan(an, gen) -> dict[int, _Fn]:
                 elif "rt_call(c," in text:
                     kind = IND
                     f.indirect = True
+            # BOTW_LOCAL_ARGS: code outside this analysis (indirect and HLE calls, natives) takes arguments
+            iu = LOCAL_ARGS and (kind == IND or "HLE_CALL(" in text or "HLE_TAIL(" in text
+                                 or (callee >= 0 and callee in gen.natives))
+            if iu and kind == 0 and "HLE_CALL(" in text:
+                kind = IND  # an HLE call: like an indirect call (for the old names an IND changes nothing)
             if callee >= 0:
                 f.callees.add(callee)
             # falling into the next function's entry: gen_function emits a tail call (GHS save/restore helpers
@@ -182,6 +206,7 @@ def _scan(an, gen) -> dict[int, _Fn]:
             f.kind.append(kind)
             f.callee.append(callee)
             f.cond.append(kind != 0 and text.lstrip().startswith("if ("))
+            f.iu.append(iu)
             if fall_tail:
                 f.callees.add(a + 4)
                 tails.append((len(f.d) - 1, a + 4))
@@ -194,6 +219,7 @@ def _scan(an, gen) -> dict[int, _Fn]:
             f.kind.append(TAIL)
             f.callee.append(t)
             f.cond.append(False)
+            f.iu.append(LOCAL_ARGS and t in gen.natives)
         fns[entry] = f
         f_entry_index[entry] = idx.get(entry, 0)
     return fns
@@ -226,19 +252,20 @@ def _fix(fns, base: dict[int, int]) -> dict[int, int]:
     return S
 
 
-def _liveness(f: _Fn, LI, MW, NC, exit_live: int, post: list | None, EXPd=None) -> int:
+def _liveness(f: _Fn, LI, MW, NC, exit_live: int, post: list | None, EXPd=None, iu_bits: int = 0) -> int:
     """Backward liveness. exit_live: registers this function delivers to its caller (live at its returns).
     post collects (caller, callee or None, bitmask) for values a call delivers to this function. EXPd: registers
     each callee delivers; a callee may also pass such a value through unchanged, so with EXPd given a value live
-    after the call that the callee delivers is live before it too (and at a tail call all of exit_live is)."""
+    after the call that the callee delivers is live before it too (and at a tail call all of exit_live is).
+    iu_bits: what an indirect/HLE call or native reads (BOTW_LOCAL_ARGS; it defines all of ARGCA)."""
     n = len(f.d)
     live = [0] * n
 
     def clob(k):
         if f.kind[k] == IND:
-            return 0
+            return ARGCA
         g = f.callee[k]
-        return MW.get(g, SCRATCH) | NC.get(g, 0)
+        return MW.get(g, SCRATCH) | NC.get(g, 0) | (ARGCA if f.iu[k] else 0)
 
     changed = True
     while changed:
@@ -262,6 +289,8 @@ def _liveness(f: _Fn, LI, MW, NC, exit_live: int, post: list | None, EXPd=None) 
                     li |= out & ~d & EXPd.get(f.callee[k], 0)
             else:
                 li = u | (out & ~d)
+            if f.iu[k]:
+                li |= iu_bits
             if li != live[k]:
                 live[k] = li
                 changed = True
@@ -314,7 +343,8 @@ def compute(an, gen, log=print, origins=None) -> dict[int, set[str]]:
     fns = _scan(an, gen)
     # A scratch register the function saves and restores is not clobbered for its callers. Indirect calls add
     # nothing: the compiler cannot know their target, so it never keeps or receives a scratch value through one.
-    MW = _fix(fns, {e: f.writes & SCRATCH & ~f.saves for e, f in fns.items()})
+    # (BOTW_LOCAL_ARGS: an indirect/HLE call or a native may write every argument register)
+    MW = _fix(fns, {e: (f.writes & SCRATCH & ~f.saves) | (ARGCA if any(f.iu) else 0) for e, f in fns.items()})
     # r14-r31/f14-f31 follow the EABI in compiled code (read only to be saved, never returned); only the graphic
     # pack caves, entered by bla from the middle of a game function, read and write that function's registers.
     NC = _fix(fns, {e: (f.writes & NONVOL & ~f.saves) if _cave(e) else 0 for e, f in fns.items()})
@@ -335,7 +365,7 @@ def compute(an, gen, log=print, origins=None) -> dict[int, set[str]]:
         while work:
             e = work.popleft()
             queued.discard(e)
-            li = _liveness(fns[e], LI, MW, NC, EXP[e] if _PT else 0, None)
+            li = _liveness(fns[e], LI, MW, NC, EXP[e] if _PT else 0, None, None, ARGS)
             if not _fps_cave(e) and not _NOMASK:
                 li &= ~NONVOL  # compiled code and the GHS helpers read the caller's r14-r31/f14-f31 only to save them
             if li != LI[e]:
@@ -346,7 +376,7 @@ def compute(an, gen, log=print, origins=None) -> dict[int, set[str]]:
                         work.append(k)
         post = []
         for e, f in fns.items():
-            _liveness(f, LI, MW, NC, EXP[e], post, None if _PT else EXP)
+            _liveness(f, LI, MW, NC, EXP[e] | RET, post, None if _PT else EXP, RET)
         grew = False
         indirect_returns = 0
         if origins is not None and rounds == 1:  # first-round deliveries: the seeds of EXP
@@ -371,6 +401,19 @@ def compute(an, gen, log=print, origins=None) -> dict[int, set[str]]:
             for n in _names(own):
                 if len(origins[n]) < 6:
                     origins[n].append(f"f_{e:08x}")
+    if LOCAL_ARGS and os.environ.get("BOTW_ARGS_STAT") == "1":
+        # check of the RET rule: argument registers the code itself reads after an indirect/HLE call or native
+        # before writing them (results it takes from code outside the analysis); expected: a subset of RET
+        seen, sites = 0, 0
+        for e, f in fns.items():
+            p2 = []
+            _liveness(f, LI, MW, NC, EXP[e], p2, EXP, 0)
+            for _, g, x in p2:
+                if g is None and x & ARGCA:
+                    seen |= x & ARGCA
+                    sites += 1
+        log(f"regctx: argument registers read after indirect/HLE calls: {sorted(_names(seen))} at {sites} sites; "
+            f"outside RET: {sorted(_names(seen & ~RET))}")
     li_scratch_uncalled = sum(1 for e in fns if (LI[e] & SCRATCH) and not callers[e])
     nv_entry = sum(1 for e in fns if LI[e] & NONVOL)
     out = {}
