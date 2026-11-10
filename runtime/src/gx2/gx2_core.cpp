@@ -717,6 +717,24 @@ HLE_EXPORT(gx2, GX2CallDisplayList) { emit(OP_CALL, {ARG(0), ARG(1)}); }
 // a copy into the command stream: run where it stands (our display lists are op lists, not PM4)
 HLE_EXPORT(gx2, GX2CopyDisplayList) { emit(OP_CALL, {ARG(0), ARG(1)}); }
 HLE_EXPORT(gx2, GX2SetDefaultState) { set_default_state(); }
+// (dl, type, byteOffset, shader): rewrite the program address in a shader-set packet of a prebuilt (PM4)
+// display list, as the hardware reads it: type 1 fetch, 2 vertex, 3 GS copy, 4 GS, 5 pixel.
+static uint32 program_addr(uint32 shader, uint32 ptr_off, uint32 rbuf_off) {
+    uint32 a = mem::r32(shader + ptr_off);
+    return a ? a : mem::r32(shader + rbuf_off + 0xC);
+}
+HLE_EXPORT(gx2, GX2PatchDisplayList) {
+    uint32 s = ARG(3), a;
+    switch (ARG(1)) {
+        case 1: a = mem::r32(s + 0x0C); break;
+        case 2: a = program_addr(s, 0xD4, 0x124); break;
+        case 3: a = program_addr(s, 0x58, 0xB0); break;
+        case 4: a = program_addr(s, 0x50, 0xA0); break;
+        case 5: a = program_addr(s, 0xA8, 0xD8); break;
+        default: LOG("[gx2] GX2PatchDisplayList: type %u", ARG(1)); return;
+    }
+    mem::w32(ARG(0) + ARG(2) + 8, a >> 8);
+}
 HLE_EXPORT(gx2, GX2DirectCallDisplayList) { emit(OP_CALL, {ARG(0), ARG(1)}); }
 
 // ---------------------------------------------------------------- draws
@@ -856,12 +874,12 @@ HLE_EXPORT(gx2, GX2SetClearDepthStencil) {
     db->clearDepth = farg(c, 0);
     db->clearStencil = ARG(1) & 0xFF;
 }
-HLE_EXPORT(gx2, GX2CopySurface) {
+static void copy_surface(uint32 src, uint32 srcMip, uint32 srcSlice, uint32 dst, uint32 dstMip, uint32 dstSlice) {
     std::vector<uint32> p;
-    put_struct(p, ARG(0), kSurfaceWords);
-    p.insert(p.end(), {ARG(1), ARG(2)});
-    put_struct(p, ARG(3), kSurfaceWords);
-    p.insert(p.end(), {ARG(4), ARG(5)});
+    put_struct(p, src, kSurfaceWords);
+    p.insert(p.end(), {srcMip, srcSlice});
+    put_struct(p, dst, kSurfaceWords);
+    p.insert(p.end(), {dstMip, dstSlice});
     emit(OP_COPY_SURFACE, p.data(), (uint32)p.size());
     // The copy is complete when GX2CopySurface returns: the game uses the result (and frees the
     // surfaces) right away. agl's tile-mode conversion (027B5EEC) copies into a temporary surface,
@@ -873,6 +891,16 @@ HLE_EXPORT(gx2, GX2CopySurface) {
         handoff.yield();
         render_sync();
     }
+}
+HLE_EXPORT(gx2, GX2CopySurface) { copy_surface(ARG(0), ARG(1), ARG(2), ARG(3), ARG(4), ARG(5)); }
+// (depthBuffer, dstSurface, dstMip, dstSlice): the depth buffer's view copied slice by slice, as Cemu.
+// GX2DepthBuffer: surface, +0x74 viewMip, +0x78 viewFirstSlice, +0x7C viewNumSlices; GX2Surface +0x24 imagePtr.
+HLE_EXPORT(gx2, GX2ConvertDepthBufferToTextureSurface) {
+    uint32 db = ARG(0), dst = ARG(1);
+    if (mem::r32(db + 0x24) == mem::r32(dst + 0x24)) return;  // in place: only a re-tiling, nothing to copy
+    uint32 slices = std::max<uint32>(mem::r32(db + 0x7C), 1);
+    for (uint32 i = 0; i < slices; i++)
+        copy_surface(db, mem::r32(db + 0x74), mem::r32(db + 0x78) + i, dst, ARG(2), ARG(3) + i);
 }
 HLE_EXPORT(gx2, GX2CopyColorBufferToScanBuffer) {
     std::vector<uint32> p;
@@ -958,6 +986,12 @@ HLE_EXPORT(gx2, GX2SetDRCBuffer) { render::set_tv_format(ARG(3), false); }
 HLE_EXPORT(gx2, GX2SetTVScale) {}
 HLE_EXPORT(gx2, GX2SetDRCScale) {}
 HLE_EXPORT(gx2, GX2SetTVEnable) {}
+HLE_EXPORT(gx2, GX2SetVerifyLevel) {}
+HLE_EXPORT(gx2, GX2SetComputeShader) {
+    // TODO: compute shaders
+    static bool warned = false;
+    if (!warned) { warned = true; LOG("[gx2] compute shaders not implemented yet"); }
+}
 HLE_EXPORT(gx2, GX2SetDRCEnable) {}
 HLE_EXPORT(gx2, GX2CalcTVSize) {
     // (mode, format, bufferingMode, uint32* size, bool* scaleNeeded)
