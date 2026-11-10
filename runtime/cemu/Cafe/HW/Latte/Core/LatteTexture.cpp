@@ -10,6 +10,7 @@
 
 #include <boost/container/small_vector.hpp>
 #include <algorithm>
+#include <bit>
 #include <vector>
 
 struct TexMemOccupancyEntry
@@ -810,8 +811,25 @@ void LatteTexture_GatherTextureRelations(LatteTexture* texture)
 			LatteTextureSliceMipInfo* sliceMipInfo = texture->sliceMipInfo + texture->GetSliceMipArrayIndex(sliceIndex, mipIndex);
 			loopItrMemOccupancyBuckets(sliceMipInfo->addrStart, sliceMipInfo->addrEnd)
 			{
-				for (auto& occupancy : list_texMemOccupancyBucket[bucketIndex])
-					LatteTexture_GatherRelationEntry(texture, sliceMipInfo, occupancy);
+				// BotW-Native: the overlap test for 64 entries at a time without branches (vectorizable), then the
+				// overlapping ones in their original order. Big terrain arrays scanned buckets of thousands of entries per
+				// slice/mip (~15 ms of a load-in frame), nearly all failing the test. Buckets are not modified meanwhile.
+				auto& bucket = list_texMemOccupancyBucket[bucketIndex];
+				const uint32 sStart = sliceMipInfo->addrStart, sEnd = sliceMipInfo->addrEnd;
+				const size_t n = bucket.size();
+				for (size_t base = 0; base < n; base += 64)
+				{
+					const size_t cnt = std::min<size_t>(64, n - base);
+					uint64 mask = 0;
+					for (size_t k = 0; k < cnt; k++)
+						mask |= (uint64)((sEnd >= bucket[base + k].addrStart) & (sStart < bucket[base + k].addrEnd)) << k;
+					while (mask)
+					{
+						const size_t k = (size_t)std::countr_zero(mask);
+						mask &= mask - 1;
+						LatteTexture_GatherRelationEntry(texture, sliceMipInfo, bucket[base + k]);
+					}
+				}
 			}
 		}
 	}
