@@ -8,42 +8,12 @@
 
 namespace gx2 { void checkpoint_vulkan_caches(); }
 
-#if defined(__APPLE__) && !defined(WWHD_SDL_HOST)
-// AppKit host (gfx/display.mm): windows exist, each view gets a CAMetalLayer for a Vulkan surface
-namespace gfx {
-void display_create_windows();
-void display_attach_vulkan(void** tvLayer, void** drcLayer);
-void display_detach();
-void display_start_input();
-void display_vulkan_started();
-void run_appkit_loop();
-}  // namespace gfx
-#endif
-
 namespace render {
 const Backend& vulkan_backend() {
     static const Backend b = [] {
         Backend b{};
         b.api = Api::Vulkan;
-#if defined(__APPLE__) && !defined(WWHD_SDL_HOST)
-        b.init = [] {
-            gfx::display_create_windows();
-            void *tv = nullptr, *drc = nullptr;
-            gfx::display_attach_vulkan(&tv, &drc);
-            try {
-                gfxvk::init_appkit(tv, drc);
-            } catch (...) {
-                gfx::display_detach();  // the fallback renderer attaches fresh layers
-                throw;
-            }
-            gfx::display_vulkan_started();
-            gfx::display_start_input();
-        };
-        b.run_main_loop = gfx::run_appkit_loop;
-#else
         b.init = gfxvk::init;
-        b.run_main_loop = gfxvk::run_main_loop;
-#endif
         b.draw = gfxvk::draw;
         b.clear_color = gfxvk::clear_color;
         b.clear_depth_stencil = gfxvk::clear_depth_stencil;

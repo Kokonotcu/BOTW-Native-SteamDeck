@@ -5,10 +5,11 @@
 #include <cstdint>
 #include <string>
 
+struct SDL_Window;
+
 namespace gfxvk {
 void peek_z(const uint32_t*, uint32_t);
-void init();                     // SDL host: windows + device; AppKit host: see init_appkit
-void run_main_loop();            // SDL host only (the AppKit host runs [NSApp run])
+void init(SDL_Window* window);   // device and swapchain on the host window (host/window.cpp)
 void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr,
           uint32_t baseVertex, uint32_t instances);
 void clear_color(const uint32_t* regs, uint32_t colorBuffer, const float rgba[4]);
@@ -34,10 +35,4 @@ void save_renderer_caches();
 int renderer_smoke_test();
 std::string device_description();  // "<GPU>, driver <version>, Vulkan <version>" ("" before init)
 namespace vk { void reset_shader_memoization(); }
-
-#if defined(__APPLE__) && !defined(WWHD_SDL_HOST)
-// AppKit host (gfx/display.mm): the TV and GamePad views' CAMetalLayers (drc may be null)
-void init_appkit(void* tvLayer, void* drcLayer);
-void screen_changed(int screen, bool visible);  // 0 TV, 1 GamePad: resized / occluded
-#endif
 }  // namespace gfxvk

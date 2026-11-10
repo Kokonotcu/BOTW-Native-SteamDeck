@@ -292,7 +292,8 @@ target_include_directories(BotWRecomp PRIVATE runtime/include runtime/src genera
   runtime/cemu_shims runtime/cemu runtime/cemu/Cafe runtime/cemu/dependencies/imgui)  # native GPU: Latte decompiler/ISA/addrlib headers
 # The native GPU sources use Cemu's Latte headers, which expect Cemu's common definitions first (as cemu_gpu has them).
 file(GLOB_RECURSE NATIVE_GPU_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/runtime/src/gx2/*.cpp ${CMAKE_SOURCE_DIR}/runtime/src/gfx/*.cpp)
-set_source_files_properties(${NATIVE_GPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-include;Common/precompiled.h")
+set_source_files_properties(${NATIVE_GPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-include;Common/precompiled.h"
+  COMPILE_DEFINITIONS "WWHD_HAS_VULKAN=1;WWHD_SDL_HOST=1")
 if(APPLE)
   target_compile_options(BotWRecomp PRIVATE -Wall -Wno-unused-function -Wno-unused-variable -fwrapv -mcpu=apple-m1
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)

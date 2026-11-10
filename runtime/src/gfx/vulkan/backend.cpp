@@ -3224,18 +3224,9 @@ static void set_window_icons() {
       SDL_SetWindowIcon(s->window, icon);
   SDL_DestroySurface(icon);
 }
-// SDL host (Vulkan-only builds): SDL windows, input and audio
-void init() {
-#ifdef __ANDROID__
-  SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
-#endif
-  // hidden test runs: no Dock icon, no activation (the app never takes the focus from the user)
-  if (hidden_windows())
-    SDL_SetHint(SDL_HINT_MAC_BACKGROUND_APP, "1");
-  if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO))
-    throw std::runtime_error(SDL_GetError());
-  // the Vulkan loader (vulkan-1.dll, libvulkan.so.1), loaded here rather than imported (loader.h); the
-  // windows below use the same one
+// On the host window (host/window.cpp made it with SDL_WINDOW_VULKAN); the host owns events, input and audio
+void init(SDL_Window* window) {
+  // the Vulkan loader (libvulkan.so.1), loaded here rather than imported (loader.h); the window uses the same one
   if (!SDL_Vulkan_LoadLibrary(nullptr))
     throw std::runtime_error(std::string("Vulkan is not installed on this computer: the Vulkan runtime "
 #ifdef _WIN32
@@ -3247,35 +3238,7 @@ void init() {
   if (auto custom = drivers::open_custom()) gipa = custom;
 #endif
   load_global_functions(gipa);
-#ifdef __ANDROID__
-  SDL_AddEventWatch(lifecycle_watch, nullptr);
-  const SDL_WindowFlags windowFlags = SDL_WINDOW_VULKAN | SDL_WINDOW_FULLSCREEN;
-#else
-  // test runs: WWHD_HIDDEN_WINDOWS=1 never puts the windows on screen (nothing pops up or takes the
-  // focus); the swapchains still exist, so frame dumps and present dumps work as with visible windows
-  const SDL_WindowFlags windowFlags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
-                                      (hidden_windows() ? SDL_WINDOW_HIDDEN : 0);
-#endif
-  R.tv.window = SDL_CreateWindow("Wind Waker HD — Vulkan", 1280, 720, windowFlags);
-  if (!R.tv.window)
-    throw std::runtime_error(SDL_GetError());
-#ifdef __ANDROID__
-  // one surface: the GamePad picture is drawn into it (display_modes.h: picture-in-picture, GamePad
-  // only), never a window of its own
-#else
-  if (!getenv("WWHD_NO_GAMEPAD")) {
-    // made hidden: the GamePad screen mode (load_saved_options below) shows it in window mode only;
-    // the other modes draw the GamePad picture into the TV window (gfx/display_modes.h)
-    R.drc.window = SDL_CreateWindow("GamePad — Vulkan", 854, 480, windowFlags | SDL_WINDOW_HIDDEN);
-    if (!R.drc.window)
-      throw std::runtime_error(SDL_GetError());
-    R.drc.visible = false;
-    gfx::g_has_drc_window = true;
-  }
-#endif
-  if (hidden_windows())
-    R.tv.visible = R.drc.visible = false;  // no drawables: pictures only reach frame / present dumps
-  set_window_icons();
+  R.tv.window = window;  // the TV picture; no GamePad window (the host shows one screen)
   uint32_t n;
   const char *const *se = SDL_Vulkan_GetInstanceExtensions(&n);
   if (!se)
@@ -3289,18 +3252,9 @@ void init() {
       s->height = height;
     }
   init_device(std::vector<const char *>(se, se + n), [] {
-    if (!WWHD_CREATE_WINDOW_SURFACE(R.tv.window, R.instance, nullptr,
-                                  &R.tv.surface))
-      throw std::runtime_error(SDL_GetError());
-    if (R.drc.window && !WWHD_CREATE_WINDOW_SURFACE(R.drc.window, R.instance,
-                                                  nullptr, &R.drc.surface))
+    if (!SDL_Vulkan_CreateSurface(R.tv.window, R.instance, nullptr, &R.tv.surface))
       throw std::runtime_error(SDL_GetError());
   });
-  mods::mouse_init(R.tv.window);
-  input::set_prompt_window(R.tv.window);
-  input::init();
-  install_graphics_menu(R.tv.window);
-  ::hostui::load_saved_options();  // graphics and GamePad screen options saved by the settings overlay (settings.ini)
 }
 #endif
 void save_renderer_caches() {

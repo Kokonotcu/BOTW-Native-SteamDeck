@@ -1,33 +1,21 @@
-// Renderer selection and dispatch. One executable can contain both renderers (macOS default build:
-// WWHD_RENDERER=BOTH): Metal (gfx/metal_*.mm, namespace gfx) and Vulkan (gfx/vulkan/*, namespace
-// gfxvk). Each fills a Backend table; the GX2 layer and the host (windows, menus, save states) call
-// the functions below, which forward to the renderer chosen once at start-up.
-//
-// Choice, highest priority first:
-//   --renderer=metal|vulkan (or --renderer metal|vulkan)   command line
-//   WWHD_RENDERER_RUNTIME=metal|vulkan                      environment (tests)
-//   Graphics > Renderer                                     saved setting (display.plist, "renderer")
-//   Metal                                                   default
-// If Vulkan cannot start (no Vulkan loader / MoltenVK / suitable device), the game starts with Metal
-// and says why (log, window title, a sheet on the TV window).
+// The native renderer (Vulkan, gfx/vulkan/*, namespace gfxvk) behind a Backend table; the GX2 layer calls the
+// functions below. Started on the host window by latte::create_renderer (gfx/latte_native.cpp).
 #pragma once
 #include <cstdint>
 #include <string>
 #include <vector>
 
+struct SDL_Window;
+
 namespace render {
 
 enum class Api : int { Metal = 0, Vulkan = 1 };
 const char* api_name(Api a);      // "Metal", "Vulkan"
-const char* api_key(Api a);       // "metal", "vulkan" (setting / command line value)
-bool compiled(Api a);             // built into this executable
-bool can_choose();                // more than one renderer built in (the Graphics menu offers the choice)
 
 struct Backend {
     Api api;
-    // start-up on the main thread; throws std::exception when the renderer cannot start
-    void (*init)();
-    void (*run_main_loop)();
+    // start-up on the main thread, on the host window; throws std::exception when the renderer cannot start
+    void (*init)(SDL_Window* window);
     // GX2 render thread (in submission order)
     void (*draw)(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr,
                  uint32_t baseVertex, uint32_t instances);
@@ -82,31 +70,11 @@ enum Feature : int { kFeatureAO, kFeatureAOHires, kFeatureAniso, kFeatureFXAA, k
                      kFeatureShaderHeadStart };
 
 extern const Backend* g_backend;
-#ifdef WWHD_HAS_METAL
-const Backend& metal_backend();   // gfx/metal_backend.mm
-#endif
-#ifdef WWHD_HAS_VULKAN
 const Backend& vulkan_backend();  // gfx/vulkan/backend_table.cpp
-#endif
 
-// ---- start-up (main.cpp)
-// pick the renderer from the command line, environment and saved setting (before init)
-void choose(int argc, char** argv);
-// argv without --renderer options (restart with the saved choice)
-void set_restart_args(int argc, char** argv);
-// start the chosen renderer; falls back to Metal when Vulkan cannot start
-void init();
-void run_main_loop();
-
+void init(SDL_Window* window);    // main thread (latte::create_renderer); a failure is fatal
 Api active();
 inline bool vulkan() { return g_backend && g_backend->api == Api::Vulkan; }
-Api requested();                  // what was asked for at start-up (differs from active() after a fallback)
-std::string fallback_reason();    // why the requested renderer did not start ("" if it did)
-Api preferred();                  // saved setting: the renderer the next start uses
-void set_preferred(Api a);        // save the setting (Graphics > Renderer)
-bool restart_pending();           // the setting was changed this session to another renderer than the active one
-// relaunch the game with the saved choice (Graphics > Renderer > Restart now); returns on failure
-bool restart();
 
 // ---- dispatch
 // base instance of the draw being issued (GX2DrawIndexedEx2); 0 otherwise. Metal only so far.
