@@ -1,4 +1,4 @@
-# BotW-Native for Steam Deck — v0.8.0
+# BotW-Native for Steam Deck — v0.8.3
 
 Breath of the Wild (Wii U) running natively on the **Steam Deck** (SteamOS, Vulkan/RADV) and other Linux PCs.
 The PowerPC game code is statically recompiled to C++ and runs on a Cafe OS runtime; Cemu's Latte GPU layer
@@ -19,7 +19,7 @@ Deck platform itself. Work in progress, not a full-game release.
 
 LCD Steam Deck, SteamOS, 60 fps mode, 1280x720 render. "15 W" / "8 W" are the Deck's TDP limit.
 
-| | Start of the port (2026-10-31) | Now (v0.8.0) |
+| | Start of the port (2026-10-31) | v0.8.0 |
 | --- | --- | --- |
 | Open world, 15 W | 37–48 fps, CPU-bound | locked 60 fps (59.6–60 average) |
 | Open world, 8 W | 46–52 fps | 56–58 fps |
@@ -218,6 +218,35 @@ Environment variables, for comparing or working around a problem. Defaults are t
 - Windows was not re-tested in this fork. macOS/iOS (Metal) are upstream's and untouched.
 
 ## Version
+
+v0.8.3 (Deck build 180): hitch work on top of v0.8.2, every change exact (same game behaviour), measured on the Deck.
+- Periodic GPU-thread spikes removed:
+  - the index cache trim, every ~44 s;
+  - the first wave of texture deletions, ~2 min after each load;
+  - the pipeline cache save, which blocked pipeline creation for 25-50 ms;
+  - a 35 ms frame when a new 128 MB texture memory block was allocated (now allocated ahead).
+- First visits: the shader compile threads were counted from logical cores and ran on the game's worker cores;
+  they now use the physical count.
+- Loads and fast travel:
+  - texture decoding runs on helper threads, and the GPU thread no longer waits for it at submit;
+  - texture change hashes are computed off the GPU thread;
+  - buffer-cache merges load only the gaps.
+
+  The worst frame after a load went from 86-95 ms to 43-48 ms, and most of that work now finishes behind the
+  loading screen.
+- Recompiler:
+  - float compares no longer update FPSCR's FPCC (BotW never reads it);
+  - faster exact float stores;
+  - inline fres/frsqrte;
+  - the entry saves of f14-f31 that nothing reads are dropped.
+- Results:
+  - No frame over 50 ms after the load at six test places (Riverside Stable, Lurelin, Kakariko, Hateno, Zora's
+    Domain, Woodland).
+  - With no TDP limit, Kakariko has about 2-3 frames over 25 ms per minute.
+  - At 8 W the Deck's power limit holds the CPU at ~2.4 GHz and the GPU at ~500-800 MHz, and frames still go over
+    16.7 ms every few seconds in heavy views.
+
+v0.8.2: display-list prefetch and branchless cube map helpers. v0.8.1: the "world" gyro turning mode removed.
 
 v0.8.0: about 145 Deck builds on top of upstream's main from before its v0.1.2 release (upstream v0.1.2's
 controller, region and launcher fixes are not merged yet), with the Linux / Steam Deck port and changes to the
