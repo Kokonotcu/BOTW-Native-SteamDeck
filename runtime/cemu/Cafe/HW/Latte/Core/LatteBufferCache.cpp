@@ -1518,7 +1518,8 @@ public:
 		}
 	}
 
-	static BufferCacheNode* Create(MPTR rangeBegin, MPTR rangeEnd, std::span<BufferCacheNode*> overlappingObjects)
+	// checkedNow: the caller syncs the new node with RAM right away (LatteBufferCache_retrieveDataInCache)
+	static BufferCacheNode* Create(MPTR rangeBegin, MPTR rangeEnd, std::span<BufferCacheNode*> overlappingObjects, bool checkedNow)
 	{
 		auto newRange = new BufferCacheNode(rangeBegin, rangeEnd);
 		if (!newRange->allocateCacheMemory())
@@ -1546,14 +1547,33 @@ public:
 				}
 			}
 		}
-		newRange->syncFromRAM(rangeBegin, rangeEnd); // possible small optimization: only load the ranges from RAM which are not overwritten by ->syncFromNode()
+		// BotW-Native: RAM is loaded (and hashed) only where no old node's data is copied over it below; upstream loaded
+		// the whole range first ("possible small optimization" note). And a caller that syncs right away rechecks only
+		// the copied parts: the rest was hashed from RAM a moment ago. A new area's big nodes were hashed twice and
+		// uploaded once more than needed in one GPU-thread frame (10-15 ms of hashing, castle 98.7 s / load-ins).
+		MPTR ramFrom = rangeBegin;
+		for (auto itr : overlappingObjects)  // address order, no overlaps among them
+		{
+			if (itr == nullptr)
+				continue;
+			const MPTR from = std::max(itr->m_rangeBegin, rangeBegin);
+			if (from > ramFrom)
+				newRange->syncFromRAM(ramFrom, from);
+			ramFrom = std::max(ramFrom, std::min(itr->m_rangeEnd, rangeEnd));
+		}
+		if (ramFrom < rangeEnd)
+			newRange->syncFromRAM(ramFrom, rangeEnd);
 		for (auto itr : overlappingObjects)
 		{
 			if(itr == nullptr)
 				continue;
 			newRange->syncFromNode(itr);
+			if (checkedNow)
+				newRange->checkAndSyncModifications(std::max(itr->m_rangeBegin, rangeBegin), std::min(itr->m_rangeEnd, rangeEnd), true);
 			delete itr;
 		}
+		if (checkedNow)
+			newRange->m_lastModifyCheckCronon = g_currentCacheChronon;
 		return newRange;
 	}
 
@@ -1625,7 +1645,7 @@ void LatteBufferCache_nodeCacheForget(BufferCacheNode* node, uint32 rangeBegin, 
 	}
 }
 
-BufferCacheNode* LatteBufferCache_reserveRange(MPTR physAddress, uint32 size)
+BufferCacheNode* LatteBufferCache_reserveRange(MPTR physAddress, uint32 size, bool checkedNow)
 {
 	NodeCacheEntry& cached = NodeCacheSlot(physAddress);
 	const bool stats = telem::on();  // hit/miss statistics: telemetry only
@@ -1654,7 +1674,7 @@ BufferCacheNode* LatteBufferCache_reserveRange(MPTR physAddress, uint32 size)
 	if (s_gpuCacheQueryResult.empty())
 	{
 		// no overlaps we can just create a new blank range
-		BufferCacheNode* newRange = BufferCacheNode::Create(rangeStart, rangeEnd, s_gpuCacheQueryResult);
+		BufferCacheNode* newRange = BufferCacheNode::Create(rangeStart, rangeEnd, s_gpuCacheQueryResult, checkedNow);
 		g_gpuBufferCache.AddRange(rangeStart, rangeEnd, newRange);
 		return newRange;
 	}
@@ -1665,7 +1685,7 @@ BufferCacheNode* LatteBufferCache_reserveRange(MPTR physAddress, uint32 size)
 		uint32 mergedRangeEnd = std::max<uint32>(rangeEnd, s_gpuCacheQueryResult.back()->GetRangeEnd());
 		for (auto& it : s_gpuCacheQueryResult)
 			g_gpuBufferCache.RemoveRange(it->GetRangeBegin(), it->GetRangeEnd()); // remove from interval tree, BufferCacheNode::Create below will delete the range objects
-		BufferCacheNode* newRange = BufferCacheNode::Create(mergedRangeStart, mergedRangeEnd, s_gpuCacheQueryResult);
+		BufferCacheNode* newRange = BufferCacheNode::Create(mergedRangeStart, mergedRangeEnd, s_gpuCacheQueryResult, checkedNow);
 		g_gpuBufferCache.AddRange(mergedRangeStart, mergedRangeEnd, newRange);
 		return newRange;
 	}
@@ -1673,7 +1693,7 @@ BufferCacheNode* LatteBufferCache_reserveRange(MPTR physAddress, uint32 size)
 
 uint32 LatteBufferCache_retrieveDataInCache(MPTR physAddress, uint32 size)
 {
-	auto range = LatteBufferCache_reserveRange(physAddress, size);
+	auto range = LatteBufferCache_reserveRange(physAddress, size, true);
 	range->flagInUse();
 
 	range->checkAndSyncModificationsIfChrononChanged(physAddress, size);
@@ -1687,7 +1707,7 @@ void LatteBufferCache_copyStreamoutDataToCache(MPTR physAddress, uint32 size, ui
 		return;
 	cemu_assert_debug(size >= 16);
 
-	auto range = LatteBufferCache_reserveRange(physAddress, size);
+	auto range = LatteBufferCache_reserveRange(physAddress, size, false);
 	range->flagInUse();
 
 	g_renderer->bufferCache_copyStreamoutToMainBuffer(streamoutBufferOffset, range->getBufferOffset(physAddress), size);
