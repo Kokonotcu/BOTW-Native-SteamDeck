@@ -9,6 +9,8 @@
 #include "Cafe/GraphicPack/GraphicPack2.h"
 
 #include <boost/container/small_vector.hpp>
+#include <algorithm>
+#include <vector>
 
 struct TexMemOccupancyEntry
 {
@@ -765,8 +767,37 @@ void LatteTexture_DeleteDataOverlapTracking(LatteTexture* texture)
 	}
 }
 
+// one occupancy entry against one slice/mip of the new texture (the upstream loop body)
+static void LatteTexture_GatherRelationEntry(LatteTexture* texture, LatteTextureSliceMipInfo* sliceMipInfo, TexMemOccupancyEntry& occupancy)
+{
+	// BotW-Native: the address test (inline in the entry) before the owner lookup (a dependent load through
+	// sliceMipInfo per entry); same checks, same order of effects
+	if (!(sliceMipInfo->addrEnd >= occupancy.addrStart && sliceMipInfo->addrStart < occupancy.addrEnd))
+		return;
+	LatteTexture* itrTexture = occupancy.sliceMipInfo->texture;
+	if (itrTexture == texture)
+		return; // ignore self
+	if (sliceMipInfo->addrStart == occupancy.addrStart && sliceMipInfo->subIndex == occupancy.sliceMipInfo->subIndex)
+	{
+		// overlapping with zero x/y offset
+		if (sliceMipInfo->pitch == occupancy.sliceMipInfo->pitch && LatteTexture_IsTexelSizeCompatibleFormat(texture->format, itrTexture->format)
+			&& sliceMipInfo->tileMode == occupancy.sliceMipInfo->tileMode &&
+			LatteTexture_IsFormatViewCompatible(texture->format, itrTexture->format))
+		{
+			LatteTexture_TrackTextureRelation(texture, itrTexture);
+		}
+		// else: pitch not compatible or format not compatible
+	}
+	else
+	{
+		LatteTexture_TrackDataOverlap(texture, sliceMipInfo, occupancy);
+	}
+}
+
 void LatteTexture_GatherTextureRelations(LatteTexture* texture)
 {
+	// (an address-sorted per-call index was tried, b167: one long entry per bucket made the candidate window most of the
+	// bucket and the per-slice sort of candidates cost ~80 ms of a load-in frame; the plain scan stays)
 	for (sint32 mipIndex = 0; mipIndex < texture->mipLevels; mipIndex++)
 	{
 		sint32 mipSliceCount;
@@ -780,32 +811,7 @@ void LatteTexture_GatherTextureRelations(LatteTexture* texture)
 			loopItrMemOccupancyBuckets(sliceMipInfo->addrStart, sliceMipInfo->addrEnd)
 			{
 				for (auto& occupancy : list_texMemOccupancyBucket[bucketIndex])
-				{
-					LatteTexture* itrTexture = occupancy.sliceMipInfo->texture;
-					if (itrTexture == texture)
-						continue; // ignore self
-					if (sliceMipInfo->addrEnd >= occupancy.addrStart && sliceMipInfo->addrStart < occupancy.addrEnd)
-					{
-						if (sliceMipInfo->addrStart == occupancy.addrStart && sliceMipInfo->subIndex == occupancy.sliceMipInfo->subIndex)
-						{
-							// overlapping with zero x/y offset
-							if (sliceMipInfo->pitch == occupancy.sliceMipInfo->pitch && LatteTexture_IsTexelSizeCompatibleFormat(texture->format, itrTexture->format)
-								&& sliceMipInfo->tileMode == occupancy.sliceMipInfo->tileMode &&
-								LatteTexture_IsFormatViewCompatible(texture->format, itrTexture->format))
-							{
-								LatteTexture_TrackTextureRelation(texture, itrTexture);
-							}
-							else
-							{
-								// pitch not compatible or format not compatible
-							}
-						}
-						else
-						{
-							LatteTexture_TrackDataOverlap(texture, sliceMipInfo, occupancy);
-						}
-					}
-				}
+					LatteTexture_GatherRelationEntry(texture, sliceMipInfo, occupancy);
 			}
 		}
 	}
