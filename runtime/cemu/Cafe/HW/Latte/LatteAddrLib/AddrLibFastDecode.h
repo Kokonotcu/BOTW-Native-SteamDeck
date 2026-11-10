@@ -14,7 +14,7 @@ inline bool microTileRowsContiguous(const uint16* table)
 template<typename texelBaseType, int texelBaseTypeCount, bool isEncodeDirection, bool isCompressed>
 void optimizedDecodeLoop_tm04_numSamples1_8x8(LatteTextureLoaderCtx* textureLoader, uint8* outputData, sint32 texelCountX, sint32 texelCountY)
 {
-	uint16* tableBase = textureLoader->computeAddrInfo.microTilePixelIndexTable + ((textureLoader->computeAddrInfo.slice & 7) << 6);
+	const uint16* tableBase = textureLoader->computeAddrInfo.microTilePixelIndexTable + ((textureLoader->computeAddrInfo.slice & 7) << 6);
 	for (sint32 yt = 0; yt < texelCountY; yt += 8)
 	{
 		for (sint32 xt = 0; xt < texelCountX; xt += 8)
@@ -25,7 +25,7 @@ void optimizedDecodeLoop_tm04_numSamples1_8x8(LatteTextureLoaderCtx* textureLoad
 				sint32 pixelOffset = ((yt + ry)*textureLoader->decodedTexelCountX + (xt)) * (sizeof(texelBaseType)*texelBaseTypeCount);
 				texelBaseType* blockOutput = (texelBaseType*)(outputData + pixelOffset);
 
-				uint16* pixelOffsets = tableBase + (ry << 3);
+				const uint16* pixelOffsets = tableBase + (ry << 3);
 
 				for (sint32 rx = 0; rx < 8; rx++)
 				{
@@ -76,7 +76,7 @@ void optimizedDecodeLoop_tm04_numSamples1_8x8(LatteTextureLoaderCtx* textureLoad
 template<typename texelBaseType, int texelBaseTypeCount, bool isEncodeDirection, bool isCompressed>
 void optimizedDecodeLoop_tm04_numSamples1_8x8_optimizedRowCopy(LatteTextureLoaderCtx* textureLoader, uint8* outputData, sint32 texelCountX, sint32 texelCountY)
 {
-	uint16* tableBase = textureLoader->computeAddrInfo.microTilePixelIndexTable + ((textureLoader->computeAddrInfo.slice & 7) << 6);
+	const uint16* tableBase = textureLoader->computeAddrInfo.microTilePixelIndexTable + ((textureLoader->computeAddrInfo.slice & 7) << 6);
 	for (sint32 yt = 0; yt < texelCountY; yt += 8)
 	{
 		for (sint32 xt = 0; xt < texelCountX; xt += 8)
@@ -87,7 +87,7 @@ void optimizedDecodeLoop_tm04_numSamples1_8x8_optimizedRowCopy(LatteTextureLoade
 				sint32 pixelOffset = ((yt + ry)*textureLoader->decodedTexelCountX + (xt)) * (sizeof(texelBaseType)*texelBaseTypeCount);
 				texelBaseType* blockOutput = (texelBaseType*)(outputData + pixelOffset);
 
-				uint16* pixelOffsets = tableBase + (ry << 3);
+				const uint16* pixelOffsets = tableBase + (ry << 3);
 
 				uint32 pixelIndex = *pixelOffsets;
 				pixelOffsets++;

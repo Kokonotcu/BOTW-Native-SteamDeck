@@ -172,7 +172,9 @@ namespace LatteAddrLib
 		// const
 		uint32 c0;
 		// micro tile pixel index table
-		uint16 microTilePixelIndexTable[8 * 8 * 8];
+		// BotW-Native: points at the shared, never-freed table for (bpp, tile mode, micro tile type) instead of a 1 KB copy
+		// in every context (each texture slice/mip load zeroed and copied it)
+		const uint16* microTilePixelIndexTable;
 	};
 
 	void SetupCachedSurfaceAddrInfo(CachedSurfaceAddrInfo* info, uint32 slice, uint32 sample, uint32 bpp, uint32 pitch, uint32 height, uint32 depth, uint32 numSamples, Latte::E_HWTILEMODE tileMode, int isDepth, uint32 pipeSwizzle, uint32 bankSwizzle);

@@ -338,10 +338,9 @@ namespace LatteAddrLib
 		}
 		info->bytesPerPixel = info->pixelOffsetMul >> 3;
 		// table for micro tile offset calculation: a pure function of (bpp, tile mode, micro tile type), so each table
-		// is built once and copied. BotW-Native: rebuilding all 512 entries per mip/slice was 20% of the GPU thread's
+		// is built once and shared. BotW-Native: rebuilding all 512 entries per mip/slice was 20% of the GPU thread's
 		// samples in the area-load frames (b97 Deck session 031115: 34-75 ms GPU-thread frames while textures load).
-		memcpy(info->microTilePixelIndexTable, GetMicroTilePixelIndexTable(info->bpp, info->tileMode, info->microTileType),
-		       sizeof(info->microTilePixelIndexTable));
+		info->microTilePixelIndexTable = GetMicroTilePixelIndexTable(info->bpp, info->tileMode, info->microTileType);
 		// other constant values
 		uint32 swizzle = info->pipeSwizzle + m_pipes * info->bankSwizzle;
 		info->c0 = (swizzle + info->sliceIn * info->rotation);
