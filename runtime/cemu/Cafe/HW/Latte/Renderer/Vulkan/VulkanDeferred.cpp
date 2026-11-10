@@ -22,6 +22,7 @@
 
 extern "C" void botw_place_thread(int kind);  // runtime/src/thread.cpp core plan
 void LatteCP_idleUntilWrite(const void* addr, uint32 seen);  // MWAITX until addr is written (LatteCommandProcessor.cpp)
+void LatteTextureLoader_WaitAsyncDecodeBatch(void* batch);  // LatteTextureLoader.cpp
 
 namespace
 {
@@ -77,6 +78,7 @@ namespace
 	std::atomic<VkResult> s_submitError{VK_SUCCESS};
 	bool s_installed = false;
 	thread_local bool t_producer = false;
+	thread_local void* t_submitDecodeBatch = nullptr;  // producer: decode batch the next vkQueueSubmit waits for
 
 	struct Rec
 	{
@@ -609,8 +611,14 @@ namespace
 	VKAPI_ATTR VkResult VKAPI_CALL T_vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence fence)
 	{
 		VKDEFER_DIRECT(vkQueueSubmit, q, n, s, fence);
+		void* const decodeBatch = t_submitDecodeBatch;  // texture decodes this submit's uploads need (VkDefer_WaitBeforeNextSubmit)
+		t_submitDecodeBatch = nullptr;
 		if (VkResult e = s_submitError.load(std::memory_order_relaxed); e != VK_SUCCESS)
+		{
+			if (decodeBatch)
+				LatteTextureLoader_WaitAsyncDecodeBatch(decodeBatch);
 			return e;
+		}
 		uint64 extra = Bytes<VkSubmitInfo>(n);
 		bool chained = false;
 		for (uint32 k = 0; k < n; k++)
@@ -622,6 +630,8 @@ namespace
 		if (chained)
 		{
 			Drain();
+			if (decodeBatch)
+				LatteTextureLoader_WaitAsyncDecodeBatch(decodeBatch);
 			return r_vkQueueSubmit(q, n, s, fence);
 		}
 		FenceSlot* fenceSlot = fence ? FindFence(fence, true) : nullptr;
@@ -637,6 +647,8 @@ namespace
 				c[k].pSignalSemaphores = Copy(x, s[k].pSignalSemaphores, s[k].signalSemaphoreCount);
 			}
 			return [=] {
+				if (decodeBatch)
+					LatteTextureLoader_WaitAsyncDecodeBatch(decodeBatch);
 				const VkResult r = r_vkQueueSubmit(q, n, c, fence);
 				if (r != VK_SUCCESS)
 					s_submitError.store(r, std::memory_order_relaxed);
@@ -705,6 +717,16 @@ namespace
 void VkDefer_SetProducerThread()
 {
 	t_producer = s_installed;
+}
+
+// The next vkQueueSubmit from this thread waits for the texture decode batch right before the driver call (on the
+// recording thread when queued); false: submits are not deferred here, the caller waits itself.
+bool VkDefer_WaitBeforeNextSubmit(void* batch)
+{
+	if (!t_producer)
+		return false;
+	t_submitDecodeBatch = batch;
+	return true;
 }
 
 void VkDefer_Install()

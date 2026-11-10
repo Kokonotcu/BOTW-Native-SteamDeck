@@ -2598,11 +2598,16 @@ void VulkanRenderer::WaitForNextFinishedCommandBuffer()
 	ProcessFinishedCommandBuffers();
 }
 
-void LatteTextureLoader_JoinAsyncDecodes();  // LatteTextureLoader.cpp: decoded texture data into the recorded uploads
+void* LatteTextureLoader_CloseAsyncDecodeBatch();  // LatteTextureLoader.cpp: decoded texture data into the recorded uploads
+void LatteTextureLoader_WaitAsyncDecodeBatch(void* batch);
+bool VkDefer_WaitBeforeNextSubmit(void* batch);  // VulkanDeferred.cpp
 
 void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphore waitSemaphore)
 {
-	LatteTextureLoader_JoinAsyncDecodes();  // the upload memory this command buffer copies from is filled
+	// the upload memory this command buffer copies from is filled before the driver submit: waited for on the
+	// recording thread when submits are deferred, else here
+	if (void* decodeBatch = LatteTextureLoader_CloseAsyncDecodeBatch(); decodeBatch && !VkDefer_WaitBeforeNextSubmit(decodeBatch))
+		LatteTextureLoader_WaitAsyncDecodeBatch(decodeBatch);
 	draw_endRenderPass();
 
 	occlusionQuery_notifyEndCommandBuffer();

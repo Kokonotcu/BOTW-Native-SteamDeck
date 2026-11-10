@@ -615,6 +615,15 @@ namespace
 	class AsyncTextureDecoder
 	{
 	public:
+		// The jobs pushed while one command buffer is recorded form a batch. A submit no longer joins on the GPU thread:
+		// the recording thread (VkRecord) waits for the batch right before the driver submit (VulkanDeferred.cpp), so
+		// the GPU thread goes on recording while the helpers finish. Batches are reused round-robin; one reused while
+		// still pending only makes its waiter wait for more jobs.
+		struct Batch
+		{
+			std::atomic<int> pending{0};
+		};
+
 		void push(TextureDecoder* decoder, const LatteTextureLoaderCtx& ctx, uint8* dst, uint32 size)
 		{
 			{
@@ -622,10 +631,29 @@ namespace
 				if (m_threads.empty())
 					for (int i = 0; i < kHelpers; i++)
 						m_threads.emplace_back([this] { helperLoop(); }).detach();
-				m_jobs.push_back(Job{decoder, ctx, dst, size});
+				Batch* batch = &m_batches[m_batchIndex];
+				batch->pending.fetch_add(1, std::memory_order_relaxed);
+				m_jobs.push_back(Job{decoder, ctx, dst, size, batch});
 				m_pending.fetch_add(1, std::memory_order_relaxed);
 			}
 			m_jobCv.notify_one();
+		}
+
+		// GPU thread, at a submit: the batch of the command buffer being submitted (nullptr: nothing pending in it)
+		Batch* closeBatch()
+		{
+			std::lock_guard lock(m_mutex);
+			Batch* batch = &m_batches[m_batchIndex];
+			if (batch->pending.load(std::memory_order_acquire) == 0)
+				return nullptr;
+			m_batchIndex = (m_batchIndex + 1) % kBatches;
+			return batch;
+		}
+
+		static void waitBatch(Batch* batch)
+		{
+			for (int v; (v = batch->pending.load(std::memory_order_acquire)) != 0;)
+				batch->pending.wait(v, std::memory_order_acquire);
 		}
 
 		// GPU thread: run queued jobs itself, then wait for the ones the helpers are running
@@ -643,8 +671,7 @@ namespace
 					lock.unlock();
 					run(job);
 					lock.lock();
-					if (m_pending.fetch_sub(1, std::memory_order_release) == 1)
-						m_doneCv.notify_all();  // another joiner may be waiting (today all joins are on the GPU thread)
+					finish(job);  // another joiner may be waiting (today all joins are on the GPU thread)
 					continue;
 				}
 				if (m_pending.load(std::memory_order_acquire) == 0)
@@ -661,7 +688,18 @@ namespace
 			LatteTextureLoaderCtx ctx;
 			uint8* dst;
 			uint32 size;
+			Batch* batch;
 		};
+		static constexpr int kBatches = 64;
+
+		// m_mutex held
+		void finish(Job& job)
+		{
+			if (job.batch->pending.fetch_sub(1, std::memory_order_release) == 1)
+				job.batch->pending.notify_all();
+			if (m_pending.fetch_sub(1, std::memory_order_release) == 1)
+				m_doneCv.notify_all();
+		}
 
 		static void run(Job& job)
 		{
@@ -691,8 +729,7 @@ namespace
 				lock.unlock();
 				run(job);
 				lock.lock();
-				if (m_pending.fetch_sub(1, std::memory_order_release) == 1)
-					m_doneCv.notify_all();
+				finish(job);
 			}
 		}
 
@@ -701,6 +738,8 @@ namespace
 		std::deque<Job> m_jobs;
 		std::vector<std::thread> m_threads;
 		std::atomic<int> m_pending{0};
+		Batch m_batches[kBatches];
+		int m_batchIndex = 0;  // m_mutex
 	};
 	AsyncTextureDecoder* s_asyncTextureDecoder = new AsyncTextureDecoder();  // never destroyed: the helpers run until exit
 
@@ -720,6 +759,16 @@ namespace
 void LatteTextureLoader_JoinAsyncDecodes()
 {
 	s_asyncTextureDecoder->join();
+}
+
+void* LatteTextureLoader_CloseAsyncDecodeBatch()
+{
+	return s_asyncTextureDecoder->closeBatch();
+}
+
+void LatteTextureLoader_WaitAsyncDecodeBatch(void* batch)
+{
+	AsyncTextureDecoder::waitBatch((AsyncTextureDecoder::Batch*)batch);
 }
 
 void LatteTextureLoader_UpdateTextureSliceData(LatteTexture* tex, uint32 sliceIndex, uint32 mipIndex, MPTR physImagePtr, MPTR physMipPtr, Latte::E_DIM dim, uint32 width, uint32 height, uint32 depth, uint32 mipLevels, uint32 pitch, Latte::E_HWTILEMODE tileMode, uint32 swizzle, bool dumpTex)
