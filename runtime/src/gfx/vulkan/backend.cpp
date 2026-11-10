@@ -19,7 +19,6 @@
 #include "bc_decode.h"
 #include "android_driver.h"
 #include "buffer_cache.h"
-#include "render_prof.h"
 #include "perf_metrics.h"
 #include "report_header.h"
 #include "present.h"
@@ -234,16 +233,13 @@ void init_pipeline_cache() try {
     R.pipelineCache=VK_NULL_HANDLE;
   LOG("[vulkan cache] load disabled after error: %s",error.what());
 }
-// profWait: also report the wait to the render-thread profiler (render_prof.h)
-template<class F> VkResult timed_call(WaitTiming& timing, F&& call, int profWait = -1) {
-  const bool profiled = profWait >= 0 && rprof::enabled();
-  if (!perf_enabled() && !profiled) return call();
+template<class F> VkResult timed_call(WaitTiming& timing, F&& call) {
+  if (!perf_enabled()) return call();
   auto start = std::chrono::steady_clock::now();
   VkResult result = call();
   const uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now() - start).count();
   if (perf_enabled()) { ++timing.count; timing.ns += ns; }
-  if (profiled) rprof::add_wait(rprof::Wait(profWait), ns);
   return result;
 }
 } // namespace
@@ -461,7 +457,6 @@ UploadSlice allocate_upload(VkDeviceSize size, VkDeviceSize alignment) {
       return UploadSlice{};
     block.used = offset + size;
     R.uploadBytes += size;
-    rprof::add_upload(size);
     return UploadSlice{block.buffer.buffer,offset,size,
                        static_cast<uint8_t*>(block.buffer.mapped)+offset};
   };
@@ -898,7 +893,7 @@ static void retire_submission(Renderer::Submission& slot, WaitTiming& timing=sub
   if (status==VK_NOT_READY) {
     vk_check(timed_call(timing,[&] {
       return vkWaitForFences(R.device,1,&slot.fence,VK_TRUE,UINT64_MAX);
-    },rprof::kWaitGpu),"wait submission retirement");
+    }),"wait submission retirement");
   } else vk_check(status,"submission fence status");
   timed_call(retirementCleanupTiming,[&] {
     collect_gpu_timestamp_queries(slot);
@@ -1915,7 +1910,7 @@ static void present(Screen &s) {
 #endif
     return vkAcquireNextImageKHR(R.device, s.swapchain, secondary ? 0 : UINT64_MAX,
                                 acquireSemaphore, VK_NULL_HANDLE, &index);
-  }, rprof::kWaitAcquire);
+  });
   // No image was acquired and the semaphore remains unsignalled. Leave it
   // available for another frame; submitting a wait here would deadlock.
   if (ar == VK_NOT_READY || ar == VK_TIMEOUT)
@@ -2121,7 +2116,7 @@ static void present(Screen &s) {
     if(secondary)result=secondary_present_result(result);
 #endif
     return result;
-  }, rprof::kWaitPresent);
+  });
   if (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR)
     ++s.presented;
 #ifdef __ANDROID__
@@ -2143,7 +2138,7 @@ static void present(Screen &s) {
     vk_check(pr, "present scan buffer");
 #endif
   if (!async)
-    vk_check(timed_call(timing.idle, [&] { return vkQueueWaitIdle(R.queue); }, rprof::kWaitGpu),
+    vk_check(timed_call(timing.idle, [&] { return vkQueueWaitIdle(R.queue); }),
              "present completion");
 }
 void copy_to_scan(uint32_t cb, uint32_t target) {
@@ -3198,33 +3193,6 @@ static bool hidden_windows() {
 }
 // The game's own icon on the windows (title bar, taskbar): meta/iconTex.tga of the game folder, an
 // uncompressed 32-bit TGA (128x128 in Wind Waker HD). Nothing happens without it.
-static void set_window_icons() {
-  FILE *f = std::fopen((config::game_dir + "/meta/iconTex.tga").c_str(), "rb");
-  if (!f)
-    return;
-  std::vector<uint8_t> d;
-  uint8_t buf[65536];
-  for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;)
-    d.insert(d.end(), buf, buf + n);
-  std::fclose(f);
-  if (d.size() < 18 || d[1] != 0 || d[2] != 2 || d[16] != 32)  // no colour map, true colour, 32 bpp
-    return;
-  const uint32_t w = d[12] | d[13] << 8, h = d[14] | d[15] << 8, start = 18 + d[0];
-  if (!w || !h || w > 1024 || h > 1024 || d.size() < start + size_t(w) * h * 4)
-    return;
-  SDL_Surface *icon = SDL_CreateSurface(int(w), int(h), SDL_PIXELFORMAT_BGRA32);
-  if (!icon)
-    return;
-  const bool topDown = d[17] & 0x20;  // otherwise the first row is the bottom one
-  for (uint32_t y = 0; y < h; y++)
-    std::memcpy(static_cast<uint8_t *>(icon->pixels) + size_t(y) * icon->pitch,
-                d.data() + start + size_t(topDown ? y : h - 1 - y) * w * 4, size_t(w) * 4);
-  for (Screen *s : {&R.tv, &R.drc})
-    if (s->window)
-      SDL_SetWindowIcon(s->window, icon);
-  SDL_DestroySurface(icon);
-}
-// On the host window (host/window.cpp made it with SDL_WINDOW_VULKAN); the host owns events, input and audio
 void init(SDL_Window* window) {
   // the Vulkan loader (libvulkan.so.1), loaded here rather than imported (loader.h); the window uses the same one
   if (!SDL_Vulkan_LoadLibrary(nullptr))
@@ -3270,443 +3238,5 @@ void save_renderer_caches() {
   vk::save_shader_cache();
   save_pipeline_cache();
 }
-#ifdef WWHD_SDL_HOST
-// GamePad touch screen: the left mouse button on the GamePad picture, in the GamePad window (window
-// mode; the picture fitted as display_layout fits it) or inside the TV window (picture-in-picture,
-// GamePad only: display_modes.cpp maps the point as on macOS), mapped to 0..1 touch coordinates. A
-// press that starts on the picture keeps touching while it is dragged, clamped to the picture's edge.
-// The settings overlay keeps its clicks in the TV window.
-enum class TouchIn { None, DrcWindow, TvWindow };
-static TouchIn touchHeld = TouchIn::None;
-static bool drc_window_point(float x, float y, float &tx, float &ty) {
-  int pw = 0, ph = 0;
-  SDL_GetWindowSizeInPixels(R.drc.window, &pw, &ph);
-  const float density = SDL_GetWindowPixelDensity(R.drc.window);
-  const float sw = R.drc.scan ? float(R.drc.scan->extent.width) : 854.0f;
-  const float sh = R.drc.scan ? float(R.drc.scan->extent.height) : 480.0f;
-  const gfx::Box b = gfx::display_layout(float(pw), float(ph), sw, sh);
-  if (b.w <= 0 || b.h <= 0) return false;
-  tx = (x * density - b.x) / b.w;
-  ty = (y * density - b.y) / b.h;
-  return tx >= 0 && tx <= 1 && ty >= 0 && ty <= 1;
-}
-// a point of the TV window (window coordinates) as 0..1 from its top left
-static void tv_window_point(float x, float y, float &nx, float &ny) {
-  int w = 0, h = 0;
-  SDL_GetWindowSize(R.tv.window, &w, &h);
-  nx = w > 0 ? x / float(w) : 0;
-  ny = h > 0 ? y / float(h) : 0;
-}
-//
-// Touch screens (display_modes.h's view button, on by default on Android): a tap on the button
-// switches to the next view (picture-in-picture, GamePad only, TV only), a long press (0.6 s)
-// switches 60 fps on Android. On Android fingers are read as fingers (several at once, one of them
-// touching the GamePad); the mouse events SDL makes from them only reach the settings overlay.
-static uint64_t buttonDown = 0;  // SDL_GetTicks() of the press on the view button, 0: none
-static void view_button_released() {
-  if (SDL_GetTicks() - buttonDown >= 600) {
-#ifdef __ANDROID__
-    // the choice only: platform/perf_hint.cpp switches interpolation where the phone keeps up
-    perf_hint::set_fps60_chosen(!perf_hint::fps60_chosen());
-    ::hostui::graphics_changed();  // saved with the graphics options (fps60)
-#endif
-  } else {
-    ::hostui::set_drc_mode(gfx::next_view());
-  }
-  buttonDown = 0;
-}
-#ifdef __ANDROID__
-static bool synthHeld = false;                 // a mouse press SDL made from a finger, kept from the game
-static SDL_FingerID touchFinger = 0, buttonFinger = 0;  // 0: none
-bool android_display_touch_event(const SDL_Event& event) {
-  if (event.type != SDL_EVENT_FINGER_DOWN && event.type != SDL_EVENT_FINGER_MOTION &&
-      event.type != SDL_EVENT_FINGER_UP && event.type != SDL_EVENT_FINGER_CANCELED)
-    return false;
-  const SDL_TouchFingerEvent& f = event.tfinger;
-  if (f.windowID != SDL_GetWindowID(R.tv.window)) return false;
-  static uint64_t touchGeneration = 0;
-  uint64_t currentGeneration = touchLayoutGeneration.load();
-  if (touchGeneration != currentGeneration) {
-    touchGeneration = currentGeneration;
-    touchFinger = buttonFinger = 0;
-    buttonDown = 0;
-  }
-  const bool dual = gfx::g_has_drc_window;
-  if (event.type == SDL_EVENT_FINGER_DOWN && SDL_GetHintBoolean("WWHD_DISPLAY_SMOKE_INPUT_TRACE", false)) {
-    std::lock_guard<std::mutex> guard(secondaryMutex);
-    LOG("[display smoke input] down layout=%llu fingerHeld=%lld capture=%d changed=%d viewport=%f,%f,%f,%f",
-        (unsigned long long)currentGeneration, (long long)touchFinger, int(overlay::captures()),
-        int(secondaryChanged), primaryTouchBox.x, primaryTouchBox.y, primaryTouchBox.w, primaryTouchBox.h);
-  }
-  if (dual && !dual_display::active_swap) {
-    touchFinger = buttonFinger = 0;
-    buttonDown = 0;
-    return false;
-  }
-  float tx = 0, ty = 0;
-  auto hit = [&](bool dragging = false) {
-    if (!dual) return gfx::overlay_hit(f.x, f.y, &tx, &ty, dragging);
-    std::lock_guard<std::mutex> guard(secondaryMutex);
-    return gamepad_touch::map(primaryTouchBox, f.x, f.y, dragging, tx, ty);
-  };
-  switch (event.type) {
-  case SDL_EVENT_FINGER_DOWN:
-    if (input::touch_from_controller(f.touchID)) return true;  // a controller's own touch pad / buttons
-    if (overlay::captures()) return false;
-    if (!dual && !buttonFinger && gfx::view_button_hit(f.x, f.y)) {
-      buttonFinger = f.fingerID;
-      buttonDown = std::max<uint64_t>(SDL_GetTicks(), 1);
-      return true;
-    }
-    if (touchFinger || !hit()) return false;
-    touchFinger = f.fingerID;
-    gfx::display_touched();
-    input::set_touch(true, tx, ty);
-    return true;
-  case SDL_EVENT_FINGER_MOTION:
-    if (!touchFinger || f.fingerID != touchFinger) return f.fingerID == buttonFinger && buttonFinger;
-    if (!hit(true)) tx = ty = 0;
-    input::set_touch(true, tx, ty);
-    return true;
-  case SDL_EVENT_FINGER_UP:
-  case SDL_EVENT_FINGER_CANCELED:
-    if (buttonFinger && f.fingerID == buttonFinger) {
-      buttonFinger = 0;
-      if (event.type == SDL_EVENT_FINGER_UP) view_button_released();
-      buttonDown = 0;
-      return true;
-    }
-    if (!touchFinger || f.fingerID != touchFinger) return false;
-    touchFinger = 0;
-    if (!hit(true)) tx = ty = 0;
-    input::set_touch(false, tx, ty);
-    gfx::display_touched();
-    return true;
-  default:
-    return false;
-  }
-}
-#endif
-static bool gamepad_touch(const SDL_Event& event) {
-  const SDL_WindowID drcId = R.drc.window ? SDL_GetWindowID(R.drc.window) : 0;
-  const SDL_WindowID tvId = SDL_GetWindowID(R.tv.window);
-  float tx = 0, ty = 0;
-#ifdef __ANDROID__
-  if (android_display_touch_event(event)) return true;
-  // the mouse events SDL makes from fingers: those on the GamePad picture or the button are the
-  // fingers' (above) and kept from the game's mouse camera; the settings overlay gets them all
-  if ((event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) &&
-      event.button.which == SDL_TOUCH_MOUSEID) {
-    if (overlay::captures() || event.button.windowID != tvId) return false;
-    if (event.type == SDL_EVENT_MOUSE_BUTTON_UP) return std::exchange(synthHeld, false);
-    float nx, ny;
-    tv_window_point(event.button.x, event.button.y, nx, ny);
-    synthHeld = gfx::view_button_hit(nx, ny) || gfx::overlay_hit(nx, ny, &tx, &ty);
-    return synthHeld;
-  }
-  if (event.type == SDL_EVENT_MOUSE_MOTION && event.motion.which == SDL_TOUCH_MOUSEID) return synthHeld;
-#endif
-  switch (event.type) {
-  case SDL_EVENT_MOUSE_BUTTON_DOWN:
-    if (event.button.button != SDL_BUTTON_LEFT) return false;
-    if (event.button.windowID == tvId && !overlay::captures() && gfx::view_button_enabled()) {
-      float nx, ny;
-      tv_window_point(event.button.x, event.button.y, nx, ny);
-      if (gfx::view_button_hit(nx, ny)) {
-        buttonDown = std::max<uint64_t>(SDL_GetTicks(), 1);
-        return true;
-      }
-    }
-    if (drcId && event.button.windowID == drcId) {
-      if (!drc_window_point(event.button.x, event.button.y, tx, ty)) return true;  // outside the picture
-      touchHeld = TouchIn::DrcWindow;
-    } else if (event.button.windowID == tvId && !overlay::captures()) {
-      float nx, ny;
-      tv_window_point(event.button.x, event.button.y, nx, ny);
-      if (!gfx::overlay_hit(nx, ny, &tx, &ty)) return false;  // the game's window: mouse camera etc.
-      touchHeld = TouchIn::TvWindow;
-      gfx::display_touched();
-    } else {
-      return false;
-    }
-    input::set_touch(true, tx, ty);
-    return true;
-  case SDL_EVENT_MOUSE_MOTION:
-  case SDL_EVENT_MOUSE_BUTTON_UP: {
-    const bool up = event.type == SDL_EVENT_MOUSE_BUTTON_UP;
-    if (buttonDown && up && event.button.button == SDL_BUTTON_LEFT) {
-      view_button_released();
-      return true;
-    }
-    if (touchHeld == TouchIn::None || (up && event.button.button != SDL_BUTTON_LEFT)) return false;
-    const float x = up ? event.button.x : event.motion.x, y = up ? event.button.y : event.motion.y;
-    if (touchHeld == TouchIn::DrcWindow) {
-      drc_window_point(x, y, tx, ty);
-      tx = std::clamp(tx, 0.0f, 1.0f);
-      ty = std::clamp(ty, 0.0f, 1.0f);
-    } else {
-      float nx, ny;
-      tv_window_point(x, y, nx, ny);
-      if (!gfx::overlay_hit(nx, ny, &tx, &ty, true)) tx = ty = 0;
-      gfx::display_touched();
-    }
-    if (up) touchHeld = TouchIn::None;
-    input::set_touch(!up, tx, ty);
-    return true;
-  }
-  case SDL_EVENT_WINDOW_FOCUS_LOST:
-    if (touchHeld != TouchIn::None) { touchHeld = TouchIn::None; input::set_touch(false, 0, 0); }
-    return false;
-  default:
-    return false;
-  }
-}
 
-// Ctrl+G (Cmd+G on macOS, as the AppKit host's Display menu): show / hide the GamePad screen in the
-// current mode (the GamePad window, or the picture-in-picture overlay; auto mode: keep it up)
-static bool drc_key(const SDL_Event& event) {
-  if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat || event.key.scancode != SDL_SCANCODE_G) return false;
-#ifdef __APPLE__
-  const SDL_Keymod want = SDL_KMOD_GUI;
-#else
-  const SDL_Keymod want = SDL_KMOD_CTRL;
-#endif
-  if (!(event.key.mod & want) || (event.key.mod & (SDL_KMOD_ALT | SDL_KMOD_SHIFT))) return false;
-  ::hostui::toggle_drc();
-  return true;
-}
-// debug: a test variable's list of TV frames ("3500,3700"); due once per listed frame
-static bool test_frame_due(const std::vector<uint64_t> &frames, size_t &i) {
-  if (i >= frames.size() || frame_count() < frames[i]) return false;
-  i++;
-  return true;
-}
-static std::vector<uint64_t> test_frames(const char *var) {
-  std::vector<uint64_t> f;
-  if (const char *e = getenv(var))
-    for (const char *p = e; *p;) {
-      f.push_back(strtoull(p, (char **)&p, 10));
-      while (*p == ',') p++;
-    }
-  return f;
-}
-// debug: WWHD_TEST_DRC_KEY=3500,3700 simulates Ctrl+G at those frames (as display.mm's Cmd+G)
-static void test_drc_key() {
-  static const std::vector<uint64_t> frames = test_frames("WWHD_TEST_DRC_KEY");
-  static size_t i = 0;
-  if (test_frame_due(frames, i)) {
-    LOG("[display] test: Ctrl+G at frame %llu", (unsigned long long)frame_count());
-    ::hostui::toggle_drc();
-  }
-}
-
-// full screen (the TV window's is remembered for the next start: hostui::tv_fullscreen_changed)
-static void toggle_fullscreen(SDL_Window* window) {
-  const bool full = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
-  const char* which = window == R.drc.window ? "GamePad window" : "TV window";
-  if (!SDL_SetWindowFullscreen(window, !full))
-    LOG("[display] %s: switching to %s failed: %s", which, full ? "windowed" : "full screen", SDL_GetError());
-  else
-    LOG("[display] %s %s", which, full ? "windowed" : "full screen");
-  if (window == R.tv.window)
-    ::hostui::tv_fullscreen_changed();
-}
-// F11 or Alt+Enter toggles the focused window (TV or GamePad)
-static bool fullscreen_key(const SDL_Event& event) {
-  if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat) return false;
-  const bool f11 = event.key.scancode == SDL_SCANCODE_F11 && !(event.key.mod & (SDL_KMOD_CTRL | SDL_KMOD_GUI));
-  const bool altEnter = (event.key.scancode == SDL_SCANCODE_RETURN || event.key.scancode == SDL_SCANCODE_KP_ENTER) &&
-                        (event.key.mod & SDL_KMOD_ALT);
-  if (!f11 && !altEnter) return false;
-  SDL_Window* window = SDL_GetWindowFromID(event.key.windowID);
-  toggle_fullscreen(window ? window : R.tv.window);
-  return true;
-}
-// debug: WWHD_TEST_FULLSCREEN_KEY=3500,3700 simulates F11 on the TV window at those frames (with
-// WWHD_HIDDEN_WINDOWS the window stays hidden: SDL only notes the state for when it is shown)
-static void test_fullscreen_key() {
-  static const std::vector<uint64_t> frames = test_frames("WWHD_TEST_FULLSCREEN_KEY");
-  static size_t i = 0;
-  if (test_frame_due(frames, i)) {
-    LOG("[display] test: F11 at frame %llu", (unsigned long long)frame_count());
-    toggle_fullscreen(R.tv.window);
-  }
-}
-
-// Closing the TV window ends the game. SDL only sends SDL_EVENT_QUIT once every window is closed, so
-// with the GamePad window open the close button of the TV window did nothing. Closing the GamePad
-// window only hides it (WWHD_NO_GAMEPAD=1 starts without it).
-static void quit_game() {
-  audio::finish_dump();  // _Exit bypasses atexit handlers
-  screenshot::finish();  // the screenshots taken are written first
-  gx2::checkpoint_vulkan_caches();
-  std::_Exit(0);
-}
-static bool close_request(const SDL_Event& event) {
-  if (event.type != SDL_EVENT_WINDOW_CLOSE_REQUESTED) return false;
-  if (event.window.windowID == SDL_GetWindowID(R.tv.window)) quit_game();
-  if (R.drc.window && event.window.windowID == SDL_GetWindowID(R.drc.window)) {
-    ::hostui::drc_window_closed();  // hidden until Ctrl+G or the settings overlay shows it again
-    LOG("[display] GamePad window closed (hidden); the game keeps running");
-  }
-  return true;
-}
-
-void run_main_loop() {
-  auto titleTime = std::chrono::steady_clock::now();
-  uint64_t titleFrames = gx2::flips_presented();
-  // Deterministic shutdown hook for cache durability tests.
-  const char* exitAt=getenv("WWHD_EXIT_AT_FRAME");
-  const uint64_t exitFrame=exitAt ? std::strtoull(exitAt,nullptr,10) : 0;
-  // Issue #109: the mouse pointer hides after 2 s without mouse use while the game window has focus
-  // (not while the settings overlay is open, which needs it; the mouse camera captures it itself).
-  auto mouseUsed = std::chrono::steady_clock::now();
-  bool pointerHidden = false;
-  for (;;) {
-    SDL_Event event;
-    while (SDL_PollEvent(&event)) {
-      if ((event.type == SDL_EVENT_MOUSE_MOTION && event.motion.which != SDL_TOUCH_MOUSEID) ||
-          ((event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) &&
-           event.button.which != SDL_TOUCH_MOUSEID) ||
-          event.type == SDL_EVENT_MOUSE_WHEEL) {
-        mouseUsed = std::chrono::steady_clock::now();
-        if (pointerHidden) { SDL_ShowCursor(); pointerHidden = false; }
-      }
-      if (event.type == SDL_EVENT_QUIT) quit_game();
-      if (close_request(event)) continue;
-      if (fullscreen_key(event)) continue;
-      if (drc_key(event)) continue;
-      if (gamepad_touch(event)) continue;
-      input::handle_event(event);
-      for (Screen *s : {&R.tv, &R.drc})
-        if (s->window && event.window.windowID == SDL_GetWindowID(s->window)) {
-          if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
-            s->width = event.window.data1;
-            s->height = event.window.data2;
-            s->resize = true;
-          }
-          if (s == &R.tv && (event.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN ||
-                             event.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN))
-            ::hostui::tv_fullscreen_changed();  // also when the window manager switched it
-          if (event.type == SDL_EVENT_WINDOW_MINIMIZED)
-            s->visible = false;
-          if (event.type == SDL_EVENT_WINDOW_RESTORED ||
-              event.type == SDL_EVENT_WINDOW_SHOWN)
-            s->visible = true;
-        }
-    }
-    input::update();
-#ifndef __ANDROID__
-    {
-      const bool focused = R.tv.window && (SDL_GetWindowFlags(R.tv.window) & SDL_WINDOW_INPUT_FOCUS);
-      const bool keep = !focused || overlay::is_open() || mods::mouse_captured();
-      if (pointerHidden && keep) { SDL_ShowCursor(); pointerHidden = false; mouseUsed = std::chrono::steady_clock::now(); }
-      else if (!pointerHidden && !keep && std::chrono::steady_clock::now() - mouseUsed > std::chrono::seconds(2)) {
-        SDL_HideCursor();
-        pointerHidden = true;
-      }
-    }
-#endif
-    ::hostui::run_posted();  // option changes from the settings overlay (render thread)
-    test_drc_key();
-    test_fullscreen_key();
-    if (const int m = gfx::display_test_mode(frame_count()); m >= 0)
-      ::hostui::set_drc_mode(m);
-    overlay::set_density(SDL_GetWindowPixelDensity(R.tv.window));
-    auto now = std::chrono::steady_clock::now();
-    double elapsed = std::chrono::duration<double>(now - titleTime).count();
-    static auto polled = now;  // twice a second: frame interpolation's cap (and Android's display mode)
-    if (now - polled >= std::chrono::milliseconds(500) || polled == now) {
-      polled = now;
-      display_rate::poll(R.tv.window);
-    }
-    if (elapsed >= 0.5 && !input::text_prompt_active()) {
-      uint64_t frames = gx2::flips_presented();
-      if (exitFrame && frame_count() >= exitFrame) {
-        SDL_Event quit{};quit.type=SDL_EVENT_QUIT;SDL_PushEvent(&quit);
-      }
-      char title[160];
-      int mode = interp::mode();
-      std::snprintf(title, sizeof title,
-          "The Legend of Zelda: The Wind Waker HD (Vulkan) — %.0f fps%s%s · %gx%s",
-          double(frames - titleFrames) / elapsed,
-          mode ? " · " : "", mode ? interp::mode_name() : "",
-          double(requested_res_scale()), fxaa_enabled() ? " · FXAA" : "");
-      if (gx2::uncapped()) std::strncat(title, " · UNCAPPED (debug)", sizeof title - std::strlen(title) - 1);
-      SDL_SetWindowTitle(R.tv.window, title);
-      titleFrames = frames;
-      titleTime = now;
-    }
-    SDL_Delay(1);
-  }
-}
-#endif  // WWHD_SDL_HOST
-
-#if defined(__APPLE__) && !defined(WWHD_SDL_HOST)
-// AppKit host: the TV / GamePad windows of gfx/display.mm, shared with the Metal renderer. Each view
-// has a CAMetalLayer; Vulkan presents to it through VK_EXT_metal_surface (MoltenVK).
-static const char *image_loaded(const char *part) {
-  for (uint32_t i = 0, n = _dyld_image_count(); i < n; i++)
-    if (const char *name = _dyld_get_image_name(i))
-      if (strstr(name, part))
-        return name;
-  return nullptr;
-}
-// The macOS release ships the Vulkan loader and MoltenVK next to the game (tools/release/macos_vulkan.py;
-// the game's rpath is its own folder, so that loader is the one dyld loads). Point the loader at the
-// MoltenVK beside it unless the player chose drivers (VK_DRIVER_FILES / VK_ICD_FILENAMES); source
-// builds without that file keep the loader's own search (Homebrew's MoltenVK).
-static void use_bundled_driver() {
-  for (const char *var : {"VK_DRIVER_FILES", "VK_ICD_FILENAMES"})
-    if (const char *v = getenv(var); v && *v) {
-      LOG("[vulkan] drivers from %s: %s", var, v);
-      return;
-    }
-  std::string icd = host::exe_dir() + "/MoltenVK_icd.json";
-  if (host::exe_dir().empty() || access(icd.c_str(), R_OK) != 0)
-    return;
-  setenv("VK_DRIVER_FILES", icd.c_str(), 1);
-  LOG("[vulkan] driver: bundled MoltenVK (%s)", icd.c_str());
-}
-void init_appkit(void *tvLayer, void *drcLayer) {
-  if (const char *e = getenv("WWHD_VK_FORCE_INIT_FAIL"); e && *e && strcmp(e, "0"))
-    throw std::runtime_error("Vulkan start-up failure forced for testing (WWHD_VK_FORCE_INIT_FAIL)");
-  // weak imports (CMakeLists.txt): a Mac without them still starts the game with Metal
-  const char *loader = image_loaded("/libvulkan");
-  if (!loader)
-    throw std::runtime_error("The Vulkan loader (libvulkan) is missing. The release ships it next to the game "
-                             "(libvulkan.1.dylib): run the setup again to repair it. Source builds: "
-                             "brew install vulkan-loader molten-vk");
-  LOG("[vulkan] loader: %s", loader);
-#ifdef WWHD_GLSLANG_WEAK
-  if (!image_loaded("/libglslang"))
-    throw std::runtime_error("glslang (shader compiler for Vulkan) is not installed. "
-                             "Install it with: brew install glslang");
-#endif
-  use_bundled_driver();
-  load_global_functions(reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr")));
-  if (!tvLayer)
-    throw std::runtime_error("no TV window layer");
-  R.tv.window = tvLayer;
-  R.drc.window = drcLayer;
-  init_device({VK_KHR_SURFACE_EXTENSION_NAME, VK_EXT_METAL_SURFACE_EXTENSION_NAME}, [&] {
-    auto create = (PFN_vkCreateMetalSurfaceEXT)vkGetInstanceProcAddr(R.instance, "vkCreateMetalSurfaceEXT");
-    if (!create)
-      throw std::runtime_error("vkCreateMetalSurfaceEXT unavailable");
-    for (Screen *s : {&R.tv, &R.drc}) {
-      if (!s->window)
-        continue;
-      VkMetalSurfaceCreateInfoEXT ci{VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT};
-      ci.pLayer = static_cast<const CAMetalLayer *>(s->window);
-      vk_check(create(R.instance, &ci, nullptr, &s->surface), "create Metal surface");
-    }
-  });
-  LOG("[vulkan] presenting to the AppKit windows through VK_EXT_metal_surface");
-}
-void screen_changed(int screen, bool visible) {
-  Screen &s = screen ? R.drc : R.tv;
-  s.visible = visible;
-  s.resize = true;  // drawable size or backing scale may have changed
-}
-#endif
 } // namespace gfxvk

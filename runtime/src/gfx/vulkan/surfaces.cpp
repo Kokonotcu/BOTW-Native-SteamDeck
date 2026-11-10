@@ -4,7 +4,6 @@
 // Guest surfaces backed by Vulkan images. LatteAddrLib supplies guest tiling geometry.
 #include "backend.h"
 #include "buffer_cache.h"
-#include "render_prof.h"
 #include "settings.h"
 #include "shaders.h"
 #include "sparse_hash_memo.h"
@@ -1172,7 +1171,6 @@ void upload_surface(Surface* s) {
         Buffer staging=create_buffer(packed.size(),VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         if(!staging.mapped){defer_buffer(staging);throw std::runtime_error("Vulkan texture staging allocation is not mapped");}
         memcpy(staging.mapped,packed.data(),packed.size());
-        rprof::add_upload(rprof::kUpTexture,packed.size());
         vkCmdCopyBufferToImage(command_buffer(),staging.buffer,s->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,uint32_t(copies.size()),copies.data());
         defer_buffer(staging);
     }
@@ -1267,16 +1265,13 @@ static void write_back_linear_copy(Surface* img,uint32_t layer,GX2Surface* d,uin
     auto dtm=static_cast<Latte::E_HWTILEMODE>(di.hwTileMode);
     if(!linear_tile_mode(dtm)||dstSlice>=di.depth||!can_write_back(img))return;
     const uint32_t bytes=img->fmt.bytesPerBlock;
-    const uint64_t r0=rprof::now_ns();
     auto texels=read_guest_texels(img,layer,w,h);
     for(uint32_t y=0;y<h;++y)for(uint32_t x=0;x<w;++x)
         memcpy(mem::host(dbase+element_offset(di,dtm,x,y,dstSlice,bytes*8,d->swizzle,nullptr,false)),texels.data()+(size_t(y)*w+x)*bytes,bytes);
     img->writtenBackSeq=img->writeSeq;
-    rprof::add_write_back(0,1,texels.size(),rprof::now_ns()-r0);
 }
 // GX2DrawDone: linear render targets drawn since their last write-back
 void write_back_linear_targets() {
-    const uint64_t t0=rprof::now_ns();uint64_t readNs=0,bytesDone=0;uint32_t count=0;
     // linear aligned only: a tile mode of 0 can also be GX2's "default" (a tiled copy destination)
     for(Surface* s:R.linearTargets) {
         if(!s->gpuWritten||s->writtenBackSeq==s->writeSeq||!s->image)continue;
@@ -1284,13 +1279,10 @@ void write_back_linear_targets() {
         if(s->arrayLayers!=1||!can_write_back(s))continue;
         const uint32_t addr=s->addr;
         const uint32_t bytes=s->fmt.bytesPerBlock,pitch=std::max(s->pitch,s->width);
-        const uint64_t r0=rprof::now_ns();
         auto texels=read_guest_texels(s,0,s->width,s->height);
         for(uint32_t y=0;y<s->height;++y)
             memcpy(mem::host(addr+y*pitch*bytes),texels.data()+size_t(y)*s->width*bytes,size_t(s->width)*bytes);
-        readNs+=rprof::now_ns()-r0;bytesDone+=texels.size();++count;
     }
-    rprof::add_write_back(std::max<uint64_t>(1,rprof::now_ns()-t0-readNs),count,bytesDone,readNs);
 }
 void copy_surface_impl(uint32_t srcAddr,uint32_t srcMip,uint32_t srcSlice,uint32_t dstAddr,uint32_t dstMip,uint32_t dstSlice) {
     auto* s=reinterpret_cast<GX2Surface*>(mem::host(srcAddr));auto* d=reinterpret_cast<GX2Surface*>(mem::host(dstAddr));

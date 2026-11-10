@@ -9,7 +9,6 @@
 #include <stdexcept>
 
 #include "backend.h"
-#include "render_prof.h"
 #include "hle.h"
 #include "gfx/write_watch.h"
 
@@ -162,7 +161,7 @@ void buffer_cache_mismatch(const char* what, const bufcache::Entry& e, uint32_t 
         what, e.addr, size, e.size, (unsigned long long)e.uploadFrame, (unsigned long long)s.cache.frame(), firstDiff);
 }
 
-bool cached_guest_range(uint32_t addr, uint32_t size, int uploadKind, UploadSlice& out) {
+bool cached_guest_range(uint32_t addr, uint32_t size, UploadSlice& out) {
   if (!addr || size < 16 || size > kMaxCachedRange || uint64_t(addr) + size > 0x100000000ull) return false;
   auto& cache = state().cache;
   bufcache::Entry* e;
@@ -175,7 +174,6 @@ bool cached_guest_range(uint32_t addr, uint32_t size, int uploadKind, UploadSlic
     break;
   case bufcache::kMiss:
     if (!cache.upload(*e, mem::host(addr), size)) return false;
-    rprof::add_upload(rprof::Upload(uploadKind), size);
     break;
   case bufcache::kBypass: return false;
   }
@@ -199,7 +197,6 @@ bool cached_native_indices(uint32_t addr, uint32_t size, UploadSlice& out, bufca
     std::vector<uint8_t> bytes(mem::host(addr), mem::host(addr) + size);
     if (!cache.upload(*e, bytes.data(), size)) return false;
     e->shadow = std::move(bytes);
-    rprof::add_upload(rprof::kUpIndex, size);
     break;
   }
   case bufcache::kBypass: return false;

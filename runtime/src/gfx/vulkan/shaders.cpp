@@ -6,7 +6,6 @@
 #include "gfx/area_sample.h"
 #include "gfx/shader_linkage.h"
 #include "exact_state_memo.h"
-#include "render_prof.h"
 #include "Cafe/HW/Latte/Core/FetchShader.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
@@ -390,38 +389,6 @@ void miss_words(const uint32_t* regs, bool vertex, uint64_t fsKey, std::vector<u
     put(uint32_t(fsKey >> 32), kMgFetch);
 }
 std::unordered_map<uint64_t, std::vector<std::vector<uint32_t>>> missVariants;  // program base -> variants
-void record_shader_variant(const uint32_t* regs, bool vertex, uint64_t base, uint64_t fsKey,
-                           const LatteDecompilerShader* dec) {
-    if (!rprof::enabled()) return;
-    std::vector<uint32_t> words;
-    std::vector<uint8_t> groups;
-    miss_words(regs, vertex, vertex ? fsKey : 0, words, &groups, dec);
-    auto& variants = missVariants[base];
-    const char* names[kMgCount];
-    int count = 0;
-    bool onlyUnused = false;
-    if (!variants.empty()) {
-        const std::vector<uint32_t>* nearest = nullptr;
-        size_t best = SIZE_MAX;
-        for (const auto& v : variants) {
-            size_t d = 0;
-            for (size_t i = 0; i < v.size() && i < words.size(); ++i) d += v[i] != words[i];
-            if (d < best) { best = d; nearest = &v; }
-        }
-        std::array<bool, kMgCount> differs{};
-        for (size_t i = 0; i < words.size() && i < nearest->size(); ++i)
-            if ((*nearest)[i] != words[i]) differs[groups[i]] = true;
-        onlyUnused = best > 0;
-        for (int g = 0; g < kMgCount; ++g)
-            if (differs[g]) {
-                names[count++] = missGroupNames[g];
-                if (g != kMgTexUnused && g != kMgSamplerUnused) onlyUnused = false;
-            }
-        if (!count) names[count++] = "none (equal words)";
-    }
-    rprof::shader_variant(variants.empty(), onlyUnused, names, count);
-    variants.push_back(std::move(words));
-}
 void free_decompiler(LatteDecompilerShader* shader) {
     if (!shader) return;
     delete shader->strBuf_shaderSource;
@@ -776,7 +743,6 @@ Shader* translate(const uint32_t* regs, bool vertex, LatteFetchShader* fetch, ui
         fprintf(stderr, "[vulkan] shader %08X: %s\n", address, shader->error.c_str());
         return remember(shader);
     }
-    record_shader_variant(regs, vertex, base, fsKey, shader->dec);
     if (!use.known) {
         const auto& dec = *shader->dec;
         use.unitCount = uint8_t(std::clamp(int(dec.textureUnitListCount), 0, int(LATTE_NUM_MAX_TEX_UNITS)));

@@ -8,7 +8,6 @@
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
 #include "backend.h"
 #include "buffer_cache.h"
-#include "render_prof.h"
 #include "hle.h"
 #include "shaders.h"
 #include "settings.h"
@@ -1598,13 +1597,12 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     // compares CPU copies of the slots' bytes, not mapped upload memory, unless the upload memory is
     // host-cached (R.uploadReadsDirect; uniform_snapshot.h)
     static UniformSnapshotCache<UploadSlice, VkDevice> uniformCache;
-    rprof::UploadKind uploads(logicalSlot == 16 ? rprof::kUpUniformVars : rprof::kUpUbo);
     auto fresh = [&](const void* source, size_t length) {
       return snapshot(source, length, R.properties.limits.minUniformBufferOffsetAlignment);
     };
     UploadSlice cachedSlice;
     const bool cached = guestAddr && buffer_cache_enabled() &&
-        cached_guest_range(guestAddr, uint32_t(size), rprof::kUpUbo, cachedSlice);
+        cached_guest_range(guestAddr, uint32_t(size), cachedSlice);
     const auto b = cached ? cachedSlice
         : reuseUniforms
         ? uniformCache.get(R.device, R.submissionGeneration,
@@ -1678,9 +1676,7 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
       uint32_t size = std::min<uint32_t>(r[block + i * 7 + 1] + 1, 0x10000);
       uniform(m.uniformBuffersBindingPoint[i], addr ? mem::host(addr) : nullptr,
               size, size_t(i), addr);
-      if (addr) rprof::guest_read(rprof::kUpUbo, addr, size);
     }
-  rprof::mark(rprof::kUniforms);
   uint32_t texbase = sh->vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS
                                 : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
   for (int i = 0; i < sh->dec->textureUnitListCount; i++) {
@@ -1747,12 +1743,9 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     write.pImageInfo = &info;
   }
-  rprof::mark(rprof::kTextures);
   if (m.uniformVarsBufferBindingPoint >= 0)
     uniform(m.uniformVarsBufferBindingPoint, supportUniforms.data(),
             supportUniforms.size(), 16);
-  rprof::mark(rprof::kUniforms);
-  struct DescriptorMark { ~DescriptorMark() { rprof::mark(rprof::kDescriptors); } } descriptorMark;
   if (useRanks) {
     uint32_t dense = 0;
     for (uint32_t rank = 0; rank < rankPlan.count; ++rank) {
@@ -1837,7 +1830,6 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   auto *vs = vk::translate(r, true, fs, fsKey, R.frame, g_shader_state_gen);
   auto *ps = vk::translate(r, false, fs, fsKey, R.frame, g_shader_state_gen,
                            vs && vs->ready() ? vs : nullptr);
-  rprof::mark(rprof::kShader);
   if (!vs || !vs->ready() || !ps || !ps->ready())
     throw std::runtime_error("Vulkan shader translation failed: " +
                              (vs && !vs->ready() ? vs->error
@@ -1993,7 +1985,6 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
           !buffer_cache().upload(*convertedEntry, indices.data(), uint32_t(indices.size() * 4))) {
         convertedEntry = nullptr;
       } else {
-        rprof::add_upload(rprof::kUpIndex, indices.size() * 4);
         cached_index_extent(*convertedEntry, indices.data(), indices.size(), 4, hostStrip, 0);
       }
     } else if (buffer_cache_verify()) {
@@ -2003,7 +1994,6 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
         buffer_cache_mismatch("converted indices", *convertedEntry, uint32_t(indices.size() * 4), diff);
     }
   }
-  rprof::mark(rprof::kIndices);
   const auto &lcr = *reinterpret_cast<const LatteContextRegister *>(r);
   std::array<Surface *, 8> colors{};
   uint32_t slices[8]{}, depthSlice = 0;
@@ -2048,9 +2038,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     }
   if (depth && (depth->extent.width < width || depth->extent.height < height))
     depth = nullptr;
-  rprof::mark(rprof::kTargets);
   auto &p = pipeline(r, vs, ps, fs, topology, colors, depth);
-  rprof::mark(rprof::kPipeline);
   if (!p.pipeline)
     return;  // the driver could not build it (logged once in pipeline())
   if(feedback_stats_enabled()) report_feedback_stats();
@@ -2154,7 +2142,6 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     R.passWidth = width;
     R.passHeight = height;
   }
-  rprof::mark(rprof::kPass);
   if (state.pipeline != p.pipeline) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
     state.pipeline = p.pipeline;
@@ -2248,8 +2235,6 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   state.stencilFront = stencilFront;
   state.stencilBack = stencilBack;
   state.stencilValid = true;
-  rprof::mark(rprof::kRecord);
-  rprof::UploadKind indexUploads(rprof::kUpIndex);
   // Scan the actual immutable index snapshot, never a second guest read: the bytes of the buffer
   // cache entry's shadow, or of a CPU copy that the upload slice is written from. Never the slice's
   // mapped memory: upload memory is uncached or write-combined on discrete GPUs (issue #44). Unless it
@@ -2283,7 +2268,6 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
                                            indexBytes, hostRestart,
                                            int32_t(baseVertex));
     }
-    rprof::guest_read(rprof::kUpIndex, indexAddr, uint64_t(count) * indexBytes);
   } else if (convertedEntry) {
     vertexExtent = cached_index_extent(*convertedEntry, nullptr, convertedEntry->outSize / 4, 4,
                                        hostRestart, int32_t(baseVertex));
@@ -2309,7 +2293,6 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       windowExtent={true,baseVertex,uint32_t(uint64_t(baseVertex)+count-1)};
     }
   }
-  rprof::g_upload_kind = rprof::kUpVertex;
   const bool cachedTrims = p.trimFetch == fs && p.trimVertex == vs &&
                            p.bindingTrims.size() == fs->bufferGroups.size();
   size_t trimGroup = 0;
@@ -2345,7 +2328,6 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     }
     R.vertexDeclaredBytes += size;
     R.vertexCopiedBytes += copied;
-    rprof::guest_read(rprof::kUpVertex, addr, copied);
     const uint64_t windowBegin=uint64_t(extent.minimum)*stride;
     const uint64_t windowEnd=uint64_t(extent.maximum)*stride+attributeEnd;
     const bool copyWindow=vertex_copy_window_enabled() &&
@@ -2353,7 +2335,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
         attributeEnd && stride && extent.valid && vertexExtent.valid &&
         windowEnd<=copied && windowBegin<windowEnd && windowBegin!=0;
     UploadSlice b;
-    if (!buffer_cache_enabled() || !cached_guest_range(addr, copied, rprof::kUpVertex, b))
+    if (!buffer_cache_enabled() || !cached_guest_range(addr, copied, b))
       b = copyWindow
         ? vertex_window_snapshot(g.attributeBufferIndex,addr,copied,
                                  uint32_t(windowBegin),uint32_t(windowEnd-windowBegin))
@@ -2375,8 +2357,6 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     if(!skip)
       vkCmdBindVertexBuffers(cmd,g.attributeBufferIndex,1,&b.buffer,&offset);
   }
-  rprof::g_upload_kind = rprof::kUpIndex;
-  rprof::mark(rprof::kVertex);
   if (nativeIndices) {
     vkCmdBindIndexBuffer(cmd, nativeIndexSlice.buffer, nativeIndexSlice.offset,
                          indexType == 0 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
@@ -2384,14 +2364,12 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   } else if (convertedEntry) {
     const uint32_t converted = convertedEntry->outSize / 4;
     auto b = buffer_cache_slice(*convertedEntry, convertedEntry->outSize);
-    rprof::guest_read(rprof::kUpIndex, indexAddr, guestBytes);
     vkCmdBindIndexBuffer(cmd, b.buffer, b.offset, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(cmd, converted, instances, 0, int32_t(baseVertex), 0);
   } else if (indices.empty())
     vkCmdDraw(cmd, count, instances, baseVertex, 0);
   else {
     auto b = snapshot(indices.data(), indices.size() * 4, 4);
-    if (indexAddr) rprof::guest_read(rprof::kUpIndex, indexAddr, guestBytes);
     vkCmdBindIndexBuffer(cmd, b.buffer, b.offset, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(cmd, indices.size(), instances, 0, int32_t(baseVertex), 0);
   }
@@ -2421,6 +2399,5 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     flush_async();
     ++drawBatchSubmissions;
   }
-  rprof::mark(rprof::kSubmit);
 }
 } // namespace gfxvk

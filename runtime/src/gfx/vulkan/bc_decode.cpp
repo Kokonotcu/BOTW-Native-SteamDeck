@@ -3,7 +3,6 @@
 #include "bc_shader.h"
 #include "shaders.h"
 #include "hle.h"
-#include "render_prof.h"
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -98,7 +97,6 @@ void bc_decode_upload(Surface* s,uint32_t level,const std::vector<uint8_t>& bloc
     vkCmdCopyBufferToImage(command_buffer(),output.buffer,s->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);
     if(check)verify(output,blocks,w,h,slices,mode);
     defer_buffer(output);
-    rprof::add_upload(rprof::kUpTexture,blocks.size());
     if(env_on("WWHD_VK_BC_TIMING"))LOG("[vulkan BC] mode=%u %ux%ux%u bytes=%zu CPU-upload-us=%.1f%s",mode,w,h,slices,blocks.size(),
         std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-start).count(),check?" (includes GPU drain/verify)":" (dispatch recording only)");
 }
