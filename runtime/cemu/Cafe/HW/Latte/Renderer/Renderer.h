@@ -114,6 +114,10 @@ public:
 
 	virtual void texture_clearSlice(LatteTexture* hostTexture, sint32 sliceIndex, sint32 mipIndex) = 0;
 	virtual void texture_loadSlice(LatteTexture* hostTexture, sint32 width, sint32 height, sint32 depth, void* pixelData, sint32 sliceIndex, sint32 mipIndex, uint32 compressedImageSize) = 0;
+	// BotW-Native: texture_loadSlice without the data: reserves the upload memory and records the copy now; the caller
+	// fills the returned memory before the commands are submitted (LatteTextureLoader async decode, joined at every
+	// submit and every GPU-progress signal). nullptr = unsupported here, use texture_loadSlice.
+	virtual uint8* texture_reserveSliceUpload(LatteTexture* hostTexture, sint32 width, sint32 height, sint32 depth, sint32 sliceIndex, sint32 mipIndex, uint32 compressedImageSize) { return nullptr; }
 	virtual void texture_clearColorSlice(LatteTexture* hostTexture, sint32 sliceIndex, sint32 mipIndex, float r, float g, float b, float a) = 0;
 	virtual void texture_clearDepthSlice(LatteTexture* hostTexture, uint32 sliceIndex, sint32 mipIndex, bool clearDepth, bool clearStencil, float depthValue, uint32 stencilValue) = 0;
 

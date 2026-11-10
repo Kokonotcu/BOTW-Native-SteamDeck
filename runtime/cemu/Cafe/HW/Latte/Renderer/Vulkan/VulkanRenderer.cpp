@@ -2598,8 +2598,11 @@ void VulkanRenderer::WaitForNextFinishedCommandBuffer()
 	ProcessFinishedCommandBuffers();
 }
 
+void LatteTextureLoader_JoinAsyncDecodes();  // LatteTextureLoader.cpp: decoded texture data into the recorded uploads
+
 void VulkanRenderer::SubmitCommandBuffer(VkSemaphore signalSemaphore, VkSemaphore waitSemaphore)
 {
+	LatteTextureLoader_JoinAsyncDecodes();  // the upload memory this command buffer copies from is filled
 	draw_endRenderPass();
 
 	occlusionQuery_notifyEndCommandBuffer();
@@ -4037,6 +4040,20 @@ void VulkanRenderer::texture_clearDepthSlice(LatteTexture* hostTexture, uint32 s
 
 void VulkanRenderer::texture_loadSlice(LatteTexture* hostTexture, sint32 width, sint32 height, sint32 depth, void* pixelData, sint32 sliceIndex, sint32 mipIndex, uint32 compressedImageSize)
 {
+	texture_uploadSlice(hostTexture, width, height, depth, pixelData, sliceIndex, mipIndex, compressedImageSize);
+}
+
+uint8* VulkanRenderer::texture_reserveSliceUpload(LatteTexture* hostTexture, sint32 width, sint32 height, sint32 depth, sint32 sliceIndex, sint32 mipIndex, uint32 compressedImageSize)
+{
+	// filled later by another thread: only on coherent staging memory (no flush after the write)
+	if (!memoryManager->getStagingAllocator().IsCoherent())
+		return nullptr;
+	return texture_uploadSlice(hostTexture, width, height, depth, nullptr, sliceIndex, mipIndex, compressedImageSize);
+}
+
+// texture_loadSlice; pixelData == nullptr: the data is written later into the returned staging memory
+uint8* VulkanRenderer::texture_uploadSlice(LatteTexture* hostTexture, sint32 width, sint32 height, sint32 depth, void* pixelData, sint32 sliceIndex, sint32 mipIndex, uint32 compressedImageSize)
+{
 	auto vkTexture = (LatteTextureVk*)hostTexture;
 	auto vkImageObj = vkTexture->GetImageObj();
 	vkImageObj->flagForCurrentCommandBuffer();
@@ -4068,8 +4085,11 @@ void VulkanRenderer::texture_loadSlice(LatteTexture* hostTexture, sint32 width, 
 	VKRSynchronizedRingAllocator& vkMemAllocator = memoryManager->getStagingAllocator();
 
 	auto uploadResv = vkMemAllocator.AllocateBufferMemory(uploadSize, uploadAlignment);
-	memcpy(uploadResv.memPtr, pixelData, compressedImageSize);
-	vkMemAllocator.FlushReservation(uploadResv);
+	if (pixelData)
+	{
+		memcpy(uploadResv.memPtr, pixelData, compressedImageSize);
+		vkMemAllocator.FlushReservation(uploadResv);
+	}
 
 	FormatInfoVK texFormatInfo;
 	GetTextureFormatInfoVK(hostTexture->format, hostTexture->isDepth, hostTexture->dim, 0, 0, &texFormatInfo);
@@ -4153,13 +4173,14 @@ void VulkanRenderer::texture_loadSlice(LatteTexture* hostTexture, sint32 width, 
 		PendingUpload u{vkTexture, uploadResv.vkBuffer, {}, {imageRegion[0], imageRegion[1]}, (uint32)imageRegionCount};
 		u.range = {barrierSubresourceRange.aspectMask, barrierSubresourceRange.mipLevel, 1, barrierSubresourceRange.baseArrayLayer, 1};
 		m_uploadBatch.push_back(u);  // recorded by texture_endUploadBatch
-		return;
+		return uploadResv.memPtr;
 	}
 	barrier_image<ANY_TRANSFER | IMAGE_READ | IMAGE_WRITE | HOST_WRITE, ANY_TRANSFER>(vkTexture, barrierSubresourceRange, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
 	vkCmdCopyBufferToImage(m_state.currentCommandBuffer, uploadResv.vkBuffer, vkImageObj->m_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, imageRegionCount, imageRegion);
 
 	barrier_image<ANY_TRANSFER, ANY_TRANSFER | IMAGE_READ | IMAGE_WRITE>(vkTexture, barrierSubresourceRange, vkTexture->GetDefaultLayout());
+	return uploadResv.memPtr;
 }
 
 void VulkanRenderer::texture_beginUploadBatch()

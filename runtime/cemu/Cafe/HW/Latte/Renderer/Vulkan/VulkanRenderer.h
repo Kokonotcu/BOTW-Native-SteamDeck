@@ -319,6 +319,8 @@ public:
 	void rendertarget_bindFramebufferObject(LatteCachedFBO* cfbo) override;
 
 	// texture functions
+	uint8* texture_reserveSliceUpload(LatteTexture* hostTexture, sint32 width, sint32 height, sint32 depth, sint32 sliceIndex, sint32 mipIndex, uint32 compressedImageSize) override;
+	uint8* texture_uploadSlice(LatteTexture* hostTexture, sint32 width, sint32 height, sint32 depth, void* pixelData, sint32 sliceIndex, sint32 mipIndex, uint32 compressedImageSize);
 	void* texture_acquireTextureUploadBuffer(uint32 size) override;
 	void texture_releaseTextureUploadBuffer(uint8* mem) override;
 

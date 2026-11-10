@@ -634,8 +634,13 @@ LatteCMDPtr LatteCP_itWaitRegMem(LatteCMDPtr cmd, uint32 nWords)
 	return cmd;
 }
 
+// BotW-Native: pending asynchronous texture decodes finish before anything the game can observe as GPU progress
+// (LatteTextureLoader.cpp): they read guest texture memory the game may reuse once it sees the GPU passed this point
+void LatteTextureLoader_JoinAsyncDecodes();
+
 LatteCMDPtr LatteCP_itMemWrite(LatteCMDPtr cmd, uint32 nWords)
 {
+	LatteTextureLoader_JoinAsyncDecodes();
 	cemu_assert_debug(nWords == 4);
 	uint32 word0 = LatteReadCMD();
 	uint32 word1 = LatteReadCMD();
@@ -676,6 +681,7 @@ LatteCMDPtr LatteCP_itMemWrite(LatteCMDPtr cmd, uint32 nWords)
 
 LatteCMDPtr LatteCP_itEventWriteEOP(LatteCMDPtr cmd, uint32 nWords)
 {
+	LatteTextureLoader_JoinAsyncDecodes();
 	cemu_assert_debug(nWords == 5);
 	uint32 word0 = LatteReadCMD();
 	uint32 word1 = LatteReadCMD();
@@ -705,6 +711,7 @@ LatteCMDPtr LatteCP_itEventWriteEOP(LatteCMDPtr cmd, uint32 nWords)
 
 LatteCMDPtr LatteCP_itMemSemaphore(LatteCMDPtr cmd, uint32 nWords)
 {
+	LatteTextureLoader_JoinAsyncDecodes();
 	cemu_assert_debug(nWords == 2);
 	MPTR semaphorePhysicalAddress = LatteReadCMD();
 	uint32 semaphoreControl = LatteReadCMD();
@@ -904,6 +911,7 @@ LatteCMDPtr LatteCP_itDrawImmediate(LatteCMDPtr cmd, uint32 nWords, DrawPassCont
 
 LatteCMDPtr LatteCP_itHLESampleTimer(LatteCMDPtr cmd, uint32 nWords)
 {
+	LatteTextureLoader_JoinAsyncDecodes();
 	cemu_assert_debug(nWords == 1);
 	MPTR timerMPTR = (MPTR)LatteReadCMD();
 	memory_writeU64(timerMPTR, coreinit::OSGetSystemTime());
@@ -944,6 +952,7 @@ LatteCMDPtr LatteCP_itHLEEndOcclusionQuery(LatteCMDPtr cmd, uint32 nWords)
 
 LatteCMDPtr LatteCP_itHLEBottomOfPipeCB(LatteCMDPtr cmd, uint32 nWords)
 {
+	LatteTextureLoader_JoinAsyncDecodes();
 	cemu_assert_debug(nWords == 3);
 	MPTR timestampMPTR = (uint32)LatteReadCMD();
 	uint32 timestampHigh = (uint32)LatteReadCMD();
@@ -1038,6 +1047,7 @@ LatteCMDPtr LatteCP_itHLEClearColorDepthStencil(LatteCMDPtr cmd, uint32 nWords)
 
 LatteCMDPtr LatteCP_itHLERequestSwapBuffers(LatteCMDPtr cmd, uint32 nWords)
 {
+	LatteTextureLoader_JoinAsyncDecodes();
 	catchOpenGLError();
 	cemu_assert_debug(nWords == 1);
 	MPTR reserved1 = LatteReadCMD();
@@ -1048,6 +1058,7 @@ LatteCMDPtr LatteCP_itHLERequestSwapBuffers(LatteCMDPtr cmd, uint32 nWords)
 
 LatteCMDPtr LatteCP_itHLESwapScanBuffer(LatteCMDPtr cmd, uint32 nWords)
 {
+	LatteTextureLoader_JoinAsyncDecodes();
 	catchOpenGLError();
 	cemu_assert_debug(nWords == 1);
 	MPTR reserved1 = LatteReadCMD(); // reserved
@@ -1057,6 +1068,7 @@ LatteCMDPtr LatteCP_itHLESwapScanBuffer(LatteCMDPtr cmd, uint32 nWords)
 
 LatteCMDPtr LatteCP_itHLEWaitForFlip(LatteCMDPtr cmd, uint32 nWords)
 {
+	LatteTextureLoader_JoinAsyncDecodes();
 	catchOpenGLError();
 	cemu_assert_debug(nWords == 1);
 	MPTR reserved1 = LatteReadCMD(); // reserved
@@ -1516,6 +1528,7 @@ void LatteCP_processCommandBuffer(DrawPassContext& drawPassCtx)
 				}
 				case IT_HLE_SYNC_ASYNC_OPERATIONS:
 				{
+					LatteTextureLoader_JoinAsyncDecodes();
 					LatteTextureReadback_UpdateFinishedTransfers(true);
 					LatteQuery_UpdateFinishedQueriesForceFinishAll();
 					break;
@@ -1825,6 +1838,7 @@ void LatteCP_ProcessRingbuffer()
 			case IT_HLE_SYNC_ASYNC_OPERATIONS:
 			{
 				//LatteCP_skipWords<LatteCP_readU32Deprc>(nWords);
+				LatteTextureLoader_JoinAsyncDecodes();
 				LatteTextureReadback_UpdateFinishedTransfers(true);
 				LatteQuery_UpdateFinishedQueriesForceFinishAll();
 				break;

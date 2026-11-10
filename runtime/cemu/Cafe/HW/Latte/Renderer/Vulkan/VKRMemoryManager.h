@@ -194,6 +194,16 @@ public:
 
 	AllocatorReservation_t AllocateBufferMemory(uint32 size, uint32 alignment);
 	void FlushReservation(AllocatorReservation_t& uploadReservation);
+	// BotW-Native: every buffer so far is HOST_COHERENT (false before the first allocation)
+	bool IsCoherent() const
+	{
+		if (m_buffers.empty())
+			return false;
+		for (const auto& b : m_buffers)
+			if (!b.coherent)
+				return false;
+		return true;
+	}
 	void CleanupBuffer(uint64 latestFinishedCommandBufferId);
 	VkBuffer GetBufferByIndex(uint32 index) const;
 

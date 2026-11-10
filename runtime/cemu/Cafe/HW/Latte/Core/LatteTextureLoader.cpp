@@ -2,6 +2,11 @@
 #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
 #include "config/ActiveSettings.h"
 #include "Cafe/CafeSystem.h"
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 extern "C" void botw_place_thread(int kind);  // runtime/src/thread.cpp core plan
 
@@ -591,6 +596,131 @@ void LatteTextureLoader_loadTextureDataIntoSlice(LatteTexture* hostTexture, sint
 	}
 }
 
+// BotW-Native: asynchronous texture decode. The GPU thread hashes the texture and records the upload copy as before,
+// but the decode (and the copy of the result into the reserved upload memory) runs on helper threads while the GPU
+// thread goes on with the next draws (area loads decoded hundreds of textures serially on it: ~40% of the load-in
+// burst). Every submit and every GPU-progress signal the game can observe (end-of-pipe/timestamp writes, memory
+// writes and semaphores, swap/flip, bottom-of-pipe callbacks, timer samples) first joins all pending decodes, so the
+// data is in place before the GPU runs the copy and the guest texture memory is read before the game can learn that
+// the GPU is done with it - the same bytes as the synchronous decode. BOTW_ASYNC_TEXDECODE=0 off.
+namespace
+{
+	bool AsyncTexDecodeOn()
+	{
+		static const bool on = !(getenv("BOTW_ASYNC_TEXDECODE") && getenv("BOTW_ASYNC_TEXDECODE")[0] == '0');
+		return on;
+	}
+	constexpr uint32 kAsyncDecodeMinBytes = 4096;  // smaller slices decode faster than a queue round trip
+
+	class AsyncTextureDecoder
+	{
+	public:
+		void push(TextureDecoder* decoder, const LatteTextureLoaderCtx& ctx, uint8* dst, uint32 size)
+		{
+			{
+				std::lock_guard lock(m_mutex);
+				if (m_threads.empty())
+					for (int i = 0; i < kHelpers; i++)
+						m_threads.emplace_back([this] { helperLoop(); }).detach();
+				m_jobs.push_back(Job{decoder, ctx, dst, size});
+				m_pending.fetch_add(1, std::memory_order_relaxed);
+			}
+			m_jobCv.notify_one();
+		}
+
+		// GPU thread: run queued jobs itself, then wait for the ones the helpers are running
+		void join()
+		{
+			if (m_pending.load(std::memory_order_acquire) == 0)
+				return;
+			std::unique_lock lock(m_mutex);
+			while (true)
+			{
+				if (!m_jobs.empty())
+				{
+					Job job = std::move(m_jobs.front());
+					m_jobs.pop_front();
+					lock.unlock();
+					run(job);
+					lock.lock();
+					m_pending.fetch_sub(1, std::memory_order_release);
+					continue;
+				}
+				if (m_pending.load(std::memory_order_acquire) == 0)
+					return;
+				m_doneCv.wait(lock, [this] { return !m_jobs.empty() || m_pending.load(std::memory_order_acquire) == 0; });
+			}
+		}
+
+	private:
+		static constexpr int kHelpers = 3;
+		struct Job
+		{
+			TextureDecoder* decoder;
+			LatteTextureLoaderCtx ctx;
+			uint8* dst;
+			uint32 size;
+		};
+
+		static void run(Job& job)
+		{
+			// decode into cached memory, then one sequential copy into the (write-combined) upload memory
+			static thread_local std::vector<uint8> scratch;
+			if (scratch.size() < job.size)
+				scratch.resize(job.size);
+			job.decoder->decode(&job.ctx, scratch.data());
+			memcpy(job.dst, scratch.data(), job.size);
+#if defined(__x86_64__)
+			_mm_sfence();  // write-combined / non-temporal stores visible before the job counts as done (then submit)
+#endif
+		}
+
+		void helperLoop()
+		{
+#if defined(__linux__)
+			pthread_setname_np(pthread_self(), "TexDecodeA");
+			botw_place_thread(0);
+#endif
+			std::unique_lock lock(m_mutex);
+			while (true)
+			{
+				m_jobCv.wait(lock, [this] { return !m_jobs.empty(); });
+				Job job = std::move(m_jobs.front());
+				m_jobs.pop_front();
+				lock.unlock();
+				run(job);
+				lock.lock();
+				if (m_pending.fetch_sub(1, std::memory_order_release) == 1)
+					m_doneCv.notify_all();
+			}
+		}
+
+		std::mutex m_mutex;
+		std::condition_variable m_jobCv, m_doneCv;
+		std::deque<Job> m_jobs;
+		std::vector<std::thread> m_threads;
+		std::atomic<int> m_pending{0};
+	};
+	AsyncTextureDecoder* s_asyncTextureDecoder = new AsyncTextureDecoder();  // never destroyed: the helpers run until exit
+
+	// reserve the upload, record its copy and queue the decode; false = do it synchronously
+	bool LatteTextureLoader_TryAsyncDecode(LatteTexture* tex, TextureDecoder* texDecoder, const LatteTextureLoaderCtx& ctx, sint32 depth, uint32 sliceIndex, uint32 mipIndex, uint32 imageSize)
+	{
+		if (!AsyncTexDecodeOn() || imageSize < kAsyncDecodeMinBytes || ctx.dump || tex->overwriteInfo.hasFormatOverwrite || tex->overwriteInfo.hasResolutionOverwrite)
+			return false;
+		uint8* dst = g_renderer->texture_reserveSliceUpload(tex, ctx.width, ctx.height, depth, sliceIndex, mipIndex, imageSize);
+		if (!dst)
+			return false;
+		s_asyncTextureDecoder->push(texDecoder, ctx, dst, imageSize);
+		return true;
+	}
+}
+
+void LatteTextureLoader_JoinAsyncDecodes()
+{
+	s_asyncTextureDecoder->join();
+}
+
 void LatteTextureLoader_UpdateTextureSliceData(LatteTexture* tex, uint32 sliceIndex, uint32 mipIndex, MPTR physImagePtr, MPTR physMipPtr, Latte::E_DIM dim, uint32 width, uint32 height, uint32 depth, uint32 mipLevels, uint32 pitch, Latte::E_HWTILEMODE tileMode, uint32 swizzle, bool dumpTex)
 {
 	LatteTextureLoaderCtx textureLoader = { 0 };
@@ -634,6 +764,18 @@ void LatteTextureLoader_UpdateTextureSliceData(LatteTexture* tex, uint32 sliceIn
 
 	// allocate memory for decoded texture
 	uint32 imageSize = texDecoder->calculateImageSize(&textureLoader);
+
+	if (LatteTextureLoader_TryAsyncDecode(tex, texDecoder, textureLoader, depth, sliceIndex, mipIndex, imageSize))
+	{
+		// the same tracker update as below; the decode itself runs later (LatteTextureLoader_JoinAsyncDecodes)
+		if ((mipIndex == 0 && sliceIndex == 0) || (tex->texDataPtrLow == 0 && tex->texDataPtrHigh == 0))
+		{
+			tex->texDataPtrLow = physImagePtr + textureLoader.minOffsetOutdated;
+			tex->texDataPtrHigh = physImagePtr + textureLoader.maxOffsetOutdated;
+			LatteTC_ResetTextureChangeTracker(tex, true);
+		}
+		return;
+	}
 
 	uint8* pixelData = (uint8*)g_renderer->texture_acquireTextureUploadBuffer(imageSize);
 	// decode texture (if data is required)
@@ -787,7 +929,8 @@ void LatteTextureLoader_UpdateTextureSlices(LatteTexture* tex, const std::vector
 			LatteTextureLoader_UpdateTextureSliceData(tex, s, mip, tex->physAddress, tex->physMipAddress, tex->dim, tex->width, tex->height, tex->depth, tex->mipLevels, tex->pitch, tex->tileMode, tex->swizzle, true);
 	};
 	TextureDecoder* texDecoder = g_renderer->texture_chooseDecodedFormat(tex->format, tex->isDepth, tex->dim, tex->width, tex->height);
-	if (sliceMips.size() < 4 || !texDecoder || ActiveSettings::DumpTexturesEnabled() || tex->overwriteInfo.hasFormatOverwrite || tex->overwriteInfo.hasResolutionOverwrite)
+	// async decode: every slice/mip is queued on its own (the helpers decode them in parallel with the GPU thread)
+	if (AsyncTexDecodeOn() || sliceMips.size() < 4 || !texDecoder || ActiveSettings::DumpTexturesEnabled() || tex->overwriteInfo.hasFormatOverwrite || tex->overwriteInfo.hasResolutionOverwrite)
 	{
 		oneByOne();
 		return;
