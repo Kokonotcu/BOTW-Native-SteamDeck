@@ -73,6 +73,38 @@ static inline void LatteCP_prefetchCommands(const uint32be* cmd)
 	__builtin_prefetch((const char*)cmd + 512, 0, 3);
 }
 
+// BotW-Native: most draws sit in small display lists recorded at load and called with INDIRECT_BUFFER_PRIV (~5,100
+// calls per frame, docs/native-renderer.md 2.1). They are cold by the time they run, so the first header of each
+// list was the parser's hottest load (b149 session 020421: 129 of 2,732 LatteThread samples) and the 512-byte
+// look-ahead above cannot reach it. On each call, find the caller's next INDIRECT_BUFFER_PRIV a few packets on and
+// prefetch the first 512 bytes of its target; they arrive while the current list runs. Reads and prefetches only.
+static inline void LatteCP_prefetchNextIndirectBuffer(const uint32be* cmd, const uint32be* cmdEnd)
+{
+	for (sint32 n = 0; n < 16 && cmd < cmdEnd; n++)
+	{
+		uint32 itHeader = *cmd;
+		uint32 itHeaderType = itHeader >> 30;
+		if (itHeaderType == 2)
+		{
+			cmd++;
+			continue;
+		}
+		if (itHeaderType != 3)
+			return;
+		if (((itHeader >> 8) & 0xFF) == IT_INDIRECT_BUFFER_PRIV)
+		{
+			if (cmdEnd - cmd < 4)
+				return;
+			const char* target = (const char*)memory_base + (uint32)cmd[1];
+			uint32 bytes = std::min<uint32>(cmd[3], 128) * 4;
+			for (uint32 offset = 0; offset < bytes; offset += 64)
+				__builtin_prefetch(target + offset, 0, 3);
+			return;
+		}
+		cmd += ((itHeader >> 16) & 0x3FFF) + 2;
+	}
+}
+
 class DrawPassContext
 {
 	struct CmdQueuePos
@@ -1206,6 +1238,7 @@ void LatteCP_processCommandBuffer_continuousDrawPass(DrawPassContext& drawPassCt
 				}
 				case IT_INDIRECT_BUFFER_PRIV:
 				{
+					LatteCP_prefetchNextIndirectBuffer(cmd, cmdEnd);
 					drawPassCtx.PushCurrentCommandQueuePos(cmd, cmdStart, cmdEnd);
 					LatteCP_itIndirectBuffer(cmdData, nWords, drawPassCtx);
 					if (!drawPassCtx.PopCurrentCommandQueuePos(cmd, cmdStart, cmdEnd)) // switch to sub buffer
@@ -1311,6 +1344,7 @@ void LatteCP_processCommandBuffer(DrawPassContext& drawPassCtx)
 				break;
 				case IT_INDIRECT_BUFFER_PRIV:
 				{
+					LatteCP_prefetchNextIndirectBuffer(cmd, cmdEnd);
 					drawPassCtx.PushCurrentCommandQueuePos(cmd, cmdStart, cmdEnd);
 					LatteCP_itIndirectBuffer(cmdData, nWords, drawPassCtx);
 					if (!drawPassCtx.PopCurrentCommandQueuePos(cmd, cmdStart, cmdEnd)) // switch to sub buffer

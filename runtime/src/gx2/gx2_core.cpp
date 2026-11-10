@@ -180,6 +180,13 @@ bool GX2WaitTimeStamp(uint64 ts) {
     return true;
 }
 void GX2Flush() { GX2Command_Flush(0x100, true); }
+
+// Tried and dropped (b148, 2026-11-09): one frame of run-ahead - the frame-end GX2DrawDones (f_031fa9e0, after the GPU
+// timer read and after GX2SwapScanBuffers) waiting for the end of frame N-1 instead of N. The GPU thread crashed ~10 s
+// into the first scene load in LatteIndices_unpackQuadsAndConvert: the game had already reused a draw's index data,
+// so BotW's per-frame GPU data is not all double-buffered and these waits are required. Also dropped (b149): letting
+// the swap's acquire/present overlap the next frame - at a pinned 700 MHz GPU, presents > 20 ms went 29-43 -> 222 per
+// minute and main-thread work rose 13.6 -> 14.9 ms/frame (session 20261110-020421): this wait is the display lock.
 bool GX2DrawDone() {
     GX2Command_Flush(0x100, true);
     wait_gpu(latte::last_submitted(), "gpu: GX2DrawDone");
