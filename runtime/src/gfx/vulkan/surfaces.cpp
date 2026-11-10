@@ -452,13 +452,43 @@ static void decode_level(Surface* s, uint32_t level, uint32_t base, std::vector<
     out.assign((size_t)bw * bh * slices * f.hostBytesPerBlock, 0);
     std::vector<uint8_t> row(bw * f.bytesPerBlock);
     const uint8_t* src = mem::host(base);
+    static const bool check = getenv("WWHD_VK_DETILE_CHECK") != nullptr;
+    const uint32_t B = f.bytesPerBlock;
+    std::vector<uint8_t> raw;
     for (uint32_t z = 0; z < slices; z++) {
         LatteAddrLib::CachedSurfaceAddrInfo ci;
         bool macro = Latte::TM_IsMacroTiled(tm);
         if (macro)
             LatteAddrLib::SetupCachedSurfaceAddrInfo(&ci, z, 0, bpp, pitch, height, slices, 1, tm, depthData, pipeSwizzle, bankSwizzle);
+        // full 8x8 micro tiles of a 2D thin1 surface: one tile address, then in-tile offsets from the pixel index
+        // table (bytes past 256 skip the pipe and bank bits: << 3)
+        const uint16_t* table = macro ? ci.microTilePixelIndexTable + ((z & 7) << 6) : nullptr;
+        const bool fast = macro && tm == Latte::E_HWTILEMODE::TM_2D_TILED_THIN1 && table[0] == 0;
+        const uint32_t fullW = fast ? bw & ~7u : 0, fullH = fast ? bh & ~7u : 0;
+        if (fast) {
+            raw.resize((size_t)fullW * fullH * B);
+            for (uint32_t yt = 0; yt < fullH; yt += 8)
+                for (uint32_t xt = 0; xt < fullW; xt += 8) {
+                    const uint32_t tile = LatteAddrLib::ComputeSurfaceAddrFromCoordMacroTiledCached_tm04_sample1(xt, yt, &ci);
+                    for (uint32_t i = 0; i < 64; i++) {
+                        const uint32_t px = table[i] * B, off = tile + ((px & 0xFF) | ((px & ~0xFFu) << 3));
+                        const uint32_t x = xt + (i & 7), y = yt + (i >> 3);
+                        if (check) {
+                            const uint32_t slow = LatteAddrLib::ComputeSurfaceAddrFromCoordMacroTiledCached(x, y, &ci);
+                            static int bad = 0;
+                            if (slow != off && bad < 20) { ++bad; LOG("[detile] mismatch %ux%u fmt %X bpp %u slice %u at %u,%u: %X vs %X", w, h, s->format, bpp, z, x, y, off, slow); }
+                        }
+                        memcpy(&raw[((size_t)y * fullW + x) * B], src + off, B);
+                    }
+                }
+        }
         for (uint32_t y = 0; y < bh; y++) {
-            for (uint32_t x = 0; x < bw; x++) {
+            uint32_t x0 = 0;
+            if (y < fullH && fullW) {
+                memcpy(row.data(), &raw[(size_t)y * fullW * B], (size_t)fullW * B);
+                x0 = fullW;
+            }
+            for (uint32_t x = x0; x < bw; x++) {
                 uint32_t off;
                 if (tm == Latte::E_HWTILEMODE::TM_LINEAR_GENERAL || tm == Latte::E_HWTILEMODE::TM_LINEAR_ALIGNED)
                     off = LatteAddrLib::ComputeSurfaceAddrFromCoordLinear(x, y, z, 0, bpp, pitch, height, slices);
@@ -466,7 +496,7 @@ static void decode_level(Surface* s, uint32_t level, uint32_t base, std::vector<
                     off = LatteAddrLib::ComputeSurfaceAddrFromCoordMicroTiled(x, y, z, bpp, pitch, height, tm, depthData);
                 else
                     off = LatteAddrLib::ComputeSurfaceAddrFromCoordMacroTiledCached(x, y, &ci);
-                memcpy(&row[x * f.bytesPerBlock], src + off, f.bytesPerBlock);
+                memcpy(&row[x * B], src + off, B);
             }
             uint8_t* dst = &out[((size_t)z * bh + y) * bw * f.hostBytesPerBlock];
             if (f.convert == Convert::NONE) memcpy(dst, row.data(), row.size());

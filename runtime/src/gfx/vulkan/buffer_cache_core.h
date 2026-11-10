@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <unordered_map>
@@ -217,8 +218,17 @@ class Cache {
     }
     if (frame_ < x.dynamicUntil) {
       ++stats.bypassDynamic;
-      x.armed = false;
-      return kBypass;
+      static const bool hints = [] { const char* v = std::getenv("WWHD_VK_DYNAMIC_HINTS"); return !v || std::strcmp(v, "0"); }();
+      if (!hints) {
+        x.armed = false;
+        return kBypass;
+      }
+      // unarmed: valid until a hint or a fault stamps its pages (current()); arm(addr, 0) only reads the clock
+      x.armSeq = wwatch::write_seq();
+      x.armStamp = wwatch::arm(key.addr, 0);
+      x.armSize = size;
+      x.armed = true;
+      return kMiss;
     }
     // arm first, then the caller reads guest memory (see the header comment)
     x.armSeq = wwatch::write_seq();
