@@ -27,6 +27,7 @@
 #include "settings.h"
 #include "telemetry.h"
 #include "thread.h"
+#include "gfx/write_watch.h"
 #include "host/window.h"
 #include "latte/latte.h"
 
@@ -220,6 +221,7 @@ int main(int argc, char** argv) {
     hugetext_init();
 #endif
     mem::init();
+    if (!wwatch::init(g_mem, 1ull << 32)) LOG("write tracking unavailable: textures use sampled change checks");
     dispatch::init();
     // The renderer does not need the game. Bring the device and swapchain up first so a machine
     // without a dump still proves the graphics backend, then stop if the RPX is missing.
