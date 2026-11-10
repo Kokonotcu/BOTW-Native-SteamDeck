@@ -25,7 +25,7 @@
 #include <mach-o/dyld.h>
 #endif
 
-#include "runtime.h"
+#include "hle.h"
 #ifdef WWHD_SDL_HOST
 #include <SDL3/SDL_messagebox.h>
 #ifdef __ANDROID__

@@ -15,21 +15,21 @@ constexpr uint32 PS_REGS = 0x00, PS_SHADER_SIZE = 0xA4, PS_SHADER_PTR = 0xA8, PS
 // GX2RBuffer: +0 flags, +4 elementSize, +8 elementCount, +C ptr
 
 static uint32 rbuffer_addr(uint32 rb, uint32* size) {
-    if (size) *size = ld32(rb + 4) * ld32(rb + 8);
-    return ld32(rb + 0xC);
+    if (size) *size = mem::r32(rb + 4) * mem::r32(rb + 8);
+    return mem::r32(rb + 0xC);
 }
 
 uint32 vertex_shader_program(uint32 vs, uint32* size) {
-    if (uint32 p = ld32(vs + VS_SHADER_PTR)) {
-        *size = ld32(vs + VS_SHADER_SIZE);
+    if (uint32 p = mem::r32(vs + VS_SHADER_PTR)) {
+        *size = mem::r32(vs + VS_SHADER_SIZE);
         return p;
     }
     return rbuffer_addr(vs + VS_RBUFFER, size);
 }
 
 uint32 pixel_shader_program(uint32 ps, uint32* size) {
-    if (uint32 p = ld32(ps + PS_SHADER_PTR)) {
-        *size = ld32(ps + PS_SHADER_SIZE);
+    if (uint32 p = mem::r32(ps + PS_SHADER_PTR)) {
+        *size = mem::r32(ps + PS_SHADER_SIZE);
         return p;
     }
     return rbuffer_addr(ps + PS_RBUFFER, size);
@@ -39,26 +39,26 @@ template <class Regs>
 static void bind_vs(Regs& regs, uint32 vs) {
     uint32 size = 0;
     uint32 prog = vertex_shader_program(vs, &size);
-    bool gs_mode = ld32(vs + VS_SHADER_MODE) == 2;  // GX2_SHADER_MODE_GEOMETRY_SHADER
+    bool gs_mode = mem::r32(vs + VS_SHADER_MODE) == 2;  // GX2_SHADER_MODE_GEOMETRY_SHADER
     if (gs_mode) {
         // with a geometry shader the vertex shader runs as the export shader (ES)
         regs[mmSQ_PGM_START_ES] = prog >> 8;
         regs[mmSQ_PGM_START_ES + 1] = size >> 3;
-        regs[mmSQ_PGM_RESOURCES_ES] = ld32(vs + VS_PGM_RESOURCES);
+        regs[mmSQ_PGM_RESOURCES_ES] = mem::r32(vs + VS_PGM_RESOURCES);
     } else {
         regs[mmSQ_PGM_START_VS] = prog >> 8;
         regs[mmSQ_PGM_START_VS + 1] = size >> 3;
-        regs[mmSQ_PGM_RESOURCES_VS] = ld32(vs + VS_PGM_RESOURCES);
-        regs[mmVGT_PRIMITIVEID_EN] = ld32(vs + VS_PRIMITIVEID_EN);
-        regs[mmSPI_VS_OUT_CONFIG] = ld32(vs + VS_OUT_CONFIG);
-        regs[mmPA_CL_VS_OUT_CNTL] = ld32(vs + VS_PA_CL_VS_OUT_CNTL);
-        uint32 n = std::min<uint32>(ld32(vs + VS_OUT_ID_COUNT), 10);
-        for (uint32 i = 0; i < n; i++) regs[mmSPI_VS_OUT_ID_0 + i] = ld32(vs + VS_OUT_ID + 4 * i);
+        regs[mmSQ_PGM_RESOURCES_VS] = mem::r32(vs + VS_PGM_RESOURCES);
+        regs[mmVGT_PRIMITIVEID_EN] = mem::r32(vs + VS_PRIMITIVEID_EN);
+        regs[mmSPI_VS_OUT_CONFIG] = mem::r32(vs + VS_OUT_CONFIG);
+        regs[mmPA_CL_VS_OUT_CNTL] = mem::r32(vs + VS_PA_CL_VS_OUT_CNTL);
+        uint32 n = std::min<uint32>(mem::r32(vs + VS_OUT_ID_COUNT), 10);
+        for (uint32 i = 0; i < n; i++) regs[mmSPI_VS_OUT_ID_0 + i] = mem::r32(vs + VS_OUT_ID + 4 * i);
     }
-    uint32 nsem = std::min<uint32>(ld32(vs + VS_SEMANTIC_COUNT), 32);
+    uint32 nsem = std::min<uint32>(mem::r32(vs + VS_SEMANTIC_COUNT), 32);
     if (nsem > 0) {
         regs[mmSQ_VTX_SEMANTIC_CLEAR] = 0xFFFFFFFF;
-        for (uint32 i = 0; i < nsem; i++) regs[mmSQ_VTX_SEMANTIC_0 + i] = ld32(vs + VS_SEMANTIC + 4 * i);
+        for (uint32 i = 0; i < nsem; i++) regs[mmSQ_VTX_SEMANTIC_0 + i] = mem::r32(vs + VS_SEMANTIC + 4 * i);
     }
 }
 
@@ -66,7 +66,7 @@ template <class Regs>
 static void bind_ps(Regs& regs, uint32 ps) {
     uint32 size = 0;
     uint32 prog = pixel_shader_program(ps, &size);
-    auto reg = [&](int i) { return ld32(ps + PS_REGS + 4 * i); };
+    auto reg = [&](int i) { return mem::r32(ps + PS_REGS + 4 * i); };
     uint32 ninputs = std::min<uint32>(reg(4), 0x20);
     regs[mmSQ_PGM_START_PS] = prog >> 8;
     regs[mmSQ_PGM_START_PS + 1] = size >> 3;

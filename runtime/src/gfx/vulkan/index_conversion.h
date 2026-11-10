@@ -1,5 +1,4 @@
 #pragma once
-#include "../../exception_report.h"
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -18,7 +17,7 @@ void expand_indices(uint32_t prim, uint32_t count, bool indexed,
   case 0x14: n = count >= 4 ? size_t((count - 2) / 2) * 6 : 0; break;
   case 0x12: n = size_t(count) + 1; break;
   case 1: case 2: case 3: case 4: case 6: break;
-  default: exception_report::raise("unsupported Vulkan primitive");
+  default: throw std::runtime_error("unsupported Vulkan primitive");
   }
   // Preserve the original empty-conversion indexed fallback (short fan).
   if (!n && indexed) n = count;
@@ -77,7 +76,7 @@ inline void convert_indices(const void* data, uint32_t prim, uint32_t count,
   // line-loop closure, which still reads index zero when count is zero.
   if (!count && prim != 0x12) {
     expand_indices(prim, count, true, [](uint32_t) -> uint32_t {
-      exception_report::raise("unsupported index type");
+      throw std::runtime_error("unsupported index type");
     }, out);
     return;
   }
@@ -89,7 +88,7 @@ inline void convert_indices(const void* data, uint32_t prim, uint32_t count,
     WWHD_INDEX_CASE(1, uint32_t, false);
     WWHD_INDEX_CASE(4, uint16_t, true);
     WWHD_INDEX_CASE(9, uint32_t, true);
-    default: exception_report::raise("unsupported index type");
+    default: throw std::runtime_error("unsupported index type");
   }
 #undef WWHD_INDEX_CASE
 }

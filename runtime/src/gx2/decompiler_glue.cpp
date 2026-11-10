@@ -6,7 +6,7 @@
 #include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
 #endif
 #include "gfx/renderer.h"
-#include "runtime.h"
+#include "hle.h"
 
 // The decompiler emits MSL or GLSL depending on g_renderer's type: set once at start-up (and again if
 // Vulkan cannot start and the game falls back to Metal), before any shader is translated.

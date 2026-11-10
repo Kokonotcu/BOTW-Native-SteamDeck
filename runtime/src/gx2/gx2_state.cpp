@@ -2,87 +2,87 @@
 // Register packing follows the GX2 SDK (as documented by Cemu's GX2_State.cpp).
 #include "gx2_cmd.h"
 #include "gx2_regs.h"
-#include "runtime.h"
+#include "hle.h"
 
 using namespace Latte;
 
 namespace gx2 {
-static float fa(Cpu* c, int i) { return (float)c->f[1 + i].ps0; }  // i-th float argument
+static float fa(PPCContext* c, int i) { return (float)c->f[1 + i].ps0; }  // i-th float argument
 }  // namespace gx2
 
 using gx2::fa;
 using gx2::set_reg;
 
 // ---------------------------------------------------------------- alpha test
-HLE(gx2, GX2SetAlphaTest) {
+HLE_EXPORT(gx2, GX2SetAlphaTest) {
     LATTE_SX_ALPHA_TEST_CONTROL ctrl;
-    ctrl.set_ALPHA_FUNC((LATTE_SX_ALPHA_TEST_CONTROL::E_ALPHA_FUNC)arg(c, 1));
-    ctrl.set_ALPHA_TEST_ENABLE(arg(c, 0) != 0);
+    ctrl.set_ALPHA_FUNC((LATTE_SX_ALPHA_TEST_CONTROL::E_ALPHA_FUNC)ARG(1));
+    ctrl.set_ALPHA_TEST_ENABLE(ARG(0) != 0);
     LATTE_SX_ALPHA_REF ref;
     ref.set_ALPHA_TEST_REF(fa(c, 0));
     set_reg(REGADDR::SX_ALPHA_TEST_CONTROL, ctrl.getRawValue());
     set_reg(REGADDR::SX_ALPHA_REF, ref.getRawValue());
 }
-HLE(gx2, GX2SetAlphaTestReg) {
-    set_reg(REGADDR::SX_ALPHA_TEST_CONTROL, ld32(arg(c, 0)));
-    set_reg(REGADDR::SX_ALPHA_REF, ld32(arg(c, 0) + 4));
+HLE_EXPORT(gx2, GX2SetAlphaTestReg) {
+    set_reg(REGADDR::SX_ALPHA_TEST_CONTROL, mem::r32(ARG(0)));
+    set_reg(REGADDR::SX_ALPHA_REF, mem::r32(ARG(0) + 4));
 }
-HLE(gx2, GX2SetAlphaToMask) {
+HLE_EXPORT(gx2, GX2SetAlphaToMask) {
     // (enable, GX2AlphaToMaskMode) -> DB_ALPHA_TO_MASK
-    uint32 enable = arg(c, 0) & 1, mode = arg(c, 1);
+    uint32 enable = ARG(0) & 1, mode = ARG(1);
     static const uint32 offsets[] = {0xAA, 0x78, 0xB4, 0x1E, 0x00};  // dither patterns per mode
     uint32 v = enable | ((mode < 5 ? offsets[mode] : 0) << 8);
     set_reg(mmDB_ALPHA_TO_MASK, v);
 }
-HLE(gx2, GX2SetAlphaToMaskReg) { set_reg(mmDB_ALPHA_TO_MASK, ld32(arg(c, 0))); }  // (GX2AlphaToMaskReg*)
+HLE_EXPORT(gx2, GX2SetAlphaToMaskReg) { set_reg(mmDB_ALPHA_TO_MASK, mem::r32(ARG(0))); }  // (GX2AlphaToMaskReg*)
 
 // ---------------------------------------------------------------- color / blend
-HLE(gx2, GX2SetColorControl) {
+HLE_EXPORT(gx2, GX2SetColorControl) {
     LATTE_CB_COLOR_CONTROL r;
-    r.set_MULTIWRITE_ENABLE(arg(c, 2) != 0);
-    r.set_SPECIAL_OP(arg(c, 3) == 0 ? LATTE_CB_COLOR_CONTROL::E_SPECIALOP::DISABLE : LATTE_CB_COLOR_CONTROL::E_SPECIALOP::NORMAL);
-    r.set_BLEND_MASK(arg(c, 1));
-    r.set_ROP((LATTE_CB_COLOR_CONTROL::E_LOGICOP)arg(c, 0));
+    r.set_MULTIWRITE_ENABLE(ARG(2) != 0);
+    r.set_SPECIAL_OP(ARG(3) == 0 ? LATTE_CB_COLOR_CONTROL::E_SPECIALOP::DISABLE : LATTE_CB_COLOR_CONTROL::E_SPECIALOP::NORMAL);
+    r.set_BLEND_MASK(ARG(1));
+    r.set_ROP((LATTE_CB_COLOR_CONTROL::E_LOGICOP)ARG(0));
     set_reg(REGADDR::CB_COLOR_CONTROL, r.getRawValue());
 }
-HLE(gx2, GX2SetColorControlReg) { set_reg(REGADDR::CB_COLOR_CONTROL, ld32(arg(c, 0))); }
+HLE_EXPORT(gx2, GX2SetColorControlReg) { set_reg(REGADDR::CB_COLOR_CONTROL, mem::r32(ARG(0))); }
 
-HLE(gx2, GX2SetBlendControl) {
+HLE_EXPORT(gx2, GX2SetBlendControl) {
     LATTE_CB_BLENDN_CONTROL r;
     using BF = LATTE_CB_BLENDN_CONTROL::E_BLENDFACTOR;
     using CF = LATTE_CB_BLENDN_CONTROL::E_COMBINEFUNC;
-    r.set_COLOR_SRCBLEND((BF)arg(c, 1));
-    r.set_COLOR_DSTBLEND((BF)arg(c, 2));
-    r.set_COLOR_COMB_FCN((CF)arg(c, 3));
-    r.set_SEPARATE_ALPHA_BLEND(arg(c, 4) != 0);
-    r.set_ALPHA_SRCBLEND((BF)arg(c, 5));
-    r.set_ALPHA_DSTBLEND((BF)arg(c, 6));
-    r.set_ALPHA_COMB_FCN((CF)arg(c, 7));
-    set_reg(REGADDR::CB_BLEND0_CONTROL + (arg(c, 0) & 7), r.getRawValue());
+    r.set_COLOR_SRCBLEND((BF)ARG(1));
+    r.set_COLOR_DSTBLEND((BF)ARG(2));
+    r.set_COLOR_COMB_FCN((CF)ARG(3));
+    r.set_SEPARATE_ALPHA_BLEND(ARG(4) != 0);
+    r.set_ALPHA_SRCBLEND((BF)ARG(5));
+    r.set_ALPHA_DSTBLEND((BF)ARG(6));
+    r.set_ALPHA_COMB_FCN((CF)ARG(7));
+    set_reg(REGADDR::CB_BLEND0_CONTROL + (ARG(0) & 7), r.getRawValue());
 }
-HLE(gx2, GX2SetBlendControlReg) { set_reg(REGADDR::CB_BLEND0_CONTROL + (ld32(arg(c, 0)) & 7), ld32(arg(c, 0) + 4)); }
+HLE_EXPORT(gx2, GX2SetBlendControlReg) { set_reg(REGADDR::CB_BLEND0_CONTROL + (mem::r32(ARG(0)) & 7), mem::r32(ARG(0) + 4)); }
 
-HLE(gx2, GX2SetBlendConstantColor) {
+HLE_EXPORT(gx2, GX2SetBlendConstantColor) {
     for (int i = 0; i < 4; i++) set_reg(REGADDR::CB_BLEND_RED + i, gx2::fbits(fa(c, i)));
 }
-HLE(gx2, GX2SetBlendConstantColorReg) {
-    for (int i = 0; i < 4; i++) set_reg(REGADDR::CB_BLEND_RED + i, ld32(arg(c, 0) + 4 * i));
+HLE_EXPORT(gx2, GX2SetBlendConstantColorReg) {
+    for (int i = 0; i < 4; i++) set_reg(REGADDR::CB_BLEND_RED + i, mem::r32(ARG(0) + 4 * i));
 }
 
-HLE(gx2, GX2SetTargetChannelMasks) {
+HLE_EXPORT(gx2, GX2SetTargetChannelMasks) {
     uint32 m = 0;
-    for (int i = 0; i < 8; i++) m |= (arg(c, i) & 0xF) << (4 * i);
+    for (int i = 0; i < 8; i++) m |= (ARG(i) & 0xF) << (4 * i);
     set_reg(REGADDR::CB_TARGET_MASK, m);
 }
-HLE(gx2, GX2SetTargetChannelMasksReg) { set_reg(REGADDR::CB_TARGET_MASK, ld32(arg(c, 0))); }
+HLE_EXPORT(gx2, GX2SetTargetChannelMasksReg) { set_reg(REGADDR::CB_TARGET_MASK, mem::r32(ARG(0))); }
 
 // ---------------------------------------------------------------- depth / stencil
-HLE(gx2, GX2SetDepthStencilControl) {
+HLE_EXPORT(gx2, GX2SetDepthStencilControl) {
     // (depthTest, depthWrite, depthFunc, stencilTest, backStencilTest, frontFunc, frontZPass, frontZFail,
     //  frontFail, backFunc, backZPass, backZFail, backFail) - args past r10 are on the stack
     uint32 a[13];
-    for (int i = 0; i < 8; i++) a[i] = arg(c, i);
-    for (int i = 8; i < 13; i++) a[i] = ld32(c->r[1] + 8 + 4 * (i - 8));
+    for (int i = 0; i < 8; i++) a[i] = ARG(i);
+    for (int i = 8; i < 13; i++) a[i] = mem::r32(c->r[1] + 8 + 4 * (i - 8));
     using SF = LATTE_DB_DEPTH_CONTROL::E_STENCILFUNC;
     using SA = LATTE_DB_DEPTH_CONTROL::E_STENCILACTION;
     LATTE_DB_DEPTH_CONTROL r;
@@ -92,68 +92,68 @@ HLE(gx2, GX2SetDepthStencilControl) {
     r.set_STENCIL_FUNC_B((SF)a[9]).set_STENCIL_ZPASS_B((SA)a[10]).set_STENCIL_ZFAIL_B((SA)a[11]).set_STENCIL_FAIL_B((SA)a[12]);
     set_reg(REGADDR::DB_DEPTH_CONTROL, r.getRawValue());
 }
-HLE(gx2, GX2SetDepthStencilControlReg) { set_reg(REGADDR::DB_DEPTH_CONTROL, ld32(arg(c, 0))); }
+HLE_EXPORT(gx2, GX2SetDepthStencilControlReg) { set_reg(REGADDR::DB_DEPTH_CONTROL, mem::r32(ARG(0))); }
 
-HLE(gx2, GX2SetStencilMask) {
+HLE_EXPORT(gx2, GX2SetStencilMask) {
     LATTE_DB_STENCILREFMASK f;
-    f.set_STENCILREF_F(arg(c, 2) & 0xFF).set_STENCILMASK_F(arg(c, 0) & 0xFF).set_STENCILWRITEMASK_F(arg(c, 1) & 0xFF);
+    f.set_STENCILREF_F(ARG(2) & 0xFF).set_STENCILMASK_F(ARG(0) & 0xFF).set_STENCILWRITEMASK_F(ARG(1) & 0xFF);
     LATTE_DB_STENCILREFMASK_BF b;
-    b.set_STENCILREF_B(arg(c, 5) & 0xFF).set_STENCILMASK_B(arg(c, 3) & 0xFF).set_STENCILWRITEMASK_B(arg(c, 4) & 0xFF);
+    b.set_STENCILREF_B(ARG(5) & 0xFF).set_STENCILMASK_B(ARG(3) & 0xFF).set_STENCILWRITEMASK_B(ARG(4) & 0xFF);
     set_reg(REGADDR::DB_STENCILREFMASK, f.getRawValue());
     set_reg(REGADDR::DB_STENCILREFMASK_BF, b.getRawValue());
 }
 // (GX2StencilMaskReg*): { DB_STENCILREFMASK, DB_STENCILREFMASK_BF }
-HLE(gx2, GX2SetStencilMaskReg) {
-    set_reg(REGADDR::DB_STENCILREFMASK, ld32(arg(c, 0)));
-    set_reg(REGADDR::DB_STENCILREFMASK_BF, ld32(arg(c, 0) + 4));
+HLE_EXPORT(gx2, GX2SetStencilMaskReg) {
+    set_reg(REGADDR::DB_STENCILREFMASK, mem::r32(ARG(0)));
+    set_reg(REGADDR::DB_STENCILREFMASK_BF, mem::r32(ARG(0) + 4));
 }
 // (depthTest, depthWrite, depthFunc): DB_DEPTH_CONTROL with stencil off (as Cemu)
-HLE(gx2, GX2SetDepthOnlyControl) {
+HLE_EXPORT(gx2, GX2SetDepthOnlyControl) {
     LATTE_DB_DEPTH_CONTROL r;
-    r.set_Z_ENABLE(arg(c, 0) != 0).set_Z_WRITE_ENABLE(arg(c, 1) != 0).set_Z_FUNC((LATTE_DB_DEPTH_CONTROL::E_ZFUNC)arg(c, 2));
+    r.set_Z_ENABLE(ARG(0) != 0).set_Z_WRITE_ENABLE(ARG(1) != 0).set_Z_FUNC((LATTE_DB_DEPTH_CONTROL::E_ZFUNC)ARG(2));
     set_reg(REGADDR::DB_DEPTH_CONTROL, r.getRawValue());
 }
 
 // ---------------------------------------------------------------- rasterizer
-HLE(gx2, GX2SetPolygonControl) {
+HLE_EXPORT(gx2, GX2SetPolygonControl) {
     LATTE_PA_SU_SC_MODE_CNTL v;
-    v.set_FRONT_FACE((LATTE_PA_SU_SC_MODE_CNTL::E_FRONTFACE)arg(c, 0));
-    v.set_CULL_FRONT((arg(c, 1) & 1) != 0);
-    v.set_CULL_BACK((arg(c, 2) & 1) != 0);
-    v.set_POLYGON_MODE((LATTE_PA_SU_SC_MODE_CNTL::E_POLYGONMODE)arg(c, 3));
-    v.set_FRONT_POLY_MODE((LATTE_PA_SU_SC_MODE_CNTL::E_PTYPE)arg(c, 4));
-    v.set_BACK_POLY_MODE((LATTE_PA_SU_SC_MODE_CNTL::E_PTYPE)arg(c, 5));
-    v.set_OFFSET_FRONT_ENABLED((arg(c, 6) & 1) != 0);
-    v.set_OFFSET_BACK_ENABLED((arg(c, 7) & 1) != 0);
-    v.set_OFFSET_PARA_ENABLED((ld32(c->r[1] + 8) & 1) != 0);  // 9th argument
+    v.set_FRONT_FACE((LATTE_PA_SU_SC_MODE_CNTL::E_FRONTFACE)ARG(0));
+    v.set_CULL_FRONT((ARG(1) & 1) != 0);
+    v.set_CULL_BACK((ARG(2) & 1) != 0);
+    v.set_POLYGON_MODE((LATTE_PA_SU_SC_MODE_CNTL::E_POLYGONMODE)ARG(3));
+    v.set_FRONT_POLY_MODE((LATTE_PA_SU_SC_MODE_CNTL::E_PTYPE)ARG(4));
+    v.set_BACK_POLY_MODE((LATTE_PA_SU_SC_MODE_CNTL::E_PTYPE)ARG(5));
+    v.set_OFFSET_FRONT_ENABLED((ARG(6) & 1) != 0);
+    v.set_OFFSET_BACK_ENABLED((ARG(7) & 1) != 0);
+    v.set_OFFSET_PARA_ENABLED((mem::r32(c->r[1] + 8) & 1) != 0);  // 9th argument
     set_reg(REGADDR::PA_SU_SC_MODE_CNTL, v.getRawValue());
 }
 // (frontFace, cullFront, cullBack): polygon modes and offsets off (as Cemu)
-HLE(gx2, GX2SetCullOnlyControl) {
+HLE_EXPORT(gx2, GX2SetCullOnlyControl) {
     LATTE_PA_SU_SC_MODE_CNTL v;
-    v.set_FRONT_FACE((LATTE_PA_SU_SC_MODE_CNTL::E_FRONTFACE)arg(c, 0));
-    v.set_CULL_FRONT((arg(c, 1) & 1) != 0);
-    v.set_CULL_BACK((arg(c, 2) & 1) != 0);
+    v.set_FRONT_FACE((LATTE_PA_SU_SC_MODE_CNTL::E_FRONTFACE)ARG(0));
+    v.set_CULL_FRONT((ARG(1) & 1) != 0);
+    v.set_CULL_BACK((ARG(2) & 1) != 0);
     set_reg(REGADDR::PA_SU_SC_MODE_CNTL, v.getRawValue());
 }
 // (stateId, enable). 1 = fast HiZ clear: nothing to do (Cemu ignores it too). 0 = fast clear, which
 // changes PA_CL_VTE_CNTL / PA_CL_CLIP_CNTL: not ported yet, reported.
-HLE(gx2, GX2SetSpecialState) {
-    if (arg(c, 0) == 1) return;
+HLE_EXPORT(gx2, GX2SetSpecialState) {
+    if (ARG(0) == 1) return;
     static std::atomic<int> n{0};
-    if (n++ < 5) LOG("[gx2] GX2SetSpecialState(%u, %u) not implemented lr=%08X", arg(c, 0), arg(c, 1), c->lr);
+    if (n++ < 5) LOG("[gx2] GX2SetSpecialState(%u, %u) not implemented lr=%08X", ARG(0), ARG(1), c->lr);
 }
-HLE(gx2, GX2SetPolygonControlReg) { set_reg(REGADDR::PA_SU_SC_MODE_CNTL, ld32(arg(c, 0))); }
+HLE_EXPORT(gx2, GX2SetPolygonControlReg) { set_reg(REGADDR::PA_SU_SC_MODE_CNTL, mem::r32(ARG(0))); }
 
-HLE(gx2, GX2SetPolygonOffsetReg) {
-    uint32 r = arg(c, 0);
-    for (int i = 0; i < 4; i++) set_reg(REGADDR::PA_SU_POLY_OFFSET_FRONT_SCALE + i, ld32(r + 4 * i));
-    set_reg(REGADDR::PA_SU_POLY_OFFSET_CLAMP, ld32(r + 16));
+HLE_EXPORT(gx2, GX2SetPolygonOffsetReg) {
+    uint32 r = ARG(0);
+    for (int i = 0; i < 4; i++) set_reg(REGADDR::PA_SU_POLY_OFFSET_FRONT_SCALE + i, mem::r32(r + 4 * i));
+    set_reg(REGADDR::PA_SU_POLY_OFFSET_CLAMP, mem::r32(r + 16));
 }
 
-HLE(gx2, GX2SetRasterizerClipControl) {
+HLE_EXPORT(gx2, GX2SetRasterizerClipControl) {
     LATTE_PA_CL_CLIP_CNTL r;
-    bool raster = arg(c, 0) & 1, zclip = arg(c, 1) & 1;
+    bool raster = ARG(0) & 1, zclip = ARG(1) & 1;
     r.set_ZCLIP_NEAR_DISABLE(!zclip).set_ZCLIP_FAR_DISABLE(!zclip);
     r.set_DX_RASTERIZATION_KILL(!raster);
     r.set_DX_CLIP_SPACE_DEF(false);
@@ -161,7 +161,7 @@ HLE(gx2, GX2SetRasterizerClipControl) {
     set_reg(REGADDR::PA_CL_CLIP_CNTL, r.getRawValue());
 }
 
-HLE(gx2, GX2SetViewport) {
+HLE_EXPORT(gx2, GX2SetViewport) {
     float x = fa(c, 0), y = fa(c, 1), w = fa(c, 2), h = fa(c, 3), n = fa(c, 4), f = fa(c, 5);
     set_reg(REGADDR::PA_CL_VPORT_XSCALE, gx2::fbits(w * 0.5f));
     set_reg(REGADDR::PA_CL_VPORT_XOFFSET, gx2::fbits(x + w * 0.5f));
@@ -171,8 +171,8 @@ HLE(gx2, GX2SetViewport) {
     set_reg(REGADDR::PA_CL_VPORT_ZOFFSET, gx2::fbits((n + f) * 0.5f));
 }
 
-HLE(gx2, GX2SetScissor) {
-    uint32 x = arg(c, 0), y = arg(c, 1), w = arg(c, 2), h = arg(c, 3);
+HLE_EXPORT(gx2, GX2SetScissor) {
+    uint32 x = ARG(0), y = ARG(1), w = ARG(2), h = ARG(3);
     uint32 tlx = std::min(x, 8192u), tly = std::min(y, 8192u), brx = std::min(x + w, 8192u), bry = std::min(y + h, 8192u);
     LATTE_PA_SC_GENERIC_SCISSOR_TL tl;
     tl.set_TL_X(tlx).set_TL_Y(tly).set_WINDOW_OFFSET_DISABLE(true);
@@ -182,27 +182,27 @@ HLE(gx2, GX2SetScissor) {
     set_reg(REGADDR::PA_SC_GENERIC_SCISSOR_BR, br.getRawValue());
 }
 
-HLE(gx2, GX2SetPointSize) {
+HLE_EXPORT(gx2, GX2SetPointSize) {
     uint32 w = std::min<uint32>((uint32)(fa(c, 0) * 8.0f), 0xFFFF), h = std::min<uint32>((uint32)(fa(c, 1) * 8.0f), 0xFFFF);
     set_reg(REGADDR::PA_SU_POINT_SIZE, LATTE_PA_SU_POINT_SIZE().set_WIDTH(w).set_HEIGHT(h).getRawValue());
 }
 
 // (minSize, maxSize) in f1/f2 -> PA_SU_POINT_MINMAX, 12.3 fixed point (as Cemu's GX2InitPointLimitsReg)
-HLE(gx2, GX2SetPointLimits) {
+HLE_EXPORT(gx2, GX2SetPointLimits) {
     float mn = std::max(fa(c, 0), 0.0f), mx = std::max(fa(c, 1), 0.0f);
     uint32 lo = std::min<uint32>((uint32)(mn * 8.0f), 0xFFFF), hi = std::min<uint32>((uint32)(mx * 8.0f), 0xFFFF);
     set_reg(REGADDR::PA_SU_POINT_MINMAX, lo | (hi << 16));
 }
 
-HLE(gx2, GX2SetLineWidth) {
+HLE_EXPORT(gx2, GX2SetLineWidth) {
     uint32 w = std::min<uint32>((uint32)(fa(c, 0) * 8.0f), 0xFFFF);
     set_reg(mmPA_SU_LINE_CNTL, w);
 }
 
 // ---------------------------------------------------------------- shader mode
-HLE(gx2, GX2SetShaderModeEx) {
+HLE_EXPORT(gx2, GX2SetShaderModeEx) {
     // (mode, gprsVS, stackVS, gprsGS, stackGS, gprsPS, stackPS)
-    uint32 mode = arg(c, 0);
+    uint32 mode = ARG(0);
     bool geometry = mode == 2;
     if (!geometry) set_reg(REGADDR::VGT_GS_MODE, 0);
     LATTE_SQ_CONFIG sq;

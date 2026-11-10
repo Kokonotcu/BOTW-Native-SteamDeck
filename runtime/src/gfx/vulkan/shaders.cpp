@@ -675,8 +675,8 @@ LatteFetchShader* get_fetch_shader(const uint32_t* regs, uint64_t* keyOut, uint6
     if (!cacheLast) lastFetch = {};
     uint32_t address = regs[mmSQ_PGM_START_FS] << 8;
     if (!address) return nullptr;
-    bool compact = ld32(address) == 0x57574653;
-    uint32_t count = compact ? ld32(address + 4) : 0;
+    bool compact = mem::r32(address) == 0x57574653;
+    uint32_t count = compact ? mem::r32(address + 4) : 0;
     if (compact && count > 64) return nullptr;
     uint32_t size = compact ? 16 + count * 16 : regs[mmSQ_PGM_START_FS + 1] << 3;
     if (!size || size > 0x1000 || uint64_t(address) + size > 0x100000000ull) return nullptr;

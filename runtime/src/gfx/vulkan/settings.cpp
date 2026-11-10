@@ -1,5 +1,5 @@
 #include "settings.h"
-#include "runtime.h"
+#include "hle.h"
 #include <atomic>
 #include <cstdlib>
 #include <cstring>

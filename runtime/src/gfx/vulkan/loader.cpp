@@ -1,5 +1,4 @@
 // Vulkan entry points loaded at run time (loader.h).
-#include "../../exception_report.h"
 #include "loader.h"
 #include <stdexcept>
 #include <string>
@@ -17,14 +16,14 @@ WWHD_VK_RENDERING_FUNCTIONS(WWHD_VK_DEFINE)
 
 namespace {
 [[noreturn]] void missing(const char *name) {
-  exception_report::raise(std::string("the Vulkan driver does not provide ") + name +
+  throw std::runtime_error(std::string("the Vulkan driver does not provide ") + name +
                            "; update the graphics driver");
 }
 }  // namespace
 
 void load_global_functions(PFN_vkGetInstanceProcAddr gipa) {
   if (!gipa)
-    exception_report::raise("the Vulkan loader has no vkGetInstanceProcAddr");
+    throw std::runtime_error("the Vulkan loader has no vkGetInstanceProcAddr");
   vkGetInstanceProcAddr = gipa;
 #define WWHD_VK_LOAD(name) \
   if (!(name = reinterpret_cast<PFN_##name>(gipa(nullptr, #name)))) missing(#name);

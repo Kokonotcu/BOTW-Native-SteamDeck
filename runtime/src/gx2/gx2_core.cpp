@@ -33,7 +33,7 @@
 #include "shader_key_dirty.h"
 #include "gfx/vulkan/api.h"
 #endif
-#include "runtime.h"
+#include "hle.h"
 #include "savestate.h"
 #include "guest_addr.h"
 #include "../aspect.h"
@@ -312,7 +312,7 @@ static inline uint32* record_space(Recording* rec, uint32 words) {
         LOG("[gx2] display list overflow at %08X", rec->start);
         return nullptr;
     }
-    uint32* w = (uint32*)mem::ptr(rec->pos);
+    uint32* w = (uint32*)mem::host(rec->pos);
     rec->pos += bytes;
     return w;
 }
@@ -349,30 +349,19 @@ static Rec& rcur() { return ring[(rframe + 1) & 255]; }
 }
 
 static void render_thread_main() {
-    host::set_thread_name("GX2 render");
-    host::boost_thread_priority();
-    perf_hint::add_current_thread();
+    botw_set_thread_name("GX2 render");
+    botw_place_thread(1);  // the GPU pair's cpus (6-7) and priority, as Latte's GPU thread had
     for (;;) {
         {
             std::unique_lock<std::mutex> lk(g_q_mutex);
             g_q_waiting = true;
-            if (g_q_pending.empty()) {
-                const uint64_t idle = rprof::enabled() ? rprof::now_ns() : 0;
-                const int64_t ft0 = ftrace::on ? ftrace::now() : 0;
-                g_q_cv.wait(lk, [] { return !g_q_pending.empty(); });
-                if (idle) rprof::add_idle(rprof::now_ns() - idle);
-                if (ft0) {
-                    double ms = (ftrace::now() - ft0) / 1e6;
-                    ftrace::rcur().idleMs += ms;
-                    if (ftrace::rcur().fenceB) ftrace::rcur().idleAfterFenceMs += ms;
-                }
-            }
+            if (g_q_pending.empty()) g_q_cv.wait(lk, [] { return !g_q_pending.empty(); });
             g_q_waiting = false;
             g_q_work.swap(g_q_pending);
         }
         {
             std::lock_guard<std::recursive_mutex> lk(g_exec_mutex);
-            render::with_autorelease_pool([] { execute(g_q_work.data(), (uint32)g_q_work.size()); });
+            execute(g_q_work.data(), (uint32)g_q_work.size());
         }
         g_q_work.clear();
     }
@@ -380,7 +369,16 @@ static void render_thread_main() {
 
 static void start_render_thread() {
     static std::once_flag once;
-    std::call_once(once, [] { std::thread([] { exception_report::boundary("GX2 render thread", render_thread_main); }).detach(); });
+    std::call_once(once, [] {
+        std::thread([] {
+            try {
+                render_thread_main();
+            } catch (const std::exception& e) {  // an unsupported GPU state: stop with the reason in the log
+                LOG("FATAL: GX2 render thread: %s", e.what());
+                abort();
+            }
+        }).detach();
+    });
 }
 static void enqueue(Op op, const uint32* payload, uint32 n) {
     start_render_thread();
@@ -559,7 +557,7 @@ static uint32 unpack_struct(const uint32* words, uint32 count, int slot) {
     static uint32 scratch = 0;
     if (!scratch) scratch = mem::host_alloc(2 * 0x100, 0x40);
     uint32 addr = scratch + slot * 0x100;
-    memcpy(mem::ptr(addr), words, count * 4);
+    memcpy(mem::host(addr), words, count * 4);
     return addr;
 }
 
@@ -644,7 +642,7 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
         break;
     }
     case OP_COPY_TO_SCAN: render::copy_to_scan(unpack_struct(p, kColorBufferWords, 0), p[kColorBufferWords]); break;
-    case OP_CALL: execute((const uint32*)mem::ptr(p[0]), p[1] / 4); break;
+    case OP_CALL: execute((const uint32*)mem::host(p[0]), p[1] / 4); break;
     case OP_SET_CONTEXT: set_context(p[0]); break;
     case OP_INVALIDATE: render::invalidate(p[0], p[1], p[2]); break;
     case OP_EXPAND_COLOR: case OP_EXPAND_DEPTH: break;  // MSAA/HiZ decompression: nothing to do on the host
@@ -694,7 +692,7 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
         render::guest_flush();
         const auto give_up = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
         auto met = [&] {
-            const uint32 v = ld32(p[0]) & p[1], ref = p[3];
+            const uint32 v = mem::r32(p[0]) & p[1], ref = p[3];
             switch (p[2] & 7) {
             case 0: return false;
             case 1: return v < ref;
@@ -723,8 +721,8 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
     case OP_STREAMOUT_UPDATE: {  // the buffer's write offset (bytes), in command order like the GPU's
         uint32 reg = mmVGT_STRMOUT_BUFFER_OFFSET_0 + 4 * (p[0] & 3);
         if (p[1] == 0) g_regs[reg] = 0;
-        else if (p[1] == 1) g_regs[reg] = p[2] ? ld32(p[2]) : 0;
-        else if (p[1] == 3 && p[2]) st32(p[2], g_regs[reg]);
+        else if (p[1] == 1) g_regs[reg] = p[2] ? mem::r32(p[2]) : 0;
+        else if (p[1] == 3 && p[2]) mem::w32(p[2], g_regs[reg]);
         break;
     }
     case OP_LAYOUT_CONTENT:
@@ -880,10 +878,10 @@ constexpr uint32_t kVfrVtable = 0x10319D4Cu;  // v208: ksys::VFR
 // frames, delta frames, raw delta times, delta times per core); +0xD4 base interval (2), +0xD8 frame
 // rate (30), +0xDC frame time (1/30)
 bool vfr_valid(uint32_t a) {
-    return a && ld32(a) == kVfrVtable && ld32(a + 0xD4) == 2 && ld32(a + 0xD8) == 30 && ld32(a + 0xDC) == 0x3D088889u;
+    return a && mem::r32(a) == kVfrVtable && mem::r32(a + 0xD4) == 2 && mem::r32(a + 0xD8) == 30 && mem::r32(a + 0xDC) == 0x3D088889u;
 }
 uint32_t vfr() {  // the VFR singleton's instance pointer (v208: 1047C258); the layout above is from its vtable pointer
-    const uint32_t p = ld32(0x1047C258u);
+    const uint32_t p = mem::r32(0x1047C258u);
     return p && vfr_valid(p + 0x10) ? p + 0x10 : 0;
 }
 // UI animation speed: the game sets it each frame from the VFR interval (an integer, 2) times this
@@ -892,8 +890,8 @@ constexpr uint32_t kUiSpeedConst = 0x102C1DD4u;
 // gyro aiming (bow, runes): the controller's turn rate (per second) is divided by this 30.0 to give the
 // turn per frame; it is that code's only reader. Scaled with the frame time, or gyro aim turns 2x at 60 fps
 constexpr uint32_t kGyroPerFrameConst = 0x101B2D34u;
-void set_f32(uint32_t a, float v) { uint32_t u; memcpy(&u, &v, 4); st32(a, u); }
-float get_f32(uint32_t a) { uint32_t u = ld32(a); float v; memcpy(&v, &u, 4); return v; }
+void set_f32(uint32_t a, float v) { uint32_t u; memcpy(&u, &v, 4); mem::w32(a, u); }
+float get_f32(uint32_t a) { uint32_t u = mem::r32(a); float v; memcpy(&v, &u, 4); return v; }
 // game thread, once per frame (GX2SwapScanBuffers)
 void fps_frame() {
     static auto last = std::chrono::steady_clock::now();
@@ -906,8 +904,8 @@ void fps_frame() {
     const bool active = gx2::fps_target() != 30;
     const uint32_t a = vfr();
     static uint32_t uiSpeed = 0, gyroRate = 0;  // the constants' original bits
-    if (!uiSpeed) uiSpeed = ld32(kUiSpeedConst);
-    if (!gyroRate) gyroRate = ld32(kGyroPerFrameConst);
+    if (!uiSpeed) uiSpeed = mem::r32(kUiSpeedConst);
+    if (!gyroRate) gyroRate = mem::r32(kGyroPerFrameConst);
     float gyroOrig;
     memcpy(&gyroOrig, &gyroRate, 4);
     float uiOrig;
@@ -919,8 +917,8 @@ void fps_frame() {
                 set_f32(a + 0x18, 1.0f);
                 set_f32(a + 0x1C, 1.0f);
             }
-            st32(kUiSpeedConst, uiSpeed);
-            st32(kGyroPerFrameConst, gyroRate);
+            mem::w32(kUiSpeedConst, uiSpeed);
+            mem::w32(kGyroPerFrameConst, gyroRate);
         }
         wasActive = false;
         g_fps_gameplay = false;
@@ -1087,83 +1085,83 @@ static void ready_flip_before_resume() {
 }
 #endif
 
-HLE(gx2, GX2Init) {
+HLE_EXPORT(gx2, GX2Init) {
     set_default_state();
     LOG("[gx2] initialized (native GX2 -> %s)", render::api_name(render::active()));
     if(uncapped_benchmark())
         LOG("[gx2 benchmark] uncapped guest flips; GPU completion ordering retained; frame-based simulation accelerates while timebase/audio clocks remain real-time");
 }
 
-HLE(gx2, GX2SetupContextStateEx) {
-    uint32 ctx = arg(c, 0);
+HLE_EXPORT(gx2, GX2SetupContextStateEx) {
+    uint32 ctx = ARG(0);
     emit_host(OP_SETUP_CONTEXT, {ctx});
     set_default_state();
     // the context's "restore" display list lives inside the (0xA100 byte) context structure
     uint32 dl = ctx + 0x9800;
-    uint32* w = (uint32*)mem::ptr(dl);
+    uint32* w = (uint32*)mem::host(dl);
     w[0] = OP_SET_CONTEXT | (1u << 8);
     w[1] = ctx;
 }
-HLE(gx2, GX2SetContextState) { emit(OP_SET_CONTEXT, {arg(c, 0)}); }
-HLE(gx2, GX2GetContextStateDisplayList) {
-    if (arg(c, 1)) st32(arg(c, 1), arg(c, 0) + 0x9800);
-    if (arg(c, 2)) st32(arg(c, 2), 8);
+HLE_EXPORT(gx2, GX2SetContextState) { emit(OP_SET_CONTEXT, {ARG(0)}); }
+HLE_EXPORT(gx2, GX2GetContextStateDisplayList) {
+    if (ARG(1)) mem::w32(ARG(1), ARG(0) + 0x9800);
+    if (ARG(2)) mem::w32(ARG(2), 8);
 }
 
 // ---------------------------------------------------------------- display lists
-HLE(gx2, GX2BeginDisplayListEx) {
+HLE_EXPORT(gx2, GX2BeginDisplayListEx) {
     if (Recording* rec = claim_rec()) {
-        rec->start = rec->pos = arg(c, 0);
-        rec->end = arg(c, 0) + arg(c, 1);
+        rec->start = rec->pos = ARG(0);
+        rec->end = ARG(0) + ARG(1);
         if (!rec->start) release_rec(rec);  // as before: a null list records nothing
     }
 }
-HLE(gx2, GX2EndDisplayList) {
+HLE_EXPORT(gx2, GX2EndDisplayList) {
     uint32 size = 0;
     if (Recording* rec = recording()) {
         size = rec->pos - rec->start;
         release_rec(rec);
     }
-    ret(c, size);
+    RET(size);
 }
-HLE(gx2, GX2GetCurrentDisplayList) {
+HLE_EXPORT(gx2, GX2GetCurrentDisplayList) {
     const Recording* rec = recording();
     const uint32 start = rec ? rec->start : 0;
-    if (arg(c, 0)) st32(arg(c, 0), start);
-    if (arg(c, 1)) st32(arg(c, 1), start ? rec->end - rec->start : 0);
-    ret(c, start != 0);
+    if (ARG(0)) mem::w32(ARG(0), start);
+    if (ARG(1)) mem::w32(ARG(1), start ? rec->end - rec->start : 0);
+    RET(start != 0);
 }
-HLE(gx2, GX2CallDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
+HLE_EXPORT(gx2, GX2CallDisplayList) { emit(OP_CALL, {ARG(0), ARG(1)}); }
 // a copy into the command stream: run where it stands (our display lists are op lists, not PM4)
-HLE(gx2, GX2CopyDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
-HLE(gx2, GX2SetDefaultState) { set_default_state(); }
-HLE(gx2, GX2DirectCallDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
+HLE_EXPORT(gx2, GX2CopyDisplayList) { emit(OP_CALL, {ARG(0), ARG(1)}); }
+HLE_EXPORT(gx2, GX2SetDefaultState) { set_default_state(); }
+HLE_EXPORT(gx2, GX2DirectCallDisplayList) { emit(OP_CALL, {ARG(0), ARG(1)}); }
 
 // ---------------------------------------------------------------- draws
-HLE(gx2, GX2DrawEx) { emit(OP_DRAW, {arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3)}); }
-HLE(gx2, GX2DrawIndexedEx) { emit(OP_DRAW_INDEXED, {arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5)}); }
+HLE_EXPORT(gx2, GX2DrawEx) { emit(OP_DRAW, {ARG(0), ARG(1), ARG(2), ARG(3)}); }
+HLE_EXPORT(gx2, GX2DrawIndexedEx) { emit(OP_DRAW_INDEXED, {ARG(0), ARG(1), ARG(2), ARG(3), ARG(4), ARG(5)}); }
 // Stream out (transform feedback, BotW). Registers as Cemu's GX2_Streamout.cpp; the strides come
 // from GX2SetVertexShader. GX2StreamOutBuffer: +0 size, +4 dataPtr, +8 vertexStride, +0xC GX2RBuffer
 // (+0x10 elementSize, +0x14 elementCount, +0x18 ptr; used when dataPtr is null), +0x1C ctxPtr.
-HLE(gx2, GX2SetStreamOutEnable) { set_reg(mmVGT_STRMOUT_EN, arg(c, 0) & 1); }
-HLE(gx2, GX2SetStreamOutBuffer) {
-    uint32 i = arg(c, 0), b = arg(c, 1);
+HLE_EXPORT(gx2, GX2SetStreamOutEnable) { set_reg(mmVGT_STRMOUT_EN, ARG(0) & 1); }
+HLE_EXPORT(gx2, GX2SetStreamOutBuffer) {
+    uint32 i = ARG(0), b = ARG(1);
     if (i > 3 || !b) return;
-    uint32 addr = ld32(b + 4), size = ld32(b);
-    if (!addr) { addr = ld32(b + 0x18); size = ld32(b + 0x10) * ld32(b + 0x14); }
+    uint32 addr = mem::r32(b + 4), size = mem::r32(b);
+    if (!addr) { addr = mem::r32(b + 0x18); size = mem::r32(b + 0x10) * mem::r32(b + 0x14); }
     set_reg(mmVGT_STRMOUT_BUFFER_SIZE_0 + i * 4, size >> 2);
     set_reg(mmVGT_STRMOUT_BUFFER_BASE_0 + i * 4, addr >> 8);
 }
 // (index, buffer, reset): reset != 0 starts writing at 0, otherwise continues from the saved context
-HLE(gx2, GX2SetStreamOutContext) {
-    uint32 i = arg(c, 0), b = arg(c, 1);
+HLE_EXPORT(gx2, GX2SetStreamOutContext) {
+    uint32 i = ARG(0), b = ARG(1);
     if (i > 3) return;
-    emit(OP_STREAMOUT_UPDATE, {i, arg(c, 2) ? 0u : 1u, b ? ld32(b + 0x1C) : 0u});
+    emit(OP_STREAMOUT_UPDATE, {i, ARG(2) ? 0u : 1u, b ? mem::r32(b + 0x1C) : 0u});
 }
-HLE(gx2, GX2SaveStreamOutContext) {
-    uint32 i = arg(c, 0), b = arg(c, 1);
+HLE_EXPORT(gx2, GX2SaveStreamOutContext) {
+    uint32 i = ARG(0), b = ARG(1);
     if (i > 3 || !b) return;
-    emit(OP_STREAMOUT_UPDATE, {i, 3u, ld32(b + 0x1C)});
+    emit(OP_STREAMOUT_UPDATE, {i, 3u, mem::r32(b + 0x1C)});
 }
 
 // Occlusion queries. BotW reads one result on the CPU (GX2QueryGetOcclusionResult: the sun's lens
@@ -1200,93 +1198,93 @@ extern "C" void wwhd_query_result(uint32_t addr, uint32_t gen, uint64_t samples,
     q.done = gen;
     if (ok) q.samples = samples;
 }
-HLE(gx2, GX2QueryBegin) {  // (type, GX2Query*)
-    memset(mem::ptr(arg(c, 1)), 0, 0x40);
+HLE_EXPORT(gx2, GX2QueryBegin) {  // (type, GX2Query*)
+    memset(mem::host(ARG(1)), 0, 0x40);
     g_queries++;
     if (queries_off()) return;
-    emit(OP_QUERY_BEGIN, {arg(c, 1)});
+    emit(OP_QUERY_BEGIN, {ARG(1)});
 }
-HLE(gx2, GX2QueryEnd) {  // (type, GX2Query*)
+HLE_EXPORT(gx2, GX2QueryEnd) {  // (type, GX2Query*)
     if (queries_off()) return;
     uint32 gen;
     {
         std::lock_guard<std::mutex> l(g_query_mu);
-        QueryState& q = g_query_state[arg(c, 1)];
+        QueryState& q = g_query_state[ARG(1)];
         gen = ++q.issued;
         q.issuedFrame = render::frame_count();
     }
-    emit(OP_QUERY_END, {arg(c, 1), gen});
+    emit(OP_QUERY_END, {ARG(1), gen});
 }
-HLE(gx2, GX2QueryGetOcclusionResult) {  // (GX2Query*, u64* result) -> ready
+HLE_EXPORT(gx2, GX2QueryGetOcclusionResult) {  // (GX2Query*, u64* result) -> ready
     uint64_t samples = 0x100000;
     bool ready = true;
     if (!queries_off()) {
         std::lock_guard<std::mutex> l(g_query_mu);
-        auto it = g_query_state.find(arg(c, 0));
+        auto it = g_query_state.find(ARG(0));
         if (it != g_query_state.end()) {
             ready = it->second.done == it->second.issued || render::frame_count() > it->second.issuedFrame + 60;
             samples = it->second.samples;
         }
     }
     static const bool log = getenv("WWHD_QUERY_LOG") && atoi(getenv("WWHD_QUERY_LOG"));
-    if (log) LOG("[query] read %08X: %s %llu", arg(c, 0), ready ? "ready" : "not ready", (unsigned long long)samples);
-    if (!ready) { ret(c, 0); return; }
-    if (arg(c, 1)) { st32(arg(c, 1), (uint32)(samples >> 32)); st32(arg(c, 1) + 4, (uint32)samples); }
-    ret(c, 1);
+    if (log) LOG("[query] read %08X: %s %llu", ARG(0), ready ? "ready" : "not ready", (unsigned long long)samples);
+    if (!ready) { RET(0); return; }
+    if (ARG(1)) { mem::w32(ARG(1), (uint32)(samples >> 32)); mem::w32(ARG(1) + 4, (uint32)samples); }
+    RET(1);
 }
-HLE(gx2, GX2QueryBeginConditionalRender) { g_cond_renders++; }
-HLE(gx2, GX2QueryEndConditionalRender) {}
+HLE_EXPORT(gx2, GX2QueryBeginConditionalRender) { g_cond_renders++; }
+HLE_EXPORT(gx2, GX2QueryEndConditionalRender) {}
 
-HLE(gx2, GX2DrawIndexedEx2) {  // (prim, count, indexType, indices, baseVertex, instances, baseInstance)
-    emit(OP_DRAW_INDEXED, {arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5), arg(c, 6)});
+HLE_EXPORT(gx2, GX2DrawIndexedEx2) {  // (prim, count, indexType, indices, baseVertex, instances, baseInstance)
+    emit(OP_DRAW_INDEXED, {ARG(0), ARG(1), ARG(2), ARG(3), ARG(4), ARG(5), ARG(6)});
 }
 
 // ---------------------------------------------------------------- clears and copies
-static float farg(Cpu* c, int i) { return (float)c->f[1 + i].ps0; }
+static float farg(PPCContext* c, int i) { return (float)c->f[1 + i].ps0; }
 // Struct parameters are copied into the command (as GX2 encodes them into the command buffer):
 // games reuse one GX2ColorBuffer/GX2DepthBuffer and change its view between calls, also while
 // recording display lists that run later.
 static void put_struct(std::vector<uint32>& p, uint32 addr, uint32 words) {
     size_t at = p.size();
     p.resize(at + words);
-    if (addr) memcpy(&p[at], mem::ptr(addr), words * 4);
+    if (addr) memcpy(&p[at], mem::host(addr), words * 4);
 }
-HLE(gx2, GX2ClearColor) {
+HLE_EXPORT(gx2, GX2ClearColor) {
     std::vector<uint32> p;
-    put_struct(p, arg(c, 0), kColorBufferWords);
+    put_struct(p, ARG(0), kColorBufferWords);
     for (int i = 0; i < 4; i++) p.push_back(fbits(farg(c, i)));
     emit(OP_CLEAR_COLOR, p.data(), (uint32)p.size());
 }
-HLE(gx2, GX2ClearDepthStencilEx) {
+HLE_EXPORT(gx2, GX2ClearDepthStencilEx) {
     std::vector<uint32> p;
-    put_struct(p, arg(c, 0), kDepthBufferWords);
-    p.insert(p.end(), {fbits(farg(c, 0)), arg(c, 1) & 0xFF, arg(c, 2)});
+    put_struct(p, ARG(0), kDepthBufferWords);
+    p.insert(p.end(), {fbits(farg(c, 0)), ARG(1) & 0xFF, ARG(2)});
     emit(OP_CLEAR_DEPTH, p.data(), (uint32)p.size());
 }
-HLE(gx2, GX2ClearBuffersEx) {
+HLE_EXPORT(gx2, GX2ClearBuffersEx) {
     std::vector<uint32> p;
-    put_struct(p, arg(c, 0), kColorBufferWords);
-    put_struct(p, arg(c, 1), kDepthBufferWords);
+    put_struct(p, ARG(0), kColorBufferWords);
+    put_struct(p, ARG(1), kDepthBufferWords);
     p.insert(p.end(), {fbits(farg(c, 0)), fbits(farg(c, 1)), fbits(farg(c, 2)), fbits(farg(c, 3)), fbits(farg(c, 4)),
-                       arg(c, 2) & 0xFF, arg(c, 3)});
+                       ARG(2) & 0xFF, ARG(3)});
     emit(OP_CLEAR_BUFFERS, p.data(), (uint32)p.size());
 }
-HLE(gx2, GX2SetClearDepthStencil) {
-    auto* db = (GX2::GX2DepthBuffer*)mem::ptr(arg(c, 0));
+HLE_EXPORT(gx2, GX2SetClearDepthStencil) {
+    auto* db = (GX2::GX2DepthBuffer*)mem::host(ARG(0));
     db->clearDepth = farg(c, 0);
-    db->clearStencil = arg(c, 1) & 0xFF;
+    db->clearStencil = ARG(1) & 0xFF;
 }
-HLE(gx2, GX2CopySurface) {
+HLE_EXPORT(gx2, GX2CopySurface) {
     // debug: WWHD_COPYDBG=1 logs each copy as issued (thread, caller, source and destination images)
     static const bool dbg = getenv("WWHD_COPYDBG") != nullptr;
     if (dbg)
         LOG("[copydbg] issue t=%.3f thread %08X lr %08X src %08X img %08X dst %08X img %08X size %X", timebase::now() / (double)timebase::kTicksPerSec,
-            threads::current_thread(), c->lr, arg(c, 0), ld32(arg(c, 0) + 0x24), arg(c, 3), ld32(arg(c, 3) + 0x24), ld32(arg(c, 3) + 0x20));
+            threads::current_thread(), c->lr, ARG(0), mem::r32(ARG(0) + 0x24), ARG(3), mem::r32(ARG(3) + 0x24), mem::r32(ARG(3) + 0x20));
     std::vector<uint32> p;
-    put_struct(p, arg(c, 0), kSurfaceWords);
-    p.insert(p.end(), {arg(c, 1), arg(c, 2)});
-    put_struct(p, arg(c, 3), kSurfaceWords);
-    p.insert(p.end(), {arg(c, 4), arg(c, 5)});
+    put_struct(p, ARG(0), kSurfaceWords);
+    p.insert(p.end(), {ARG(1), ARG(2)});
+    put_struct(p, ARG(3), kSurfaceWords);
+    p.insert(p.end(), {ARG(4), ARG(5)});
     emit(OP_COPY_SURFACE, p.data(), (uint32)p.size());
     // The copy is complete when GX2CopySurface returns: the game uses the result (and frees the
     // surfaces) right away. agl's tile-mode conversion (027B5EEC) copies into a temporary surface,
@@ -1298,25 +1296,25 @@ HLE(gx2, GX2CopySurface) {
         render_sync(kSyncCopySurface);
     }
 }
-HLE(gx2, GX2CopyColorBufferToScanBuffer) {
+HLE_EXPORT(gx2, GX2CopyColorBufferToScanBuffer) {
     std::vector<uint32> p;
-    put_struct(p, arg(c, 0), kColorBufferWords);
-    p.push_back(arg(c, 1));
+    put_struct(p, ARG(0), kColorBufferWords);
+    p.push_back(ARG(1));
     emit(OP_COPY_TO_SCAN, p.data(), (uint32)p.size());
 }
-HLE(gx2, GX2ExpandAAColorBuffer) { emit(OP_EXPAND_COLOR, {arg(c, 0)}); }
-HLE(gx2, GX2ExpandDepthBuffer) { emit(OP_EXPAND_DEPTH, {arg(c, 0)}); }
-HLE(gx2, GX2Invalidate) { emit(OP_INVALIDATE, {arg(c, 0), arg(c, 1), arg(c, 2)}); }
+HLE_EXPORT(gx2, GX2ExpandAAColorBuffer) { emit(OP_EXPAND_COLOR, {ARG(0)}); }
+HLE_EXPORT(gx2, GX2ExpandDepthBuffer) { emit(OP_EXPAND_DEPTH, {ARG(0)}); }
+HLE_EXPORT(gx2, GX2Invalidate) { emit(OP_INVALIDATE, {ARG(0), ARG(1), ARG(2)}); }
 
 // ---------------------------------------------------------------- submission and presentation
-HLE(gx2, GX2Flush) { emit_host(OP_FLUSH, {}); }
-HLE(gx2, GX2DrawDone) {
+HLE_EXPORT(gx2, GX2Flush) { emit_host(OP_FLUSH, {}); }
+HLE_EXPORT(gx2, GX2DrawDone) {
     BlockingScope b;
     emit_host(OP_DRAW_DONE, {});
     const int64_t ft0 = ftrace::on ? ftrace::now() : 0;
     render_sync(kSyncDrawDone);
     if (ft0) ftrace::ring[(g_swap_count + 1) & 255].drawDoneMs += (ftrace::now() - ft0) / 1e6;
-    ret(c, 1);
+    RET(1);
 }
 // Freeze watchdog: when the game presents no frame for 1.5 s (outside the first minute's loading),
 // every guest thread's state is logged once per freeze ([freeze]), so what blocked can be found.
@@ -1335,7 +1333,7 @@ static void freeze_watchdog() {
         threads::dump_threads(why);
     }
 }
-HLE(gx2, GX2SwapScanBuffers) {
+HLE_EXPORT(gx2, GX2SwapScanBuffers) {
     {
         g_last_swap_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         static const bool watch = !getenv("WWHD_NO_FREEZE_WATCH");
@@ -1356,9 +1354,9 @@ HLE(gx2, GX2SwapScanBuffers) {
         int n = snprintf(buf, sizeof buf, "[gx2] swap from lr=%08X", c->lr);
         uint32_t sp = c->r[1];
         for (int i = 0; i < 8 && sp; i++) {
-            uint32_t prev = ld32(sp);
+            uint32_t prev = mem::r32(sp);
             if (!prev || prev <= sp) break;
-            n += snprintf(buf + n, sizeof buf - n, " <- %08X", ld32(prev + 4));
+            n += snprintf(buf + n, sizeof buf - n, " <- %08X", mem::r32(prev + 4));
             sp = prev;
         }
         LOG("%s", buf);
@@ -1379,7 +1377,7 @@ HLE(gx2, GX2SwapScanBuffers) {
     if ((captureCounter || captureStep) && ss::last_load_frame()) {
         static uint64_t capturedLoad = 0;
         const auto loaded = ss::last_load_frame();
-        const uint32_t counter = ld32(GD(0x101FF560));
+        const uint32_t counter = mem::r32(GD(0x101FF560));
         const uint64_t offset = captureStep ? steps - ss::last_load_step()
                                             : uint32_t(counter - ss::last_load_counter());
         const uint64_t target = strtoull(captureStep ? captureStep : captureCounter, nullptr, 10);
@@ -1422,29 +1420,29 @@ HLE(gx2, GX2SwapScanBuffers) {
             unsigned a = 0, n = 16;
             if (sscanf(pk, "%x:%u", &a, &n) >= 1) {
                 char hex[256] = {};
-                for (unsigned i = 0; i < n && i < 64; i++) snprintf(hex + i * 3, sizeof hex - i * 3, "%02X ", ld8(a + i));
+                for (unsigned i = 0; i < n && i < 64; i++) snprintf(hex + i * 3, sizeof hex - i * 3, "%02X ", mem::r8(a + i));
                 LOG("[peek] %08X: %s", a, hex);
             }
         }
         if (getenv("WWHD_SCHED_STATS")) threads::report_sched();
     }
 }
-HLE(gx2, GX2GetSwapStatus) {
+HLE_EXPORT(gx2, GX2GetSwapStatus) {
     std::lock_guard<std::mutex> lk(g_flip_mutex);
     update_flips();
-    if (arg(c, 0)) st32(arg(c, 0), (uint32)(g_swap_count + g_count_offset));
-    if (arg(c, 1)) st32(arg(c, 1), (uint32)(g_flip_count + g_count_offset));
-    if (arg(c, 2)) st64(arg(c, 2), timebase::to_guest(g_last_flip_time));
-    if (arg(c, 3)) st64(arg(c, 3), timebase::guest_now());
+    if (ARG(0)) mem::w32(ARG(0), (uint32)(g_swap_count + g_count_offset));
+    if (ARG(1)) mem::w32(ARG(1), (uint32)(g_flip_count + g_count_offset));
+    if (ARG(2)) mem::w64(ARG(2), timebase::to_guest(g_last_flip_time));
+    if (ARG(3)) mem::w64(ARG(3), timebase::guest_now());
 }
-HLE(gx2, GX2SetSwapInterval) { g_swap_interval = std::max<uint32>(arg(c, 0), 1); }
+HLE_EXPORT(gx2, GX2SetSwapInterval) { g_swap_interval = std::max<uint32>(ARG(0), 1); }
 // GX2 event callbacks (GX2SetEventCallback): BotW registers vsync (2) and flip (3) handlers; its
 // vsync handler counts vsyncs (1046D420, also its GX2SetGPUFence value) and the flip handler records
 // that count per frame. A host thread calls them like Cemu's event callback thread: vsync at
 // 59.94 Hz, then one flip callback per flip executed since. callback(eventType, userData).
 static std::atomic<uint32_t> g_event_cb[5], g_event_ud[5];
 static void event_callback_thread() {
-    Cpu* c = threads::make_service_cpu("GX2 event", 0x8000);
+    PPCContext* c = threads::make_service_cpu("GX2 event", 0x8000);
     host::set_thread_name("GX2 event");
     uint64_t seenFlips;
     {
@@ -1480,24 +1478,24 @@ static void event_callback_thread() {
     }
 }
 // (address, mask, compare op, value): the GPU waits there until the condition holds (see OP_WAIT_MEM)
-HLE(gx2, GX2SetGPUFence) {
+HLE_EXPORT(gx2, GX2SetGPUFence) {
     static const bool off = getenv("WWHD_NO_GPU_FENCE") && atoi(getenv("WWHD_NO_GPU_FENCE"));
-    if (!off && arg(c, 0)) emit(OP_WAIT_MEM, {arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3)});
+    if (!off && ARG(0)) emit(OP_WAIT_MEM, {ARG(0), ARG(1), ARG(2), ARG(3)});
 }
-HLE(gx2, GX2SetEventCallback) {
-    const uint32_t type = arg(c, 0);
+HLE_EXPORT(gx2, GX2SetEventCallback) {
+    const uint32_t type = ARG(0);
     if (type >= 5) return;
-    g_event_cb[type] = arg(c, 1);
-    g_event_ud[type] = arg(c, 2);
-    LOG("[gx2] event callback %u: %08X (user data %08X)", type, arg(c, 1), arg(c, 2));
+    g_event_cb[type] = ARG(1);
+    g_event_ud[type] = ARG(2);
+    LOG("[gx2] event callback %u: %08X (user data %08X)", type, ARG(1), ARG(2));
     static std::once_flag started;
     std::call_once(started, [] { std::thread(event_callback_thread).detach(); });
 }
-HLE(gx2, GX2GetEventCallback) {
-    const uint32_t type = arg(c, 0);
+HLE_EXPORT(gx2, GX2GetEventCallback) {
+    const uint32_t type = ARG(0);
     if (type >= 5) return;
-    if (arg(c, 1)) st32(arg(c, 1), g_event_cb[type]);
-    if (arg(c, 2)) st32(arg(c, 2), g_event_ud[type]);
+    if (ARG(1)) mem::w32(ARG(1), g_event_cb[type]);
+    if (ARG(2)) mem::w32(ARG(2), g_event_ud[type]);
 }
 // debug: WWHD_VSYNC_FENCE_POLL=1 makes the uncapped GX2WaitForVsync poll with a queue fence on every
 // call, as before; =2 alternates every 10 s and logs the process CPU and frame time of each window
@@ -1534,7 +1532,7 @@ static bool vsync_fence_poll() {
     flipsStart = flips;
     return poll;
 }
-HLE(gx2, GX2WaitForVsync) {
+HLE_EXPORT(gx2, GX2WaitForVsync) {
     if(uncapped_benchmark()) {
         BlockingScope b;
         // Here a flip executes as soon as its frame's GPU work is done (update_flips), and BotW polls
@@ -1633,39 +1631,39 @@ HLE(gx2, GX2WaitForVsync) {
 // scan buffers: the game renders into its own color buffers and copies to "scan buffers";
 // the renderer presents whatever was copied to the TV target.
 // (buffer, size, mode, surfaceFormat, bufferingMode): an sRGB format means scan-out applies the encoding
-HLE(gx2, GX2SetTVBuffer) {
-    LOG("[gx2] TV buffer format %X", arg(c, 3));
-    render::set_tv_format(arg(c, 3), true);
+HLE_EXPORT(gx2, GX2SetTVBuffer) {
+    LOG("[gx2] TV buffer format %X", ARG(3));
+    render::set_tv_format(ARG(3), true);
 }
-HLE(gx2, GX2SetDRCBuffer) { render::set_tv_format(arg(c, 3), false); }
-HLE(gx2, GX2SetTVScale) {}
-HLE(gx2, GX2SetDRCScale) {}
-HLE(gx2, GX2SetTVEnable) {}
-HLE(gx2, GX2SetDRCEnable) {}
-HLE(gx2, GX2CalcTVSize) {
+HLE_EXPORT(gx2, GX2SetDRCBuffer) { render::set_tv_format(ARG(3), false); }
+HLE_EXPORT(gx2, GX2SetTVScale) {}
+HLE_EXPORT(gx2, GX2SetDRCScale) {}
+HLE_EXPORT(gx2, GX2SetTVEnable) {}
+HLE_EXPORT(gx2, GX2SetDRCEnable) {}
+HLE_EXPORT(gx2, GX2CalcTVSize) {
     // (mode, format, bufferingMode, uint32* size, bool* scaleNeeded)
-    uint32 mode = arg(c, 0), buffers = std::max<uint32>(arg(c, 2), 1);
+    uint32 mode = ARG(0), buffers = std::max<uint32>(ARG(2), 1);
     uint32 w = mode >= 5 ? 1920 : mode <= 2 ? 854 : 1280, h = mode >= 5 ? 1080 : mode <= 2 ? 480 : 720;
-    st32(arg(c, 3), w * h * 4 * buffers);
-    st32(arg(c, 4), 0);
+    mem::w32(ARG(3), w * h * 4 * buffers);
+    mem::w32(ARG(4), 0);
 }
-HLE(gx2, GX2CalcDRCSize) {
-    st32(arg(c, 3), 854 * 480 * 4 * std::max<uint32>(arg(c, 2), 1));
-    st32(arg(c, 4), 0);
+HLE_EXPORT(gx2, GX2CalcDRCSize) {
+    mem::w32(ARG(3), 854 * 480 * 4 * std::max<uint32>(ARG(2), 1));
+    mem::w32(ARG(4), 0);
 }
 
 // ---------------------------------------------------------------- misc queries
-HLE(gx2, GX2TempGetGPUVersion) { ret(c, 2); }
-HLE(gx2, GX2CalcGeometryShaderInputRingBufferSize) { ret(c, arg(c, 0) * 4 * 0x1000); }
-HLE(gx2, GX2CalcGeometryShaderOutputRingBufferSize) { ret(c, arg(c, 0) * 4 * 0x1000); }
-HLE(gx2, GX2CalcFetchShaderSizeEx) {
-    uint32 n = arg(c, 0);
+HLE_EXPORT(gx2, GX2TempGetGPUVersion) { RET(2); }
+HLE_EXPORT(gx2, GX2CalcGeometryShaderInputRingBufferSize) { RET(ARG(0) * 4 * 0x1000); }
+HLE_EXPORT(gx2, GX2CalcGeometryShaderOutputRingBufferSize) { RET(ARG(0) * 4 * 0x1000); }
+HLE_EXPORT(gx2, GX2CalcFetchShaderSizeEx) {
+    uint32 n = ARG(0);
     uint32 cf = ((((n + 15) / 16) + 1) * 8 + 0xF) & ~0xFu;
-    ret(c, std::max<uint32>(cf + n * 16, 16 + n * 16));
+    RET(std::max<uint32>(cf + n * 16, 16 + n * 16));
 }
-HLE(gx2, GX2GPUTimeToCPUTime) { ret64(c, arg64(c, 3)); }
-HLE(gx2, GX2SampleTopGPUCycle) { if (arg(c, 0)) st64(arg(c, 0), timebase::guest_now()); }
-HLE(gx2, GX2SampleBottomGPUCycle) { if (arg(c, 0)) st64(arg(c, 0), timebase::guest_now()); }
+HLE_EXPORT(gx2, GX2GPUTimeToCPUTime) { ret64(c, arg64(c, 3)); }
+HLE_EXPORT(gx2, GX2SampleTopGPUCycle) { if (ARG(0)) mem::w64(ARG(0), timebase::guest_now()); }
+HLE_EXPORT(gx2, GX2SampleBottomGPUCycle) { if (ARG(0)) mem::w64(ARG(0), timebase::guest_now()); }
 
 // ---------------------------------------------------------------- save states
 

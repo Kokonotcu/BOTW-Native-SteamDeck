@@ -1,4 +1,3 @@
-#include "../../exception_report.h"
 #include "aspect.h"
 #include "aspect_panes.h"
 #include "../renderer.h"
@@ -10,7 +9,7 @@
 #include "backend.h"
 #include "buffer_cache.h"
 #include "render_prof.h"
-#include "runtime.h"
+#include "hle.h"
 #include "shaders.h"
 #include "settings.h"
 #include "vertex_formats.h"
@@ -88,7 +87,7 @@ Surface* private_ao_surface(Surface& dst, const Surface* like) {
   if (!logicalWidth || !logicalHeight || logicalWidth > UINT32_MAX ||
       logicalHeight > UINT32_MAX || !physicalWidth || !physicalHeight ||
       physicalWidth > limit || physicalHeight > limit)
-    exception_report::raise("private AO image dimensions exceed device limits");
+    throw std::runtime_error("private AO image dimensions exceed device limits");
   const uint32_t width = uint32_t(logicalWidth), height = uint32_t(logicalHeight);
   const VkExtent3D extent{uint32_t(physicalWidth), uint32_t(physicalHeight), 1};
   if (!dst.image || dst.width != width || dst.height != height ||
@@ -155,7 +154,7 @@ UploadSlice vertex_snapshot(uint32_t binding, uint32_t address, uint32_t size,
     }
   }
   if (!enabled)
-    return snapshot(mem::ptr(address), size, 4);
+    return snapshot(mem::host(address), size, 4);
   static const bool historyEnabled = [] {
     const char* e = std::getenv("WWHD_VK_VERTEX_HISTORY_REUSE");
     return e && !std::strcmp(e, "1");
@@ -169,12 +168,12 @@ UploadSlice vertex_snapshot(uint32_t binding, uint32_t address, uint32_t size,
     generation = R.submissionGeneration;
   }
   if (binding >= cache.size())
-    return snapshot(mem::ptr(address), size, 4);
+    return snapshot(mem::host(address), size, 4);
   auto &history = cache[binding];
   auto &last = history.last;
   if (!bounded) {
     history.reset();
-    return snapshot(mem::ptr(address), size, 4);
+    return snapshot(mem::host(address), size, 4);
   }
   // One exact matching payload per draw; secondary is consulted only when
   // the original consecutive key differs, never after a changed-byte miss.
@@ -189,7 +188,7 @@ UploadSlice vertex_snapshot(uint32_t binding, uint32_t address, uint32_t size,
     if (timed) start = std::chrono::steady_clock::now();
     // the entry's CPU copy, not candidate->slice.mapped, unless the entry was made with direct reads
     // (host-cached upload memory: see vertex_snapshot_history.h)
-    const bool equal = VertexSnapshotHistory<UploadSlice>::equal(*candidate, mem::ptr(address));
+    const bool equal = VertexSnapshotHistory<UploadSlice>::equal(*candidate, mem::host(address));
     if (timed)
       R.vertexReuseCompareNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - start).count();
@@ -204,7 +203,7 @@ UploadSlice vertex_snapshot(uint32_t binding, uint32_t address, uint32_t size,
       return history.last.slice;
     }
   }
-  return history.remember(address, size, mem::ptr(address), historyEnabled, R.uploadReadsDirect,
+  return history.remember(address, size, mem::host(address), historyEnabled, R.uploadReadsDirect,
                           [](const void* bytes, size_t n) { return snapshot(bytes, n, 4); });
 }
 
@@ -224,7 +223,7 @@ UploadSlice vertex_window_snapshot(uint32_t binding,uint32_t address,uint32_t re
   static const bool reuse=[] {const char* e=std::getenv("WWHD_VK_REUSE_VERTEX_SNAPSHOTS");
     return e && !std::strcmp(e,"1");}();
   Entry* entry=reuse && binding<entries.size()?&entries[binding]:nullptr;
-  const auto* fresh=static_cast<const uint8_t*>(source?source:mem::ptr(address))+begin;
+  const auto* fresh=static_cast<const uint8_t*>(source?source:mem::host(address))+begin;
   // compares the entry's CPU copy of the window, not the mapped slice, unless the entry was made with
   // direct reads (host-cached upload memory; vertex_snapshot_history.h)
   if(entry && entry->matches(address,reservation,begin,length)) {
@@ -357,7 +356,7 @@ VkPrimitiveTopology primitive_topology(uint32_t prim) {
   case 3: case 0x12: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
   case 4: case 5: case 0x13: case 0x14: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
   case 6: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
-  default: exception_report::raise("unsupported Vulkan primitive");
+  default: throw std::runtime_error("unsupported Vulkan primitive");
   }
 }
 uint32_t vertex_prefix_size(uint32_t declared, uint32_t stride,
@@ -437,7 +436,7 @@ VkBlendFactor blend(uint32_t v) {
                                     VK_BLEND_FACTOR_CONSTANT_ALPHA,
                                     VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA};
   if (v >= std::size(t))
-    exception_report::raise("unsupported blend factor");
+    throw std::runtime_error("unsupported blend factor");
   return t[v];
 }
 VkBlendOp blendop(uint32_t v) {
@@ -445,7 +444,7 @@ VkBlendOp blendop(uint32_t v) {
                                 VK_BLEND_OP_MIN, VK_BLEND_OP_MAX,
                                 VK_BLEND_OP_REVERSE_SUBTRACT};
   if (v >= 5)
-    exception_report::raise("unsupported blend operation");
+    throw std::runtime_error("unsupported blend operation");
   return t[v];
 }
 VkStencilOp stencil(uint32_t v) {
@@ -458,7 +457,7 @@ VkStencilOp stencil(uint32_t v) {
                                   VK_STENCIL_OP_INCREMENT_AND_WRAP,
                                   VK_STENCIL_OP_DECREMENT_AND_WRAP};
   if (v >= 8)
-    exception_report::raise("unsupported stencil operation");
+    throw std::runtime_error("unsupported stencil operation");
   return t[v];
 }
 struct BindingTrimMetadata {
@@ -582,7 +581,7 @@ PipelineKey pipeline_key(const uint32_t* r, const vk::Shader* vs, const vk::Shad
                      r[REGADDR::PA_SU_POLY_OFFSET_CLAMP]};
   key.clip = r[REGADDR::PA_CL_CLIP_CNTL] & (1u << 27);  // depth clamp
   if (fs->bufferGroups.size() > kMaxPipelineStrides)
-    exception_report::raise("fetch shader has more vertex buffers than a pipeline key holds");
+    throw std::runtime_error("fetch shader has more vertex buffers than a pipeline key holds");
   for (auto& g : fs->bufferGroups)
     key.strides[key.strideCount++] =
         (r[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7 + 2] >> 11) & 0xFFFF;
@@ -685,7 +684,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
       add(m.textureUnitBaseBindingPoint + i,
           VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
     if (m.tfStorageBindingPoint >= 0)
-      exception_report::raise("Vulkan transform feedback unsupported");
+      throw std::runtime_error("Vulkan transform feedback unsupported");
     VkDescriptorSetLayoutCreateInfo ci{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     ci.bindingCount = b.size();
@@ -728,7 +727,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
         continue;
       auto fmt = vk::vertex_format(a.format);
       if (fmt == VK_FORMAT_UNDEFINED)
-        exception_report::raise("unsupported vertex format");
+        throw std::runtime_error("unsupported vertex format");
       attributes.push_back(
           {uint32_t(loc), g.attributeBufferIndex, fmt, a.offset});
       // Mirror the conservative prefix rules using the actual pipeline format.
@@ -745,11 +744,11 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
         }
       }
       if (fetchRate && *fetchRate != a.fetchType)
-        exception_report::raise("mixed vertex/instance rate in one buffer");
+        throw std::runtime_error("mixed vertex/instance rate in one buffer");
       fetchRate = a.fetchType;
       if (a.fetchType == LatteConst::VertexFetchType2::INSTANCE_DATA) {
         if (a.aluDivisor != 1)
-          exception_report::raise("instance divisor unsupported");
+          throw std::runtime_error("instance divisor unsupported");
         instance = true;
       }
     }
@@ -787,7 +786,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   std::memcpy(&pipelineClip, r + REGADDR::PA_CL_CLIP_CNTL, 4);
   if (pipelineClip.get_ZCLIP_FAR_DISABLE()) {
     if (!R.enabledFeatures.depthClamp)
-      exception_report::raise("device lacks depth clamp requested by guest");
+      throw std::runtime_error("device lacks depth clamp requested by guest");
     rs.depthClampEnable = VK_TRUE;
   }
   rs.lineWidth = 1;
@@ -803,7 +802,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   if (rs.depthBiasEnable) {
     rs.depthBiasClamp = f32(r[REGADDR::PA_SU_POLY_OFFSET_CLAMP]);
     if (rs.depthBiasClamp != 0 && !R.enabledFeatures.depthBiasClamp)
-      exception_report::raise("device lacks depth bias clamp requested by guest");
+      throw std::runtime_error("device lacks depth bias clamp requested by guest");
   }
   VkPipelineMultisampleStateCreateInfo ms{
       VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -866,7 +865,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   bs.logicOp = VK_LOGIC_OP_COPY;
   if (rop != 0xCC) {
     if (!R.enabledFeatures.logicOp)
-      exception_report::raise("color logic operation unsupported by device");
+      throw std::runtime_error("color logic operation unsupported by device");
     bs.logicOpEnable = VK_TRUE;
     switch (rop) {
     case 0x00:
@@ -915,7 +914,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
       bs.logicOp = VK_LOGIC_OP_SET;
       break;
     default:
-      exception_report::raise("unsupported color logic operation");
+      throw std::runtime_error("unsupported color logic operation");
     }
   }
   for (uint32_t i = 0; i < ncolor; ++i)
@@ -926,20 +925,20 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
            b.dstColorBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR ||
            b.srcAlphaBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR ||
            b.dstAlphaBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR))
-        exception_report::raise("dual-source blend unsupported by device");
+        throw std::runtime_error("dual-source blend unsupported by device");
       if (!R.constantAlphaColorBlendFactors &&
           (b.srcColorBlendFactor == VK_BLEND_FACTOR_CONSTANT_ALPHA ||
            b.srcColorBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA ||
            b.dstColorBlendFactor == VK_BLEND_FACTOR_CONSTANT_ALPHA ||
            b.dstColorBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA))
-        exception_report::raise(
+        throw std::runtime_error(
             "constant alpha color blend unsupported by device");
     }
   if (ds.stencilTestEnable && !R.separateStencilMaskRef &&
       (ds.front.compareMask != ds.back.compareMask ||
        ds.front.writeMask != ds.back.writeMask ||
        ds.front.reference != ds.back.reference))
-    exception_report::raise("separate stencil state unsupported by device");
+    throw std::runtime_error("separate stencil state unsupported by device");
   VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                           VK_DYNAMIC_STATE_BLEND_CONSTANTS,
                           VK_DYNAMIC_STATE_STENCIL_REFERENCE};
@@ -1066,11 +1065,11 @@ VkSampler sampler(const uint32_t *words, bool compare, bool integer, bool allowA
       return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
     case 3:
       if (!R.samplerMirrorClampToEdge)
-        exception_report::raise("mirror-once sampler unsupported by device");
+        throw std::runtime_error("mirror-once sampler unsupported by device");
       return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
     case 5:
     case 7:
-      exception_report::raise(
+      throw std::runtime_error(
           "mirror-once border sampling is not implemented");
     case 2:
       return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -1568,10 +1567,10 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
   if (useRanks) occupied.fill(false);
   auto appendWrite = [&](uint8_t rank) -> VkWriteDescriptorSet & {
     if (writeCount >= writes.size())
-      exception_report::raise("stage descriptor write capacity exceeded");
+      throw std::runtime_error("stage descriptor write capacity exceeded");
     const size_t slot = useRanks ? size_t(rank) : size_t(writeCount);
     if (useRanks && (slot >= rankPlan.count || occupied[slot]))
-      exception_report::raise("stage descriptor rank metadata mismatch");
+      throw std::runtime_error("stage descriptor rank metadata mismatch");
     ++writeCount;
     if (useRanks) occupied[slot] = true;
     auto &write = writes[slot];
@@ -1581,13 +1580,13 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     write.descriptorCount = 1;
     return write;
   };
-  // guestAddr: a guest uniform block (bytes == mem::ptr(guestAddr)), served by the buffer cache if on
+  // guestAddr: a guest uniform block (bytes == mem::host(guestAddr)), served by the buffer cache if on
   auto uniform = [&](int binding, const void *bytes, size_t size, size_t logicalSlot,
                      uint32_t guestAddr = 0) {
     if (binding < 0)
       return;
     if (size > R.properties.limits.maxUniformBufferRange)
-      exception_report::raise("uniform buffer exceeds device range");
+      throw std::runtime_error("uniform buffer exceeds device range");
     if(preparation_stats_enabled()) {
       ++R.cpuPreparation.uniformSnapshotCalls;
       R.cpuPreparation.uniformSnapshotBytes+=size;
@@ -1620,16 +1619,16 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
       R.cpuPreparation.uniformReuseBytes = counts.reusedBytes;
     }
     if (bufferCount >= bufferInfos.size())
-      exception_report::raise("stage uniform descriptor capacity exceeded");
+      throw std::runtime_error("stage uniform descriptor capacity exceeded");
     auto &info = bufferInfos[bufferCount++];
     info = {b.buffer, dynamicUniforms ? 0 : b.offset, b.size};
     if (dynamicUniforms) {
       if (b.offset > UINT32_MAX)
-        exception_report::raise("dynamic uniform offset exceeds uint32 range");
+        throw std::runtime_error("dynamic uniform offset exceeds uint32 range");
       if (useRanks) {
         const auto rank = logicalSlot == 16 ? rankPlan.support : rankPlan.blocks[logicalSlot];
         if (rank >= rankPlan.count)
-          exception_report::raise("stage uniform rank metadata mismatch");
+          throw std::runtime_error("stage uniform rank metadata mismatch");
         rankedOffsets[rank] = uint32_t(b.offset);
       } else dynamicBindings[dynamicCount++] = {uint32_t(binding), uint32_t(b.offset)};
     }
@@ -1677,7 +1676,7 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     if (m.uniformBuffersBindingPoint[i] >= 0) {
       uint32_t addr = r[block + i * 7];
       uint32_t size = std::min<uint32_t>(r[block + i * 7 + 1] + 1, 0x10000);
-      uniform(m.uniformBuffersBindingPoint[i], addr ? mem::ptr(addr) : nullptr,
+      uniform(m.uniformBuffersBindingPoint[i], addr ? mem::host(addr) : nullptr,
               size, size_t(i), addr);
       if (addr) rprof::guest_read(rprof::kUpUbo, addr, size);
     }
@@ -1687,14 +1686,14 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
   for (int i = 0; i < sh->dec->textureUnitListCount; i++) {
     uint32_t unit = sh->dec->textureUnitList[i];
     if (unit >= LATTE_NUM_MAX_TEX_UNITS)
-      exception_report::raise("sampled texture unit exceeds stage capacity");
+      throw std::runtime_error("sampled texture unit exceeds stage capacity");
     int binding = m.textureUnitToBindingPoint[unit];
     if (binding < 0)
       continue;
     auto *s = sampled_texture(r + texbase + unit * 7,
                               sh->dec->textureUsesDepthCompare[unit]);
     if (!s)
-      exception_report::raise("missing sampled texture");
+      throw std::runtime_error("missing sampled texture");
     if (!sh->vertex && ao_hires_enabled() && aoPrivateSource &&
         s->addr == aoPrivateSource && aoPrivateFrame == R.frame &&
         sh->kind == gfx::ProgramKind::OcclusionPixel)
@@ -1723,7 +1722,7 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     uint32_t samplerId = sh->dec->textureUnitSamplerAssignment[unit];
     uint32_t samplerBase = sh->vertex ? 18 : 0;
     if (imageCount >= imageInfos.size())
-      exception_report::raise("stage image descriptor capacity exceeded");
+      throw std::runtime_error("stage image descriptor capacity exceeded");
     auto &info = imageInfos[imageCount++];
     // A unit the shader only reads with texel fetches has no sampler (the decompiler's SAMPLER_NONE). The
     // descriptor still needs one: an all-zero sampler (point filtering, wrap), as Cemu's Vulkan renderer does;
@@ -1816,7 +1815,7 @@ UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
     const void* data,bool poisonUnused) {
   if(!data || !windowLength || windowOffset>reservation ||
      windowLength>reservation-windowOffset)
-    exception_report::raise("invalid vertex window smoke bounds");
+    throw std::runtime_error("invalid vertex window smoke bounds");
   return vertex_window_snapshot(binding,address,reservation,windowOffset,
                                 windowLength,data,poisonUnused);
 }
@@ -1834,13 +1833,13 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   uint64_t fsKey = 0;
   auto *fs = vk::get_fetch_shader(r, &fsKey, R.frame);
   if (!fs)
-    exception_report::raise("missing Vulkan fetch shader");
+    throw std::runtime_error("missing Vulkan fetch shader");
   auto *vs = vk::translate(r, true, fs, fsKey, R.frame, g_shader_state_gen);
   auto *ps = vk::translate(r, false, fs, fsKey, R.frame, g_shader_state_gen,
                            vs && vs->ready() ? vs : nullptr);
   rprof::mark(rprof::kShader);
   if (!vs || !vs->ready() || !ps || !ps->ready())
-    exception_report::raise("Vulkan shader translation failed: " +
+    throw std::runtime_error("Vulkan shader translation failed: " +
                              (vs && !vs->ready() ? vs->error
                               : ps               ? ps->error
                                                  : "missing shader"));
@@ -1908,9 +1907,9 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     case 4: case 5: case 0x13: case 0x14:
       topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
     case 6: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
-    default: exception_report::raise("unsupported Vulkan primitive");
+    default: throw std::runtime_error("unsupported Vulkan primitive");
     }
-    vk::convert_indices(indexAddr ? mem::ptr(indexAddr) : nullptr, prim, count,
+    vk::convert_indices(indexAddr ? mem::host(indexAddr) : nullptr, prim, count,
                         indexType, stripRestart, restartIndex, indices);
   } else {
   if (!nativeIndices) indices.reserve(convertedCount);
@@ -1920,19 +1919,19 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     uint32_t value;
     switch (indexType) {
     case 0:
-      value = ((uint16_t *)mem::ptr(indexAddr))[i];
+      value = ((uint16_t *)mem::host(indexAddr))[i];
       break;
     case 1:
-      value = ((uint32_t *)mem::ptr(indexAddr))[i];
+      value = ((uint32_t *)mem::host(indexAddr))[i];
       break;
     case 4:
-      value = ld16(indexAddr + i * 2);
+      value = mem::r16(indexAddr + i * 2);
       break;
     case 9:
-      value = ld32(indexAddr + i * 4);
+      value = mem::r32(indexAddr + i * 4);
       break;
     default:
-      exception_report::raise("unsupported index type");
+      throw std::runtime_error("unsupported index type");
     }
     // All host index buffers use uint32, whose native restart marker differs
     // from the guest's configurable marker (including 16-bit 0xffff).
@@ -1978,7 +1977,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     indices.push_back(idx(0));
     break;
   default:
-    exception_report::raise("unsupported Vulkan primitive");
+    throw std::runtime_error("unsupported Vulkan primitive");
   }
   if (!nativeIndices && indices.empty() && indexAddr) {
     indices.resize(count);
@@ -2045,7 +2044,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   for (auto *&c : colors)
     if (c && (c->extent.width != width || c->extent.height != height)) {
       if (aoPrivateReplay) c = nullptr;
-      else exception_report::raise("mismatched Vulkan attachments");
+      else throw std::runtime_error("mismatched Vulkan attachments");
     }
   if (depth && (depth->extent.width < width || depth->extent.height < height))
     depth = nullptr;
@@ -2271,7 +2270,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
                                          hostRestart, int32_t(baseVertex));
     } else {
       const size_t bytes = size_t(count) * indexBytes;
-      const auto* guest = static_cast<const uint8_t*>(mem::ptr(indexAddr));
+      const auto* guest = static_cast<const uint8_t*>(mem::host(indexAddr));
       if (R.uploadReadsDirect) {
         nativeIndexSlice = snapshot(guest, bytes, 4);
         nativeIndexData = nativeIndexSlice.mapped;
@@ -2320,7 +2319,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     uint32_t size =
         r[mmSQ_VTX_ATTRIBUTE_BLOCK_START + g.attributeBufferIndex * 7 + 1] + 1;
     if (!addr || !size)
-      exception_report::raise("missing vertex buffer");
+      throw std::runtime_error("missing vertex buffer");
     const BindingTrimMetadata trim = cachedTrims
         ? p.bindingTrims[trimGroup] : binding_trim_metadata(r, vs, g);
     ++trimGroup;

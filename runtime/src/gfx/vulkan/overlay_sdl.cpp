@@ -14,7 +14,7 @@
 #include "platform/host.h"
 #include "platform/perf_hint.h"
 #include "platform/dual_display.h"
-#include "runtime.h"
+#include "hle.h"
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <cctype>

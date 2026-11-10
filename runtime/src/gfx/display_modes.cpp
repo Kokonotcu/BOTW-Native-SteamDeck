@@ -31,7 +31,7 @@
 
 #include "../aspect.h"
 #include "input.h"
-#include "runtime.h"
+#include "hle.h"
 
 namespace gfx {
 

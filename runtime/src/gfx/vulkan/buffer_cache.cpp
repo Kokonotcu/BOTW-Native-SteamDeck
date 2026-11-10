@@ -10,7 +10,7 @@
 
 #include "backend.h"
 #include "render_prof.h"
-#include "runtime.h"
+#include "hle.h"
 #include "write_watch.h"
 
 namespace gfxvk {
@@ -170,11 +170,11 @@ bool cached_guest_range(uint32_t addr, uint32_t size, int uploadKind, UploadSlic
   case bufcache::kHit:
     if (buffer_cache_verify()) {
       uint32_t diff = 0;
-      if (!cache.verify(*e, mem::ptr(addr), size, &diff)) buffer_cache_mismatch("range", *e, size, diff);
+      if (!cache.verify(*e, mem::host(addr), size, &diff)) buffer_cache_mismatch("range", *e, size, diff);
     }
     break;
   case bufcache::kMiss:
-    if (!cache.upload(*e, mem::ptr(addr), size)) return false;
+    if (!cache.upload(*e, mem::host(addr), size)) return false;
     rprof::add_upload(rprof::Upload(uploadKind), size);
     break;
   case bufcache::kBypass: return false;
@@ -191,12 +191,12 @@ bool cached_native_indices(uint32_t addr, uint32_t size, UploadSlice& out, bufca
   case bufcache::kHit:
     if (buffer_cache_verify()) {
       uint32_t diff = 0;
-      if (!cache.verify(*e, mem::ptr(addr), size, &diff)) buffer_cache_mismatch("indices", *e, size, diff);
+      if (!cache.verify(*e, mem::host(addr), size, &diff)) buffer_cache_mismatch("indices", *e, size, diff);
     }
     break;
   case bufcache::kMiss: {
     // one read of guest memory: the shadow (extent scans) and the region get the same bytes
-    std::vector<uint8_t> bytes(mem::ptr(addr), mem::ptr(addr) + size);
+    std::vector<uint8_t> bytes(mem::host(addr), mem::host(addr) + size);
     if (!cache.upload(*e, bytes.data(), size)) return false;
     e->shadow = std::move(bytes);
     rprof::add_upload(rprof::kUpIndex, size);

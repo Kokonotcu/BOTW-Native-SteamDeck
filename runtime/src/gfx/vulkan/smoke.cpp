@@ -1,4 +1,3 @@
-#include "../../exception_report.h"
 #include "bc_decode.h"
 #include "bc_reference.h"
 // No game assets: assertions inspect data returned by the actual Vulkan device.
@@ -11,7 +10,7 @@
 #include "shaders.h"
 #include "gx2/gx2.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
-#include "runtime.h"
+#include "hle.h"
 #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
 #include "input.h"
 #include "gfx/display_modes.h"
@@ -37,7 +36,7 @@ namespace gfxvk {
 extern uint64_t g_stat_full_checks, g_stat_uploads;
 void request_tv_dump(const std::string&,int);
 namespace {
-void require(bool condition,const char* message) { if(!condition)exception_report::raise(message); }
+void require(bool condition,const char* message) { if(!condition)throw std::runtime_error(message); }
 struct Image {
  Surface s;
  Image(uint32_t w,uint32_t h,uint32_t format,bool depth=false,uint32_t layers=1,uint32_t mips=1) {
@@ -69,7 +68,7 @@ void clear_image(Surface& s,const float rgba[4]) {
 void colour_comparison_check() {
  for (uint32_t tile : {1u,2u}) {
   uint32_t addr=mem::host_alloc(4096,256);
-  memset(mem::ptr(addr),0,4096);
+  memset(mem::host(addr),0,4096);
   auto offset=[&](uint32_t x,uint32_t y) {
    if(tile==1)return (y*8+x)*4;
    return LatteAddrLib::ComputeSurfaceAddrFromCoordMicroTiled(x,y,0,32,8,8,
@@ -77,7 +76,7 @@ void colour_comparison_check() {
   };
   for(uint32_t y=0;y<4;++y)for(uint32_t x=0;x<4;++x) {
    uint8_t rgba[4]={uint8_t((x+y*4)*17),uint8_t(255-x*17),uint8_t(y*31),255};
-   memcpy(mem::ptr(addr)+offset(x,y),rgba,4);
+   memcpy(mem::host(addr)+offset(x,y),rgba,4);
   }
   uint32_t words[7]={1u|(tile<<3)|(3u<<19),3u|(0x1au<<26),addr>>8,0,
                     (1u<<19)|(2u<<22)|(3u<<25),0,0};
@@ -107,7 +106,7 @@ void bc_surface_check() {
  for (uint32_t format : {0x31u,0x431u,0x32u,0x432u,0x33u,0x433u,0x34u,0x234u,0x35u,0x235u}) {
   SurfaceDesc d;d.addr=mem::host_alloc(65536,256);d.mipAddr=mem::host_alloc(65536,256);
   d.width=16;d.height=16;d.pitch=4;d.slices=2;d.mips=2;d.format=format;d.dim=5;
-  memset(mem::ptr(d.addr),0,65536);memset(mem::ptr(d.mipAddr),0,65536);
+  memset(mem::host(d.addr),0,65536);memset(mem::host(d.mipAddr),0,65536);
   auto* s=find_or_create_surface(d,false);
   if(!s->bcDecoded)continue;
   upload_surface(s);auto uploads=g_stat_uploads;upload_surface(s);
@@ -117,7 +116,7 @@ void bc_surface_check() {
   auto zero=expected(0),changed=expected(255);
   for(unsigned level=0;level<2;++level)for(unsigned layer=0;layer<2;++layer)
    rgba_is(read_image(*s,VK_IMAGE_ASPECT_COLOR_BIT,4,level,layer),zero.data(),"BC mip/layer upload differs");
-  memset(mem::ptr(d.mipAddr),255,65536);invalidate(2,d.mipAddr+16,4);upload_surface(s);
+  memset(mem::host(d.mipAddr),255,65536);invalidate(2,d.mipAddr+16,4);upload_surface(s);
   require(g_stat_uploads==uploads+1,"BC partial invalidation did not re-upload");
   for(unsigned layer=0;layer<2;++layer){
    rgba_is(read_image(*s,VK_IMAGE_ASPECT_COLOR_BIT,4,0,layer),zero.data(),"BC mip invalidation modified base");
@@ -155,16 +154,16 @@ std::vector<uint8_t> read_buffer(VkBuffer source,VkDeviceSize offset,uint32_t si
 void buffer_cache_check() {
  if(!buffer_cache_enabled()){fprintf(stderr,"[renderer smoke] buffer cache off (WWHD_VK_BUFFER_CACHE=1 tests it)\n");return;}
  const uint32_t size=8192,addr=mem::host_alloc(65536,4096);
- for(uint32_t i=0;i<65536;++i)mem::ptr(addr)[i]=uint8_t(i*7+3);
+ for(uint32_t i=0;i<65536;++i)mem::host(addr)[i]=uint8_t(i*7+3);
  auto gpu_equals_guest=[&](const UploadSlice& s,uint32_t at,uint32_t n,const char* message) {
-  auto bytes=read_buffer(s.buffer,s.offset,n);require(!memcmp(bytes.data(),mem::ptr(at),n),message);
+  auto bytes=read_buffer(s.buffer,s.offset,n);require(!memcmp(bytes.data(),mem::host(at),n),message);
  };
  UploadSlice a,b;
  require(cached_guest_range(addr,size,rprof::kUpVertex,a),"buffer cache refused a static range");
  gpu_equals_guest(a,addr,size,"buffer cache upload differs on the GPU");
  require(cached_guest_range(addr,size,rprof::kUpVertex,b)&&b.buffer==a.buffer&&b.offset==a.offset,"unchanged range was not a hit");
  require(cached_guest_range(addr,size/2,rprof::kUpUbo,b)&&b.offset==a.offset,"sub-range with the same start was not a hit");
- mem::ptr(addr)[size-3]^=0xA5;  // unannounced CPU write: page fault, newer stamp
+ mem::host(addr)[size-3]^=0xA5;  // unannounced CPU write: page fault, newer stamp
  require(cached_guest_range(addr,size,rprof::kUpVertex,b)&&b.offset!=a.offset,"written range was not uploaded again");
  gpu_equals_guest(b,addr,size,"re-uploaded range differs on the GPU");
  gpu_equals_guest(b,addr,size,"re-uploaded range changed after a submission");
@@ -174,7 +173,7 @@ void buffer_cache_check() {
  require(cached_guest_range(addr,size,rprof::kUpVertex,b)&&b.offset!=a.offset,"save-state reset did not refresh the range");
  gpu_equals_guest(b,addr,size,"range after reset differs on the GPU");
  UploadSlice ix;bufcache::Entry* entry=nullptr;
- require(cached_native_indices(addr+size,4096,ix,entry)&&entry&&entry->shadow.size()==4096&&!memcmp(entry->shadow.data(),mem::ptr(addr+size),4096),"index shadow differs");
+ require(cached_native_indices(addr+size,4096,ix,entry)&&entry&&entry->shadow.size()==4096&&!memcmp(entry->shadow.data(),mem::host(addr+size),4096),"index shadow differs");
  gpu_equals_guest(ix,addr+size,4096,"cached index data differs on the GPU");
  command_buffer();flush();require(R.garbageCacheRegions.empty(),"replaced buffer cache regions were not retired");
  fprintf(stderr,"[renderer smoke] buffer cache hit, write fault, GX2Invalidate, reset and index readback passed\n");
@@ -393,7 +392,7 @@ void triangle(Surface& s) {
   ~Resources(){if(pipeline)vkDestroyPipeline(R.device,pipeline,nullptr);if(layout)vkDestroyPipelineLayout(R.device,layout,nullptr);if(vs)vkDestroyShaderModule(R.device,vs,nullptr);if(ps)vkDestroyShaderModule(R.device,ps,nullptr);}
  } objects;
  auto module=[&](const char* glsl,bool vertex,VkShaderModule& result) {
-  std::string error;auto words=vk::compile_glsl(glsl,vertex,&error);if(words.empty())exception_report::raise("smoke GLSL compilation: "+error);
+  std::string error;auto words=vk::compile_glsl(glsl,vertex,&error);if(words.empty())throw std::runtime_error("smoke GLSL compilation: "+error);
   VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=words.size()*4;ci.pCode=words.data();vk_check(vkCreateShaderModule(R.device,&ci,nullptr,&result),"smoke shader module");
  };
  module("#version 450\nvoid main(){vec2 p[3]=vec2[3](vec2(-0.8,-0.8),vec2(0.8,-0.8),vec2(0,0.8));gl_Position=vec4(p[gl_VertexIndex],0,1);}",true,objects.vs);
@@ -433,7 +432,7 @@ void vertex_window_check(Surface& s) {
   ~Resources(){if(pipeline)vkDestroyPipeline(R.device,pipeline,nullptr);if(layout)vkDestroyPipelineLayout(R.device,layout,nullptr);if(vs)vkDestroyShaderModule(R.device,vs,nullptr);if(ps)vkDestroyShaderModule(R.device,ps,nullptr);}
  } objects;
  auto module=[&](const char* glsl,bool vertex,VkShaderModule& result) {
-  std::string error;auto words=vk::compile_glsl(glsl,vertex,&error);if(words.empty())exception_report::raise("smoke GLSL compilation: "+error);
+  std::string error;auto words=vk::compile_glsl(glsl,vertex,&error);if(words.empty())throw std::runtime_error("smoke GLSL compilation: "+error);
   VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=words.size()*4;ci.pCode=words.data();vk_check(vkCreateShaderModule(R.device,&ci,nullptr,&result),"smoke shader module");
  };
  module("#version 450\nlayout(location=0) in vec3 position;layout(location=1) in vec4 tint;layout(location=0) out vec4 vertexColor;void main(){gl_Position=vec4(position.xy,0,1);vertexColor=gl_VertexIndex==int(position.z)?tint:vec4(0,0,1,1);}",true,objects.vs);
@@ -528,7 +527,7 @@ void dynamic_uniform_check(Surface& s) {
   ~Resources(){for(auto set:sets)if(set)vkDestroyDescriptorSetLayout(R.device,set,nullptr);if(pipeline)vkDestroyPipeline(R.device,pipeline,nullptr);if(layout)vkDestroyPipelineLayout(R.device,layout,nullptr);if(vs)vkDestroyShaderModule(R.device,vs,nullptr);if(ps)vkDestroyShaderModule(R.device,ps,nullptr);}
  } objects;
  auto module=[&](const char* glsl,bool vertex,VkShaderModule& result) {
-  std::string error;auto words=vk::compile_glsl(glsl,vertex,&error);if(words.empty())exception_report::raise("smoke GLSL compilation: "+error);
+  std::string error;auto words=vk::compile_glsl(glsl,vertex,&error);if(words.empty())throw std::runtime_error("smoke GLSL compilation: "+error);
   VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=words.size()*4;ci.pCode=words.data();vk_check(vkCreateShaderModule(R.device,&ci,nullptr,&result),"smoke shader module");
  };
  module("#version 450\nlayout(set=0,binding=7,std140) uniform Transform{vec4 transform;} ;layout(set=0,binding=1,std140) uniform Tint{vec4 tint;};layout(location=0) out vec4 vcolor;void main(){vec2 p[3]=vec2[3](vec2(-1,-1),vec2(3,-1),vec2(-1,3));gl_Position=vec4(p[gl_VertexIndex]*transform.xy+transform.zw,0,1);vcolor=tint;}",true,objects.vs);
@@ -811,7 +810,7 @@ int renderer_smoke_test() {
    Image upload(16,16,0x1a,false,2,2);
    upload.s.addr=mem::host_alloc(65536,256);upload.s.mipAddr=mem::host_alloc(65536,256);
    const uint8_t rgba[4]={17,34,51,255};
-   for(uint32_t i=0;i<65536;++i){mem::ptr(upload.s.addr)[i]=rgba[i%4];mem::ptr(upload.s.mipAddr)[i]=rgba[i%4];}
+   for(uint32_t i=0;i<65536;++i){mem::host(upload.s.addr)[i]=rgba[i%4];mem::host(upload.s.mipAddr)[i]=rgba[i%4];}
    upload_surface(&upload.s);
    uint32_t textureWords[7]={5,0,0,0,(2u<<16)|(1u<<19)|(0u<<22)|(5u<<25),0,0};
    auto swizzled=sampled_texture_view(&upload.s,textureWords);require(swizzled!=VK_NULL_HANDLE&&swizzled==sampled_texture_view(&upload.s,textureWords),"sampled array/swizzle view cache differs");
@@ -832,7 +831,7 @@ int renderer_smoke_test() {
    upload_surface(cached);
    require(g_stat_full_checks==checks&&g_stat_uploads==uploads,"unchanged next-frame texture performed a full check");
    const uint8_t changedMip[4]={85,102,119,255};
-   for(uint32_t i=0;i<65536;++i)mem::ptr(cached->mipAddr)[i]=changedMip[i%4];
+   for(uint32_t i=0;i<65536;++i)mem::host(cached->mipAddr)[i]=changedMip[i%4];
    // The invalidated range starts inside the mip, rather than crossing its base.
    invalidate(2,cached->mipAddr+16,4);
    require(cached->dirty&&cached->lastCheckedFrame!=R.frame,"interior mip invalidation did not reset the upload gate");
@@ -883,7 +882,7 @@ int renderer_smoke_test() {
     // (step 1 KiB here): page write tracking must still upload it on the next frame.
     SurfaceDesc bigDesc;bigDesc.addr=mem::host_alloc(256*256*4,256);
     bigDesc.width=256;bigDesc.height=256;bigDesc.pitch=256;bigDesc.slices=1;bigDesc.mips=1;bigDesc.format=0x1a;bigDesc.dim=1;
-    for(uint32_t i=0;i<256*256*4;++i)mem::ptr(bigDesc.addr)[i]=rgba[i%4];
+    for(uint32_t i=0;i<256*256*4;++i)mem::host(bigDesc.addr)[i]=rgba[i%4];
     auto* big=find_or_create_surface(bigDesc,false);
     upload_surface(big);
     ++R.frame;
@@ -891,7 +890,7 @@ int renderer_smoke_test() {
     upload_surface(big);
     uint64_t bigUploads=g_stat_uploads;
     const uint8_t texel[4]={200,10,20,255};
-    memcpy(mem::ptr(bigDesc.addr)+(256+5)*4,texel,4);  // texel (5,1): bytes 1044..1047, not sampled
+    memcpy(mem::host(bigDesc.addr)+(256+5)*4,texel,4);  // texel (5,1): bytes 1044..1047, not sampled
     ++R.frame;
     if(((R.frame+(big->addr>>12))&63)==0)++R.frame;
     upload_surface(big);
@@ -906,7 +905,7 @@ int renderer_smoke_test() {
    clear_image(color.s,green);destroy_surface_image(&color.s);create_surface_image(&color.s,true);const float blue[4]={0,0,1,1};const uint8_t blueBytes[4]={0,0,255,255};clear_image(color.s,blue);rgba_is(read_image(color.s,VK_IMAGE_ASPECT_COLOR_BIT,4),blueBytes,"deferred image replacement differs");
    fprintf(stderr,"[renderer smoke] clear, scaled blit and deferred image replacement passed\n");
    Image depth(16,16,0x11,true);depth.s.addr=mem::host_alloc(65536,256);
-   const uint32_t packedDepth=0x5a800000;for(uint32_t i=0;i<65536;i+=4)memcpy(mem::ptr(depth.s.addr)+i,&packedDepth,4);
+   const uint32_t packedDepth=0x5a800000;for(uint32_t i=0;i<65536;i+=4)memcpy(mem::host(depth.s.addr)+i,&packedDepth,4);
    upload_surface(&depth.s);
    textureWords[0]=1;require(sampled_texture_view(&depth.s,textureWords)!=VK_NULL_HANDLE,"sampled depth-only view creation failed");
    auto depths=read_image(depth.s,VK_IMAGE_ASPECT_DEPTH_BIT,4);auto stencils=read_image(depth.s,VK_IMAGE_ASPECT_STENCIL_BIT,1);
@@ -929,7 +928,7 @@ int renderer_smoke_test() {
      transition_image(surface,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
      VkClearDepthStencilValue value{z,0};vkCmdClearDepthStencilImage(command_buffer(),surface->image,surface->layout,&value,1,&range);
      peek_z(cells,6);flush();uint32_t expected=z==1.0f?0xFFFFFFu:0x3FFFFFu;
-     require(ld32(result)==expected&&ld32(result+4)==expected,"GPU depth peek differs");
+     require(mem::r32(result)==expected&&mem::r32(result+4)==expected,"GPU depth peek differs");
     }
     // A drain retires the newest fence first; an older answer must not replace it.
     for(float z:{0.25f,1.0f}) {
@@ -937,7 +936,7 @@ int renderer_smoke_test() {
      VkClearDepthStencilValue value{z,0};vkCmdClearDepthStencilImage(command_buffer(),surface->image,surface->layout,&value,1,&range);
      peek_z(cells,6);flush_async();
     }
-    flush();require(ld32(result)==0xFFFFFFu&&ld32(result+4)==0xFFFFFFu,"older GPU depth answer replaced newer answer");
+    flush();require(mem::r32(result)==0xFFFFFFu&&mem::r32(result+4)==0xFFFFFFu,"older GPU depth answer replaced newer answer");
     R.mainDepthAddr=previousDepth;destroy_surface_image(surface);R.surfaces.erase(entry);
     fprintf(stderr,"[renderer smoke] asynchronous GPU depth peeks passed\n");
    }

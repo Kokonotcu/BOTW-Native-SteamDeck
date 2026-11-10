@@ -1,5 +1,4 @@
 // Shader presentation matches Metal's source-grid FXAA and scaling filters.
-#include "../../exception_report.h"
 #include "present.h"
 #include "../headless_compose.h"
 #include "imgui.h"
@@ -188,13 +187,13 @@ bool srgb_format(VkFormat format) {
 }
 VkShaderModule module(PresentResources& resources,const char* source,bool vertex) {
  std::string error;auto words=vk::compile_glsl(source,vertex,&error);
- if(words.empty()||!error.empty())exception_report::raise("Vulkan presentation shader: "+error);
+ if(words.empty()||!error.empty())throw std::runtime_error("Vulkan presentation shader: "+error);
  VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=words.size()*4;ci.pCode=words.data();
  VkShaderModule result;vk_check(resources.api.vkCreateShaderModule(resources.device,&ci,nullptr,&result),"presentation shader");return result;
 }
 void ensure_resources(PresentResources& resources,VkDevice device,bool khr) {
  if(resources.device && resources.device!=device)
-  exception_report::raise("Vulkan presentation resources must be reset before device replacement");
+  throw std::runtime_error("Vulkan presentation resources must be reset before device replacement");
  if(!resources.device) { resources.api.init(device,khr);resources.device=device; }
  if(!resources.descriptors) {
   VkDescriptorSetLayoutBinding binding{0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
@@ -444,8 +443,8 @@ bool draw_present_screen(Screen& screen,uint32_t imageIndex) {
    set_graphics_feature_available(GraphicsFeature::FXAA,false);
    set_graphics_feature_available(GraphicsFeature::ScaleFilter,false);
   }
-  if(fxaa_enabled())exception_report::raise("FXAA requires color-attachment presentation support");
-  if(scale_filter()!=0)exception_report::raise("Sharp/integer filtering requires shader presentation support");
+  if(fxaa_enabled())throw std::runtime_error("FXAA requires color-attachment presentation support");
+  if(scale_filter()!=0)throw std::runtime_error("Sharp/integer filtering requires shader presentation support");
   return false;
  }
  auto& source=*presentation_source_screen(screen).scan;
@@ -454,14 +453,14 @@ bool draw_present_screen(Screen& screen,uint32_t imageIndex) {
    set_graphics_feature_available(GraphicsFeature::FXAA,false);
    set_graphics_feature_available(GraphicsFeature::ScaleFilter,false);
   }
-  exception_report::raise("Scan-buffer format cannot be sampled for shader presentation");
+  throw std::runtime_error("Scan-buffer format cannot be sampled for shader presentation");
  }
  const bool linear=linear_filtering(source.fmt.pixel);
  if(&screen==&R.tv) {
   set_graphics_feature_available(GraphicsFeature::FXAA,linear);
   set_graphics_feature_available(GraphicsFeature::ScaleFilter,linear);
  }
- if(fxaa_enabled()&&!linear)exception_report::raise("FXAA requires linear scan-buffer filtering");
+ if(fxaa_enabled()&&!linear)throw std::runtime_error("FXAA requires linear scan-buffer filtering");
  int filter=0;auto quads=screen_quads(screen,screen.swapExtent,filter);
  compose(screen.images.at(imageIndex),found->second.views.at(imageIndex),screen.layouts.at(imageIndex),screen.swapExtent,screen.swapFormat,
          quads,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,filter,fxaa_enabled(),&screen==&R.tv?overlayDraw:overlay::guesthud::gamepad_frame(screen.swapExtent.width,screen.swapExtent.height),&screen.imageUses.at(imageIndex));
@@ -473,7 +472,7 @@ void compose_headless_diagnostic(Screen& screen) {
  const auto& diagnostic=gfx::headless_compose::policy();
  if(!diagnostic.enabled()||!screen.scan||!screen.scan->image)return;
  if(!currentPlan||currentPlan->dw!=gfx::headless_compose::width||currentPlan->dh!=gfx::headless_compose::height)
-  exception_report::raise("headless composition diagnostic requires WWHD_SIM_SCREEN=1280x720");
+  throw std::runtime_error("headless composition diagnostic requires WWHD_SIM_SCREEN=1280x720");
  ensure_resources();
  auto& target=resources.diagnosticTarget;auto& counter=resources.diagnosticCounter;
  counter.require_capacity(diagnostic);
@@ -767,7 +766,7 @@ void record_present_capture(Screen& screen,uint32_t imageIndex) {
  try {
   const size_t width=screen.swapExtent.width,height=screen.swapExtent.height;
   if(!width||!height||width>std::numeric_limits<size_t>::max()/height/4)
-   exception_report::raise("invalid swap-image capture dimensions");
+   throw std::runtime_error("invalid swap-image capture dimensions");
   capture.buffer=create_readback_buffer(width*height*4);
   capture.extent=screen.swapExtent;capture.format=screen.swapFormat;
   auto cmd=command_buffer();VkImageMemoryBarrier image{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};

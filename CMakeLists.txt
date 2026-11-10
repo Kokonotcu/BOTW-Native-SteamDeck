@@ -220,14 +220,14 @@ endif()
 if(NOT BOTW_ENABLE_VULKAN)
   list(FILTER CEMU_SOURCES EXCLUDE REGEX "/Renderer/Vulkan/")
 endif()
+# Native GPU (runtime/src/gx2 + runtime/src/gfx) replaces Cemu's Latte emulation: of Latte only the shader decompiler,
+# the address library, the register definitions and the GS copy shader parser are compiled.
+list(FILTER CEMU_SOURCES EXCLUDE REGEX "/Cafe/HW/Latte/(Core|Renderer|ShaderInfo|Transcompiler|Common)/|/cemu_shims/|/imgui/imgui_impl_")
 list(APPEND CEMU_SOURCES
   ${CMAKE_SOURCE_DIR}/runtime/cemu/dependencies/imgui/imgui.cpp
   ${CMAKE_SOURCE_DIR}/runtime/cemu/dependencies/imgui/imgui_draw.cpp
   ${CMAKE_SOURCE_DIR}/runtime/cemu/dependencies/imgui/imgui_tables.cpp
   ${CMAKE_SOURCE_DIR}/runtime/cemu/dependencies/imgui/imgui_widgets.cpp)
-if(BOTW_ENABLE_VULKAN)
-  list(APPEND CEMU_SOURCES ${CMAKE_SOURCE_DIR}/runtime/cemu/imgui/imgui_impl_vulkan.cpp)
-endif()
 
 add_library(cemu_gpu OBJECT ${CEMU_SOURCES})
 target_include_directories(cemu_gpu PRIVATE runtime/cemu_shims runtime/cemu runtime/cemu/Cafe
@@ -288,7 +288,11 @@ if(BOTW_PREBUILT_GUEST_DIR)
 else()
   add_executable(BotWRecomp ${RUNTIME_SOURCES} $<TARGET_OBJECTS:guest> $<TARGET_OBJECTS:cemu_gpu>)
 endif()
-target_include_directories(BotWRecomp PRIVATE runtime/include runtime/src generated)
+target_include_directories(BotWRecomp PRIVATE runtime/include runtime/src generated
+  runtime/cemu_shims runtime/cemu runtime/cemu/Cafe runtime/cemu/dependencies/imgui)  # native GPU: Latte decompiler/ISA/addrlib headers
+# The native GPU sources use Cemu's Latte headers, which expect Cemu's common definitions first (as cemu_gpu has them).
+file(GLOB_RECURSE NATIVE_GPU_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/runtime/src/gx2/*.cpp ${CMAKE_SOURCE_DIR}/runtime/src/gfx/*.cpp)
+set_source_files_properties(${NATIVE_GPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-include;Common/precompiled.h")
 if(APPLE)
   target_compile_options(BotWRecomp PRIVATE -Wall -Wno-unused-function -Wno-unused-variable -fwrapv -mcpu=apple-m1
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
@@ -460,8 +464,6 @@ endif()
 
 message(STATUS "BotWRecomp backends: Metal=${BOTW_ENABLE_METAL} Vulkan=${BOTW_ENABLE_VULKAN}")
 
-# Native Metal GPU path (docs/native-renderer.md): option BOTW_NATIVE_GPU, default OFF (gpu_native.cmake).
-include(${CMAKE_SOURCE_DIR}/runtime/src/gpu_native/gpu_native.cmake OPTIONAL)
 
 # Unit test for the mod file index (docs/mods.md). Off by default.
 option(BOTW_BUILD_TESTS "Build the BotWModTests unit test" OFF)
