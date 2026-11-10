@@ -50,7 +50,7 @@
 #include "savestate.h"
 #include "gfx/capture_schedule.h"
 #include "sparse_hash_memo.h"
-#include "write_watch.h"
+#include "gfx/write_watch.h"
 #include <algorithm>
 #include <functional>
 #include <array>

@@ -2,7 +2,6 @@
 
 #include <Foundation/Foundation.hpp>
 #include <Metal/Metal.hpp>
-#include <TargetConditionals.h>
 
 #include "Cafe/HW/Latte/Core/LatteConst.h"
 
@@ -12,9 +11,6 @@ struct MetalPixelFormatSupport
 	bool m_supportsRG8Unorm_sRGB;
 	bool m_supportsPacked16BitFormats;
 	bool m_supportsDepth24Unorm_Stencil8;
-#if TARGET_OS_IOS  // iOS port (ios/): BC1-5 may be missing (simulator, pre-A14 GPUs)
-	bool m_supportsBCTextureCompression;
-#endif
 
 	MetalPixelFormatSupport() = default;
 	MetalPixelFormatSupport(MTL::Device* device)
@@ -22,15 +18,7 @@ struct MetalPixelFormatSupport
         m_supportsR8Unorm_sRGB = device->supportsFamily(MTL::GPUFamilyApple1);
         m_supportsRG8Unorm_sRGB = device->supportsFamily(MTL::GPUFamilyApple1);
         m_supportsPacked16BitFormats = device->supportsFamily(MTL::GPUFamilyApple1);
-#if TARGET_OS_IOS  // iOS port (ios/): macOS-only property, and no Apple GPU has D24S8
-        m_supportsDepth24Unorm_Stencil8 = false;
-        m_supportsBCTextureCompression = device->supportsBCTextureCompression();
-#if TARGET_OS_SIMULATOR  // the simulator rejects the Apple-GPU packed 16-bit formats (B5G6R5 etc.)
-        m_supportsPacked16BitFormats = false;
-#endif
-#else
         m_supportsDepth24Unorm_Stencil8 = device->depth24Stencil8PixelFormatSupported();
-#endif
 	}
 };
 
@@ -49,6 +37,8 @@ struct MetalQueryRange
 
 #define MAX_MTL_TEXTURES 31
 #define MAX_MTL_SAMPLERS 16
+// wwhd: samplers of texture bindings 16 and up (an array of sampler gpuResourceIDs)
+#define MTL_EXTRA_SAMPLER_BUFFER 29
 
 #define GET_HELPER_BUFFER_BINDING(index) (28 + index)
 #define GET_HELPER_TEXTURE_BINDING(index) (29 + index)
@@ -119,11 +109,7 @@ inline bool FormatIsRenderable(Latte::E_GX2SURFFMT format)
 template <typename... T>
 inline bool executeCommand(fmt::format_string<T...> fmt, T&&... args) {
     std::string command = fmt::format(fmt, std::forward<T>(args)...);
-#if TARGET_OS_IOS  // iOS port (ios/): no processes (only used by the xcrun AIR cache path)
-    int res = -1;
-#else
     int res = system(command.c_str());
-#endif
     if (res != 0)
     {
         cemuLog_log(LogType::Force, "command \"{}\" failed with exit code {}", command, res);

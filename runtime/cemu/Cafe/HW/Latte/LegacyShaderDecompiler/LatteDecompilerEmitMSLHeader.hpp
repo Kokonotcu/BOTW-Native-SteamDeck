@@ -132,6 +132,17 @@ namespace LatteDecompiler
 			uniformOffsets.offset_framebufferFetchSize[t] = uniformCurrentOffset;
 			uniformCurrentOffset += 8;
 		}
+		// WWHD: sampler LOD bias the shader adds (gfx/sampler_lod_bias.h); last, so the members above
+		// keep their offsets
+		for (sint32 t = 0; t < LATTE_NUM_MAX_TEX_UNITS; t++)
+		{
+			if (!decompilerContext->analyzer.texUnitUsesLodBias.test(t))
+				continue;
+			uniformCurrentOffset = (uniformCurrentOffset + 3) & ~3;
+			src->addFmt("float tex{}LodBias;" _CRLF, t);
+			uniformOffsets.offset_texLodBias[t] = uniformCurrentOffset;
+			uniformCurrentOffset += 4;
+		}
 
 		src->add("};" _CRLF _CRLF);
 
@@ -389,6 +400,24 @@ namespace LatteDecompiler
 	{
 	    auto src = decompilerContext->shaderSource;
 
+		// wwhd: Metal has 16 sampler slots per stage, GX2 18 texture units: the samplers of bindings 16
+		// and up come from an argument buffer (MTL_EXTRA_SAMPLER_BUFFER: sampler gpuResourceIDs)
+		{
+			bool extra = false;
+			for (sint32 i = 0; i < LATTE_NUM_MAX_TEX_UNITS; i++)
+			{
+				if (!decompilerContext->output->textureUnitMask[i])
+					continue;
+				uint32 binding = decompilerContext->output->resourceMappingMTL.textureUnitToBindingPoint[i];
+				if (binding < MAX_MTL_SAMPLERS)
+					continue;
+				if (!extra)
+					src->addFmt("struct SamplrExtra {{ sampler s[{}]; }};" _CRLF, LATTE_NUM_MAX_TEX_UNITS);
+				extra = true;
+				src->addFmt("#define samplr{} samplrExtra.s[{}]" _CRLF, i, binding - MAX_MTL_SAMPLERS);
+			}
+		}
+
         if (usesGeometryShader && (decompilerContext->shaderType == LatteConst::ShaderType::Vertex || decompilerContext->shaderType == LatteConst::ShaderType::Geometry))
         {
             LattePrimitiveMode vsOutPrimType = decompilerContext->contextRegistersNew->VGT_PRIMITIVE_TYPE.get_PRIMITIVE_MODE();
@@ -458,6 +487,7 @@ namespace LatteDecompiler
 	static void _emitTextureDefinitions(LatteDecompilerShaderContext* shaderContext)
 	{
 	    bool renderTargetIndexUsed[LATTE_NUM_COLOR_TARGET] = {false};
+	    bool extraSamplers = false;
 
 		auto src = shaderContext->shaderSource;
 		// texture sampler definition
@@ -514,7 +544,13 @@ namespace LatteDecompiler
     			//uint32 textureBinding = shaderContext->output->resourceMappingMTL.textureUnitToBindingPoint[i] % 31;
     			//uint32 samplerBinding = textureBinding % 16;
     			src->addFmt(" tex{} [[texture({})]]", i, binding);
-    			src->addFmt(", sampler samplr{} [[sampler({})]]", i, binding);
+    			if (binding < MAX_MTL_SAMPLERS)
+    				src->addFmt(", sampler samplr{} [[sampler({})]]", i, binding);
+    			else if (!extraSamplers)
+    			{
+    				src->addFmt(", constant SamplrExtra& samplrExtra [[buffer({})]]", MTL_EXTRA_SAMPLER_BUFFER);
+    				extraSamplers = true;
+    			}
 			}
 		}
 	}

@@ -2,11 +2,6 @@
 #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
 #include "Cafe/OS/libs/gx2/GX2_Surface.h"
 
-#include <cstring>
-#include <memory>
-#include <mutex>
-#include <vector>
-
 using namespace Latte;
 
 namespace LatteAddrLib
@@ -252,31 +247,6 @@ namespace LatteAddrLib
 		return finalMacroTileOffset | pipeOffset | bankOffset;
 	}
 
-	// 8x8x8 pixel index table per (bpp, tile mode, micro tile type), built on first use and kept (a few dozen exist).
-	// Any thread may set up a surface (texture decode helpers too), so the lookup is locked; entries never move.
-	static const uint16* GetMicroTilePixelIndexTable(uint32 bpp, E_HWTILEMODE tileMode, uint32 microTileType)
-	{
-		struct Table
-		{
-			uint32 bpp, tileMode, type;
-			uint16 v[8 * 8 * 8];
-		};
-		static std::mutex s_mutex;
-		static std::vector<std::unique_ptr<Table>> s_tables;
-		std::lock_guard<std::mutex> lock(s_mutex);
-		for (const auto& t : s_tables)
-			if (t->bpp == bpp && t->tileMode == (uint32)tileMode && t->type == microTileType)
-				return t->v;
-		auto t = std::make_unique<Table>();
-		t->bpp = bpp, t->tileMode = (uint32)tileMode, t->type = microTileType;
-		for (sint32 z = 0; z < 8; z++)
-			for (sint32 y = 0; y < 8; y++)
-				for (sint32 x = 0; x < 8; x++)
-					t->v[x + y * 8 + z * 8 * 8] = (uint16)_ComputePixelIndexWithinMicroTile(x, y, z, bpp, tileMode, microTileType);
-		s_tables.push_back(std::move(t));
-		return s_tables.back()->v;
-	}
-
 	void SetupCachedSurfaceAddrInfo(CachedSurfaceAddrInfo* info, uint32 slice, uint32 sample, uint32 bpp, uint32 pitch, uint32 height, uint32 depth, uint32 numSamples, E_HWTILEMODE tileMode, int isDepth, uint32 pipeSwizzle, uint32 bankSwizzle)
 	{
 		info->slice = slice;
@@ -337,10 +307,18 @@ namespace LatteAddrLib
 			info->pixelOffsetMul = info->bpp;
 		}
 		info->bytesPerPixel = info->pixelOffsetMul >> 3;
-		// table for micro tile offset calculation: a pure function of (bpp, tile mode, micro tile type), so each table
-		// is built once and shared. BotW-Native: rebuilding all 512 entries per mip/slice was 20% of the GPU thread's
-		// samples in the area-load frames (b97 Deck session 031115: 34-75 ms GPU-thread frames while textures load).
-		info->microTilePixelIndexTable = GetMicroTilePixelIndexTable(info->bpp, info->tileMode, info->microTileType);
+		// table for micro tile offset calculation (we could pre-generate these)
+		for (sint32 z = 0; z < 8; z++)
+		{
+			for (sint32 y = 0; y < 8; y++)
+			{
+				for (sint32 x = 0; x < 8; x++)
+				{
+					uint16 v = _ComputePixelIndexWithinMicroTile(x, y, z, info->bpp, info->tileMode, info->microTileType);
+					info->microTilePixelIndexTable[x + y * 8 + z * 8 * 8] = v;
+				}
+			}
+		}
 		// other constant values
 		uint32 swizzle = info->pipeSwizzle + m_pipes * info->bankSwizzle;
 		info->c0 = (swizzle + info->sliceIn * info->rotation);

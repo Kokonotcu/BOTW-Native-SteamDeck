@@ -27,7 +27,7 @@
 #include <algorithm>
 #include <cstdint>
 
-#include "write_watch.h"
+#include "gfx/write_watch.h"
 
 namespace texchurn {
 

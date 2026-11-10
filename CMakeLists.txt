@@ -193,82 +193,18 @@ if(HUGE_SOURCES)
 endif()
 endif()
 
-# Vendored Cemu Latte GPU layer (runtime/cemu, MPL-2.0) + shims.
-file(GLOB_RECURSE CEMU_SOURCES CONFIGURE_DEPENDS
-  ${CMAKE_SOURCE_DIR}/runtime/cemu/Cafe/*.cpp ${CMAKE_SOURCE_DIR}/runtime/cemu/Cafe/*.mm
-  ${CMAKE_SOURCE_DIR}/runtime/cemu/Common/*.cpp ${CMAKE_SOURCE_DIR}/runtime/cemu/util/*.cpp
-  ${CMAKE_SOURCE_DIR}/runtime/cemu/Cemu/FileCache/*.cpp
-  ${CMAKE_SOURCE_DIR}/runtime/cemu/imgui/*.mm
-  ${CMAKE_SOURCE_DIR}/runtime/cemu_shims/*.cpp ${CMAKE_SOURCE_DIR}/runtime/cemu_shims/*.mm)
-list(FILTER CEMU_SOURCES EXCLUDE REGEX "LatteOverlay\\.cpp$|/dependencies/")
-if(NOT WIN32)
-  list(FILTER CEMU_SOURCES EXCLUDE REGEX "SystemInfoWin\\.cpp$|/Common/windows/")
-endif()
-if(WIN32)
-  # FileStream_unix, unix/platform.cpp (GetTickCount) and SystemInfoUnix (sys/times.h) are POSIX-only.
-  list(FILTER CEMU_SOURCES EXCLUDE REGEX "/Common/unix/|SystemInfoUnix\\.cpp$")
-endif()
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  list(FILTER CEMU_SOURCES EXCLUDE REGEX "SystemInfoLinux\\.cpp$")
-endif()
-if(NOT APPLE)
-  list(FILTER CEMU_SOURCES EXCLUDE REGEX "SystemInfoMac\\.cpp$|\\.mm$")
-endif()
-if(NOT BOTW_ENABLE_METAL)
-  list(FILTER CEMU_SOURCES EXCLUDE REGEX "/Renderer/Metal/|MetalView\\.mm$|LatteDecompilerEmitMSL\\.cpp$|imgui_impl_metal")
-endif()
-if(NOT BOTW_ENABLE_VULKAN)
-  list(FILTER CEMU_SOURCES EXCLUDE REGEX "/Renderer/Vulkan/")
-endif()
-# Native GPU (runtime/src/gx2 + runtime/src/gfx) replaces Cemu's Latte emulation: of Latte only the shader decompiler,
-# the address library, the register definitions and the GS copy shader parser are compiled.
-list(FILTER CEMU_SOURCES EXCLUDE REGEX "/Cafe/HW/Latte/(Core|Renderer|ShaderInfo|Transcompiler|Common)/|/cemu_shims/|/imgui/imgui_impl_")
+# Cemu's GPU pieces the native GPU (runtime/src/gx2 + runtime/src/gfx) uses, MPL-2.0: the shader decompiler, the
+# address library and the register definitions (runtime/cemu, trimmed: no Latte emulation), with their minimal common
+# definitions (cemu_shim.h); Dear ImGui for the renderer's overlay.
+file(GLOB_RECURSE CEMU_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/runtime/cemu/*.cpp)
+list(FILTER CEMU_SOURCES EXCLUDE REGEX "LatteDecompilerEmitMSL[^/]*\\.cpp$")  # Metal's emitter
 list(APPEND CEMU_SOURCES
-  ${CMAKE_SOURCE_DIR}/runtime/cemu/dependencies/imgui/imgui.cpp
-  ${CMAKE_SOURCE_DIR}/runtime/cemu/dependencies/imgui/imgui_draw.cpp
-  ${CMAKE_SOURCE_DIR}/runtime/cemu/dependencies/imgui/imgui_tables.cpp
-  ${CMAKE_SOURCE_DIR}/runtime/cemu/dependencies/imgui/imgui_widgets.cpp)
-
+  ${CMAKE_SOURCE_DIR}/runtime/third_party/imgui/imgui.cpp ${CMAKE_SOURCE_DIR}/runtime/third_party/imgui/imgui_draw.cpp
+  ${CMAKE_SOURCE_DIR}/runtime/third_party/imgui/imgui_tables.cpp ${CMAKE_SOURCE_DIR}/runtime/third_party/imgui/imgui_widgets.cpp)
 add_library(cemu_gpu OBJECT ${CEMU_SOURCES})
-target_include_directories(cemu_gpu PRIVATE runtime/cemu_shims runtime/cemu runtime/cemu/Cafe
-  runtime/cemu/dependencies/imgui runtime/include)
-if(BOTW_ENABLE_METAL)
-  target_include_directories(cemu_gpu PRIVATE runtime/cemu/dependencies/metal-cpp)
-endif()
-if(APPLE)
-  target_include_directories(cemu_gpu PRIVATE /opt/homebrew/include)
-endif()
-if(WAYLAND_FOUND)
-  target_include_directories(cemu_gpu PRIVATE ${WAYLAND_INCLUDE_DIRS})
-endif()
-
-target_compile_definitions(cemu_gpu PRIVATE BOOST_NOWIDE_NO_LIB BOTWRECOMP
-  EMULATOR_VERSION_MAJOR=2 EMULATOR_VERSION_MINOR=6 EMULATOR_VERSION_PATCH=0 EMULATOR_HASH=a53cf0e)
-if(BOTW_ENABLE_METAL)
-  target_compile_definitions(cemu_gpu PRIVATE ENABLE_METAL IMGUI_IMPL_METAL_CPP)
-endif()
-if(BOTW_ENABLE_VULKAN)
-  target_compile_definitions(cemu_gpu PUBLIC ENABLE_VULKAN VK_NO_PROTOTYPES)
-  if(WIN32)
-    target_compile_definitions(cemu_gpu PUBLIC VK_USE_PLATFORM_WIN32_KHR)
-  elseif(APPLE)
-    target_compile_definitions(cemu_gpu PUBLIC VK_USE_PLATFORM_METAL_EXT VK_USE_PLATFORM_MACOS_MVK)
-  else()
-    target_compile_definitions(cemu_gpu PUBLIC VK_USE_PLATFORM_XLIB_KHR VK_USE_PLATFORM_XCB_KHR)
-    if(WAYLAND_FOUND)
-      target_compile_definitions(cemu_gpu PUBLIC HAS_WAYLAND VK_USE_PLATFORM_WAYLAND_KHR)
-    endif()
-  endif()
-endif()
-target_compile_options(cemu_gpu PRIVATE -w -O3 -g1 "SHELL:-include Common/precompiled.h")
-# ThinLTO across the Cemu GPU layer only (not the recompiled game code): its GPU thread limits the frame rate on the
-# Deck, and its per-draw helpers live in many small files. BOTW_CEMU_LTO=OFF builds it without.
-option(BOTW_CEMU_LTO "ThinLTO for the Cemu GPU layer" ON)
-set(_botw_cemu_lto OFF)
-if(BOTW_CEMU_LTO AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  set(_botw_cemu_lto ON)
-  target_compile_options(cemu_gpu PRIVATE -flto=thin)
-endif()
+target_include_directories(cemu_gpu PRIVATE runtime/cemu runtime/cemu/Cafe runtime/third_party/imgui)
+target_compile_definitions(cemu_gpu PUBLIC ENABLE_VULKAN=1 IMGUI_DISABLE_DEMO_WINDOWS IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
+target_compile_options(cemu_gpu PRIVATE -w -O2 "SHELL:-include ${CMAKE_SOURCE_DIR}/runtime/cemu/cemu_shim.h")
 
 file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/runtime/src/*.cpp
@@ -289,19 +225,17 @@ else()
   add_executable(BotWRecomp ${RUNTIME_SOURCES} $<TARGET_OBJECTS:guest> $<TARGET_OBJECTS:cemu_gpu>)
 endif()
 target_include_directories(BotWRecomp PRIVATE runtime/include runtime/src generated
-  runtime/cemu_shims runtime/cemu runtime/cemu/Cafe runtime/cemu/dependencies/imgui)  # native GPU: Latte decompiler/ISA/addrlib headers
+  runtime/cemu runtime/cemu/Cafe runtime/third_party runtime/third_party/imgui)
 # The native GPU sources use Cemu's Latte headers, which expect Cemu's common definitions first (as cemu_gpu has them).
 file(GLOB_RECURSE NATIVE_GPU_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/runtime/src/gx2/*.cpp ${CMAKE_SOURCE_DIR}/runtime/src/gfx/*.cpp)
-set_source_files_properties(${NATIVE_GPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-include;Common/precompiled.h"
-  COMPILE_DEFINITIONS "WWHD_HAS_VULKAN=1;WWHD_SDL_HOST=1")
+set_source_files_properties(${NATIVE_GPU_SOURCES} PROPERTIES
+  COMPILE_OPTIONS "-include;${CMAKE_SOURCE_DIR}/runtime/cemu/cemu_shim.h"
+  COMPILE_DEFINITIONS "WWHD_HAS_VULKAN=1;WWHD_SDL_HOST=1;VK_NO_PROTOTYPES")  # the renderer loads Vulkan itself (loader.h)
 if(APPLE)
   target_compile_options(BotWRecomp PRIVATE -Wall -Wno-unused-function -Wno-unused-variable -fwrapv -mcpu=apple-m1
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 else()
   target_compile_options(BotWRecomp PRIVATE -O3 -g1 -Wall -Wno-unused-function -Wno-unused-variable -fwrapv)
-endif()
-if(_botw_cemu_lto)
-  target_link_options(BotWRecomp PRIVATE -flto=thin -O3 "-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache")
 endif()
 if(BOTW_ENABLE_VULKAN)
   target_compile_definitions(BotWRecomp PRIVATE ENABLE_VULKAN)

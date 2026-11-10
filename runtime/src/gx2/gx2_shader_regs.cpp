@@ -1,6 +1,7 @@
 // Shader binding: copy the register values stored in GX2 shader structures
 // into the register file. Structure layouts and register sequences follow
 // Cemu's GX2 implementation (GX2_Shader.cpp / GX2_shader_legacy.cpp).
+#include "hle.h"
 #include "gx2_regs.h"
 #include "ppc.h"
 

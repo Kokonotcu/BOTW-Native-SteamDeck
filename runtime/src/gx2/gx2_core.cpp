@@ -420,14 +420,7 @@ void set_regs(uint32 first, const uint32* values, uint32 count) {
         }
         return;
     }
-    if (g_render_thread) {
-        enqueue_regs(first, values, count);
-        return;
-    }
-    std::vector<uint32> buf(n);  // WWHD_NO_RENDER_THREAD (debug)
-    buf[0] = first;
-    memcpy(&buf[1], values, count * 4);
-    emit(OP_SET_REGS, buf.data(), n);
+    enqueue_regs(first, values, count);
 }
 void set_reg(uint32 reg, uint32 value) { emit(OP_SET_REGS, {reg, value}); }
 
@@ -468,7 +461,7 @@ constexpr uint32 kColorBufferWords = 0x9C / 4, kDepthBufferWords = 0xAC / 4, kSu
 // one at a time, so a couple of fixed slots suffice)
 static uint32 unpack_struct(const uint32* words, uint32 count, int slot) {
     static uint32 scratch = 0;
-    if (!scratch) scratch = mem::host_alloc(2 * 0x100, 0x40);
+    if (!scratch) scratch = mem::sys_alloc(2 * 0x100, 0x40);
     uint32 addr = scratch + slot * 0x100;
     memcpy(mem::host(addr), words, count * 4);
     return addr;
@@ -882,11 +875,6 @@ HLE_EXPORT(gx2, GX2SetClearDepthStencil) {
     db->clearStencil = ARG(1) & 0xFF;
 }
 HLE_EXPORT(gx2, GX2CopySurface) {
-    // debug: WWHD_COPYDBG=1 logs each copy as issued (thread, caller, source and destination images)
-    static const bool dbg = getenv("WWHD_COPYDBG") != nullptr;
-    if (dbg)
-        LOG("[copydbg] issue t=%.3f thread %08X lr %08X src %08X img %08X dst %08X img %08X size %X", timebase::now() / (double)timebase::kTicksPerSec,
-            threads::current_thread(), c->lr, ARG(0), mem::r32(ARG(0) + 0x24), ARG(3), mem::r32(ARG(3) + 0x24), mem::r32(ARG(3) + 0x20));
     std::vector<uint32> p;
     put_struct(p, ARG(0), kSurfaceWords);
     p.insert(p.end(), {ARG(1), ARG(2)});
@@ -1010,6 +998,6 @@ HLE_EXPORT(gx2, GX2CalcFetchShaderSizeEx) {
     uint32 cf = ((((n + 15) / 16) + 1) * 8 + 0xF) & ~0xFu;
     RET(std::max<uint32>(cf + n * 16, 16 + n * 16));
 }
-HLE_EXPORT(gx2, GX2GPUTimeToCPUTime) { ret64(c, arg64(c, 3)); }
-HLE_EXPORT(gx2, GX2SampleTopGPUCycle) { if (ARG(0)) mem::w64(ARG(0), timebase::guest_now()); }
-HLE_EXPORT(gx2, GX2SampleBottomGPUCycle) { if (ARG(0)) mem::w64(ARG(0), timebase::guest_now()); }
+HLE_EXPORT(gx2, GX2GPUTimeToCPUTime) { RET64(ARG64(0)); }
+HLE_EXPORT(gx2, GX2SampleTopGPUCycle) { if (ARG(0)) mem::w64(ARG(0), rt_timebase()); }
+HLE_EXPORT(gx2, GX2SampleBottomGPUCycle) { if (ARG(0)) mem::w64(ARG(0), rt_timebase()); }

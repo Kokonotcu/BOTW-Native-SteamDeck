@@ -98,8 +98,8 @@ const char* _getElementStrByIndex(uint32 channel)
 	return "UNDEFINED";
 }
 
-char _tempGenString[64][256];
-uint32 _tempGenStringIndex = 0;
+thread_local char _tempGenString[64][256];
+thread_local uint32 _tempGenStringIndex = 0;
 
 char* _getTempString()
 {
@@ -1589,9 +1589,8 @@ void _emitALUOP2InstructionCode(LatteDecompilerShaderContext* shaderContext, Lat
 		}
 		else if( cfInstruction->type == GPU7_CF_INST_ALU_BREAK )
 		{
-			// defer the break until the ALU clause has finished
-			if (aluInstruction->updateExecuteMask)
-				src->add("aluBreak = aluBreak || (predResult == false);" _CRLF);
+			src->add("if (predResult) break;" _CRLF);
+			src->addFmt("{} = false;" _CRLF, _getActiveMaskCVarName(shaderContext, cfInstruction->activeStackDepth + 1));
 		}
 		else
 			cemu_assert_debug(false);
@@ -2277,6 +2276,16 @@ void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContext, Latt
 	bool hasOffset = false;
 	if( texInstruction->textureFetch.offsetX != 0 || texInstruction->textureFetch.offsetY != 0 || texInstruction->textureFetch.offsetZ != 0 )
 		hasOffset = true;
+	// WWHD: the sampler's LOD bias when the host can't apply it (gfx/sampler_lod_bias.h); empty: none.
+	// Unnormalized SAMPLE is a texelFetch. Outside the pixel stage texture() has no bias argument and
+	// a level of 0: SAMPLE becomes textureLod at the bias.
+	std::string samplerLodBias;
+	const bool texelCoordinateSample = texOpcode == GPU7_TEX_INST_SAMPLE && texInstruction->textureFetch.unnormalized[0] && texInstruction->textureFetch.unnormalized[1] && texInstruction->textureFetch.unnormalized[2] && texInstruction->textureFetch.unnormalized[3];
+	if (shaderContext->analyzer.texUnitUsesLodBias.test(texInstruction->textureFetch.textureIndex) && !texelCoordinateSample &&
+		(texOpcode == GPU7_TEX_INST_SAMPLE || texOpcode == GPU7_TEX_INST_SAMPLE_L || texOpcode == GPU7_TEX_INST_SAMPLE_LB ||
+		 texOpcode == GPU7_TEX_INST_SAMPLE_LZ || texOpcode == GPU7_TEX_INST_SAMPLE_G))
+		samplerLodBias = fmt::format("uf_tex{}LodBias", texInstruction->textureFetch.textureIndex);
+	const bool sampleAtBiasLevel = !samplerLodBias.empty() && texOpcode == GPU7_TEX_INST_SAMPLE && shaderContext->shaderType != LatteConst::ShaderType::Pixel;
 	// emit sample code
 	if (shaderContext->shader->textureIsIntegerFormat[texInstruction->textureFetch.textureIndex])
 	{
@@ -2369,9 +2378,9 @@ void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContext, Latt
 	else if (texOpcode == GPU7_TEX_INST_SAMPLE)
 	{
 		if (hasOffset)
-			src->add("textureOffset(");
+			src->add(sampleAtBiasLevel ? "textureLodOffset(" : "textureOffset(");
 		else
-			src->add("texture(");
+			src->add(sampleAtBiasLevel ? "textureLod(" : "texture(");
 	}
 	else if (texOpcode == GPU7_TEX_INST_SAMPLE_C_L)
 	{
@@ -2399,9 +2408,8 @@ void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContext, Latt
 	else if (texOpcode == GPU7_TEX_INST_SAMPLE_G)
 	{
 		if (hasOffset)
-			src->add("textureGradOffset(");
-		else
-			src->add("textureGrad(");
+			cemu_assert_unimplemented();
+		src->add("textureGrad(");
 	}
 	else
 	{
@@ -2564,26 +2572,38 @@ void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContext, Latt
 				src->addFmt("+ vec2(1.0)/vec2(textureSize({}{}, 0))/512.0", _getTextureUnitVariablePrefixName(shaderContext->shader->shaderType), texInstruction->textureFetch.textureIndex);
 		}
 		// lod or lod bias parameter
-		if( texOpcode == GPU7_TEX_INST_SAMPLE_L || texOpcode == GPU7_TEX_INST_SAMPLE_C_L)
+		if( texOpcode == GPU7_TEX_INST_SAMPLE_L || texOpcode == GPU7_TEX_INST_SAMPLE_LB || texOpcode == GPU7_TEX_INST_SAMPLE_C_L)
 		{
 			src->add(",");
+			if (!samplerLodBias.empty())
+				src->add("(");
 			_emitTEXSampleCoordInputComponent(shaderContext, texInstruction, 3, LATTE_DECOMPILER_DTYPE_FLOAT);
+			if (!samplerLodBias.empty())
+				src->addFmt("+{})", samplerLodBias);
 		}
 		else if( texOpcode == GPU7_TEX_INST_SAMPLE_LZ || texOpcode == GPU7_TEX_INST_SAMPLE_C_LZ )
 		{
-			src->add(",0.0");
+			if (!samplerLodBias.empty())
+				src->addFmt(",{}", samplerLodBias);
+			else
+				src->add(",0.0");
+		}
+		else if (sampleAtBiasLevel)
+		{
+			src->addFmt(",{}", samplerLodBias);
 		}
 	}
 	// gradient parameters
 	if (texOpcode == GPU7_TEX_INST_SAMPLE_G)
 	{
-		if (texDim == Latte::E_DIM::DIM_1D)
+		if (texDim == Latte::E_DIM::DIM_2D ||
+			texDim == Latte::E_DIM::DIM_1D )
 		{
-			src->add(",gradH.x,gradV.x");
-		}
-		else if (texDim == Latte::E_DIM::DIM_2D)
-		{
-			src->add(",gradH.xy,gradV.xy");
+			// WWHD: textureGrad takes no bias; scaling the gradients by 2^bias adds it to log2 of the footprint
+			if (!samplerLodBias.empty())
+				src->addFmt(",gradH.xy*exp2({0}),gradV.xy*exp2({0})", samplerLodBias);
+			else
+				src->add(",gradH.xy,gradV.xy");
 		}
 		else	
 		{
@@ -2591,7 +2611,7 @@ void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContext, Latt
 		}
 	}
 	// offset
-	if( texOpcode == GPU7_TEX_INST_SAMPLE_L || texOpcode == GPU7_TEX_INST_SAMPLE_LB || texOpcode == GPU7_TEX_INST_SAMPLE_G || texOpcode == GPU7_TEX_INST_SAMPLE_LZ || texOpcode == GPU7_TEX_INST_SAMPLE_C_LZ || texOpcode == GPU7_TEX_INST_SAMPLE || texOpcode == GPU7_TEX_INST_SAMPLE_C )
+	if( texOpcode == GPU7_TEX_INST_SAMPLE_L || texOpcode == GPU7_TEX_INST_SAMPLE_LZ || texOpcode == GPU7_TEX_INST_SAMPLE_C_LZ || texOpcode == GPU7_TEX_INST_SAMPLE || texOpcode == GPU7_TEX_INST_SAMPLE_C )
 	{
 		if( hasOffset )
 		{
@@ -2623,11 +2643,9 @@ void _emitTEXSampleTextureCode(LatteDecompilerShaderContext* shaderContext, Latt
 		}
 	}
 	// lod bias
-	if (texOpcode == GPU7_TEX_INST_SAMPLE_LB)
-	{
-		src->add(",");
-		_emitTEXSampleCoordInputComponent(shaderContext, texInstruction, 3, LATTE_DECOMPILER_DTYPE_FLOAT);
-	}
+	// WWHD: texture()/textureOffset() take the bias last (after the offset)
+	if (texOpcode == GPU7_TEX_INST_SAMPLE && !samplerLodBias.empty() && !sampleAtBiasLevel)
+		src->addFmt(",{}", samplerLodBias);
 	if( texOpcode == GPU7_TEX_INST_SAMPLE_C || texOpcode == GPU7_TEX_INST_SAMPLE_C_LZ )
 	{
 		src->add(")");
@@ -3147,7 +3165,7 @@ void _emitExportCode(LatteDecompilerShaderContext* shaderContext, LatteDecompile
 	src->add("// export" _CRLF);
 	if(shaderContext->shaderType == LatteConst::ShaderType::Vertex )
 	{
-		if( cfInstruction->exportBurstCount != 0 && cfInstruction->exportType != 2 )
+		if( cfInstruction->exportBurstCount != 0 )
 			debugBreakpoint();
 		if (cfInstruction->exportType == 1 && cfInstruction->exportArrayBase == GPU7_DECOMPILER_CF_EXPORT_BASE_POSITION)
 		{
@@ -3188,43 +3206,17 @@ void _emitExportCode(LatteDecompilerShaderContext* shaderContext, LatteDecompile
 		else if( cfInstruction->exportType == 2 && cfInstruction->exportArrayBase < 32 )
 		{
 			// export parameter
-			for (uint32 burstIndex = 0; burstIndex < (cfInstruction->exportBurstCount + 1); burstIndex++)
+			sint32 paramIndex = cfInstruction->exportArrayBase;
+			uint32 vsSemanticId = _getVertexShaderOutParamSemanticId(shaderContext->contextRegisters, paramIndex);
+			if (vsSemanticId != 0xFF)
 			{
-				uint32 paramIndex = cfInstruction->exportArrayBase + burstIndex;
-				if (paramIndex >= 32)
-				{
-					cemu_assert_unimplemented();
-					break;
-				}
-				uint32 vsSemanticId = _getVertexShaderOutParamSemanticId(shaderContext->contextRegisters, paramIndex);
-				if (vsSemanticId != 0xFF)
-				{
-					// preserve earlier exports for masked components
-					char componentMask[5]{};
-					uint32 componentCount = 0;
-					for (uint32 component = 0; component < 4; component++)
-					{
-						if (cfInstruction->exportComponentSel[component] != 7)
-						{
-							componentMask[componentCount] = _getElementStrByIndex(component)[0];
-							componentCount++;
-						}
-					}
-					if (componentCount == 0)
-						continue;
-					src->addFmt("passParameterSem{}", vsSemanticId);
-					if (componentCount < 4)
-						src->addFmt(".{}", componentMask);
-					src->add(" = ");
-					_emitExportGPRReadCode(shaderContext, cfInstruction, LATTE_DECOMPILER_DTYPE_FLOAT, burstIndex);
-					if (componentCount < 4)
-						src->addFmt(".{}", componentMask);
-					src->add(";" _CRLF);
-				}
-				else
-				{
-					src->add("// skipped export to semanticId 255" _CRLF);
-				}
+				src->addFmt("passParameterSem{} = ", vsSemanticId);
+				_emitExportGPRReadCode(shaderContext, cfInstruction, LATTE_DECOMPILER_DTYPE_FLOAT, 0);
+				src->add(";" _CRLF);
+			}
+			else
+			{
+				src->add("// skipped export to semanticId 255" _CRLF);
 			}
 		}
 		else
@@ -3566,11 +3558,7 @@ void LatteDecompiler_emitClauseCode(LatteDecompilerShaderContext* shaderContext,
 			src->addFmt("{} = {};" _CRLF, _getActiveMaskVarName(shaderContext, cfInstruction->activeStackDepth), _getActiveMaskVarName(shaderContext, cfInstruction->activeStackDepth-1));
 			src->addFmt("{} = {};" _CRLF, _getActiveMaskCVarName(shaderContext, cfInstruction->activeStackDepth + 1), _getActiveMaskCVarName(shaderContext, cfInstruction->activeStackDepth));
 		}
-		if (cfInstruction->type == GPU7_CF_INST_ALU_BREAK)
-			src->add("bool aluBreak = false;" _CRLF);
 		_emitALUClauseCode(shaderContext, cfInstruction);
-		if (cfInstruction->type == GPU7_CF_INST_ALU_BREAK)
-			src->add("if (aluBreak) break;" _CRLF);
 		if( shaderContext->analyzer.modifiesPixelActiveState )
 			src->add("}" _CRLF);
 		cemu_assert_debug(!(shaderContext->analyzer.modifiesPixelActiveState == false && cfInstruction->type != GPU7_CF_INST_ALU));
@@ -3724,10 +3712,6 @@ void LatteDecompiler_emitClauseCode(LatteDecompilerShaderContext* shaderContext,
 
 void LatteDecompiler_emitGLSLHelperFunctions(LatteDecompilerShaderContext* shaderContext, StringBuf* fCStr_shaderSource)
 {
-	// BotW-Native: both cube helpers pick their result with mix(bvec) (always an OpSelect) instead of if/else and early
-	// returns, which glslang emits as branches and Mesa only partly flattens (exec mask juggling and branches in every
-	// cube map shader). Same arithmetic per case, only the selection changed, so the values are identical; -3.6%
-	// instructions over BotW's 42 cube map shaders, -4.6% in the full screen lighting pass.
 	if( shaderContext->analyzer.hasRedcCUBE )
 	{
 		fCStr_shaderSource->add(
@@ -3737,69 +3721,49 @@ void LatteDecompiler_emitGLSLHelperFunctions(LatteDecompilerShaderContext* shade
 			"float ax = abs(x);\r\n"
 			"float ay = abs(y);\r\n"
 			"float az = abs(z);\r\n"
-			"bool zMajor = az >= ax && az >= ay;\r\n"
-			"bool yMajor = ay >= ax;\r\n"
-			"stm = mix(mix(vec3(-y, x < 0.0 ? z : -z, x * 2.0), vec3(y < 0.0 ? -z : z, x, y * 2.0), bvec3(yMajor)), vec3(-y, z < 0.0 ? -x : x, z * 2.0), bvec3(zMajor));\r\n"
-			"faceId = zMajor ? (z < 0.0 ? 5 : 4) : yMajor ? (y < 0.0 ? 3 : 2) : (x < 0.0 ? 1 : 0);\r\n"
+			"if (az >= ax && az >= ay)\r\n"
+			"{\r\n"
+			"stm = vec3(-y, z < 0.0 ? -x : x, z * 2.0);\r\n"
+			"faceId = z < 0.0 ? 5 : 4;\r\n"
+			"}\r\n"
+			"else if (ay >= ax)\r\n"
+			"{\r\n"
+			"stm = vec3(y < 0.0 ? -z : z, x, y * 2.0);\r\n"
+			"faceId = y < 0.0 ? 3 : 2;\r\n"
+			"}\r\n"
+			"else\r\n"
+			"{\r\n"
+			"stm = vec3(-y, x < 0.0 ? z : -z, x * 2.0);\r\n"
+			"faceId = x < 0.0 ? 1 : 0;\r\n"
+			"}\r\n"
 			"}\r\n");
 	}
 
 	if( shaderContext->analyzer.hasCubeMapTexture )
 	{
-		// the face ids are mutually exclusive, so testing them in reverse order picks the same vector
 		fCStr_shaderSource->add(
 			"vec3 redcCUBEReverse(vec2 st, int faceId)\r\n"
 			"{\r\n"
 			"vec2 tc = (st - vec2(1.5)) * 2.0;\r\n"
-			"vec3 v = vec3(-tc.x, -tc.y, -1.0);\r\n"
-			"v = mix(v, vec3(tc.x, -tc.y, 1.0), bvec3(faceId == 4));\r\n"
-			"v = mix(v, vec3(tc.x, -1.0, -tc.y), bvec3(faceId == 3));\r\n"
-			"v = mix(v, vec3(tc.x, 1.0, tc.y), bvec3(faceId == 2));\r\n"
-			"v = mix(v, vec3(-1.0, -tc.y, tc.x), bvec3(faceId == 1));\r\n"
-			"v = mix(v, vec3(1.0, -tc.y, -tc.x), bvec3(faceId == 0));\r\n"
-			"return v;\r\n"
+			"if (faceId == 0) return vec3(1.0, -tc.y, -tc.x);\r\n"
+			"if (faceId == 1) return vec3(-1.0, -tc.y, tc.x);\r\n"
+			"if (faceId == 2) return vec3(tc.x, 1.0, tc.y);\r\n"
+			"if (faceId == 3) return vec3(tc.x, -1.0, -tc.y);\r\n"
+			"if (faceId == 4) return vec3(tc.x, -tc.y, 1.0);\r\n"
+			"return vec3(-tc.x, -tc.y, -1.0);\r\n"
 			"}\r\n");
 	}
 
 	// clamp
-	static const bool s_exactSaturate = [] { const char* e = getenv("BOTW_EXACT_SATURATE"); return e && e[0] == '1'; }();
-	if (g_renderer->GetVendor() == GfxVendor::Mesa && !s_exactSaturate)
-	{
-		// BotW-Native: a plain saturate, which ACO folds into the instruction producing the value (free clamp modifier).
-		// The 0x7FFFFFFF -> 1.0 special case below cost a compare and a select per saturate and blocked that fold:
-		// 11-23% of the instructions of BotW's heaviest pixel shaders. The Deck's GPU never produces that bit
-		// pattern from arithmetic (its NaNs are 0x7FC00000, which already become 0 below), so it could only come from
-		// memory. BOTW_EXACT_SATURATE=1 restores it.
-		fCStr_shaderSource->add(""
-		"int clampFI32(int v)\r\n"
-		"{\r\n"
-			"return floatBitsToInt(clamp(intBitsToFloat(v), 0.0, 1.0));\r\n"
-		"}\r\n");
-	}
-	else if (g_renderer->GetVendor() == GfxVendor::Mesa)
-	{
-		// BotW-Native: Mesa defines saturate as min_num(max_num(x, 0), 1), so every NaN, 0xFFFFFFFF included, already
-		// becomes 0.0 (and RADV runs DX10_CLAMP). Only the 0x7FFFFFFF -> 1.0 case needs code: 3 ops per saturate, not 6.
-		fCStr_shaderSource->add(""
-		"int clampFI32(int v)\r\n"
-		"{\r\n"
-			"if( v == 0x7FFFFFFF )\r\n"
-			"	return floatBitsToInt(1.0);\r\n"
-			"return floatBitsToInt(clamp(intBitsToFloat(v), 0.0, 1.0));\r\n"
-		"}\r\n");
-	}
-	else
-	{
-		fCStr_shaderSource->add(""
-		"int clampFI32(int v)\r\n"
-		"{\r\n"
-			"if( v == 0x7FFFFFFF )\r\n"
-			"	return floatBitsToInt(1.0);\r\n"
-			"else if( v == 0xFFFFFFFF )\r\n"
-			"	return floatBitsToInt(0.0);\r\n"
-			"return floatBitsToInt(clamp(intBitsToFloat(v), 0.0, 1.0));\r\n"
-		"}\r\n");
-	}
+	fCStr_shaderSource->add(""
+	"int clampFI32(int v)\r\n"
+	"{\r\n"
+		"if( v == 0x7FFFFFFF )\r\n"
+		"	return floatBitsToInt(1.0);\r\n"
+		"else if( v == 0xFFFFFFFF )\r\n"
+		"	return floatBitsToInt(0.0);\r\n"
+		"return floatBitsToInt(clamp(intBitsToFloat(v), 0.0, 1.0));\r\n"
+	"}\r\n");
 	// mul non-ieee way (0*NaN/INF => 0.0)
 	if (shaderContext->options->strictMul)
 	{
@@ -3814,12 +3778,7 @@ void LatteDecompiler_emitGLSLHelperFunctions(LatteDecompilerShaderContext* shade
 		if( LatteGPUState.glVendor == GLVENDOR_NVIDIA && !ActiveSettings::DumpShadersEnabled())
 			fCStr_shaderSource->add("float mul_nonIEEE(float a, float b){return mix(0.0, a*b, (a != 0.0) && (b != 0.0));}" _CRLF); // compiles faster on Nvidia and also results in lower RAM usage (OpenGL)
 		else
-		{
-			// BotW-Native: the DXVK form. Mesa (nir_opt_algebraic "open-coded fmulz") turns exactly this into fmulz,
-			// one v_mul_legacy_f32 on AMD; the if-form stayed two compares, a multiply and a select. Same results,
-			// 0 * NaN/Inf included, except the sign of a zero result.
-			fCStr_shaderSource->add("float mul_nonIEEE(float a, float b){ return (b==0.0 ? 0.0 : a) * (a==0.0 ? 0.0 : b); }" _CRLF);
-		}
+			fCStr_shaderSource->add("float mul_nonIEEE(float a, float b){ if( a == 0.0 || b == 0.0 ) return 0.0; return a*b; }" _CRLF);
 
 		// DXKV-like: fCStr_shaderSource->add("float mul_nonIEEE(float a, float b){ return (b==0.0 ? 0.0 : a) * (a==0.0 ? 0.0 : b); }" _CRLF);
 	}
@@ -3903,7 +3862,7 @@ void LatteDecompiler_emitGLSLShader(LatteDecompilerShaderContext* shaderContext,
 	src->addFmt(_CRLF);
 #endif
 	// header part (definitions for inputs and outputs)
-	LatteDecompiler::emitHeader(shaderContext);
+	LatteDecompilerGLSL::emitHeader(shaderContext);
 	// helper functions
 	LatteDecompiler_emitGLSLHelperFunctions(shaderContext, src);
 	// start of main
@@ -3998,9 +3957,9 @@ void LatteDecompiler_emitGLSLShader(LatteDecompilerShaderContext* shaderContext,
 	}
 	for(sint32 i=0; i<LATTE_NUM_MAX_TEX_UNITS; i++)
 	{
-		if(!shaderContext->output->textureUnitMask[i])
-			continue;
-		if( shader->textureUnitDim[i] != Latte::E_DIM::DIM_CUBEMAP )
+		// WWHD: also for a unit whose index a SET_CUBEMAP_INDEX sets while the bound texture is no cube map
+		const bool sampledCube = shaderContext->output->textureUnitMask[i] && shader->textureUnitDim[i] == Latte::E_DIM::DIM_CUBEMAP;
+		if (!sampledCube && !shaderContext->analyzer.texUnitSetsCubeMapIndex.test(i))
 			continue;
 		src->addFmt("float cubeMapArrayIndex{} = 0.0;" _CRLF, i);
 	}

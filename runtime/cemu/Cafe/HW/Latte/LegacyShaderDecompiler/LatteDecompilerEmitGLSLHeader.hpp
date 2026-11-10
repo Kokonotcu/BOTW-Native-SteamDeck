@@ -1,6 +1,7 @@
 #pragma once
+#include "Cafe/HW/Latte/LegacyShaderDecompiler/LattePSInputDefault.h"
 
-namespace LatteDecompiler
+namespace LatteDecompilerGLSL
 {
 	void _emitUniformVariables(LatteDecompilerShaderContext* decompilerContext, RendererAPI rendererType, LatteDecompilerOutputUniformOffsets& uniformOffsets)
 	{
@@ -151,6 +152,17 @@ namespace LatteDecompiler
 			}
 		}
 
+		// WWHD: sampler LOD bias the shader adds (gfx/sampler_lod_bias.h); last, so the members above
+		// keep their offsets (std140: a float aligns to 4)
+		for (sint32 t = 0; t < LATTE_NUM_MAX_TEX_UNITS; t++)
+		{
+			if (!decompilerContext->analyzer.texUnitUsesLodBias.test(t))
+				continue;
+			uniformCurrentOffset = (uniformCurrentOffset + 3) & ~3;
+			shaderSrc->addFmt("uniform float uf_tex{}LodBias;" _CRLF, t);
+			uniformOffsets.offset_texLodBias[t] = uniformCurrentOffset;
+			uniformCurrentOffset += 4;
+		}
 		uniformOffsets.offset_endOfBlock = uniformCurrentOffset;
 		if (rendererType == RendererAPI::Vulkan)
 		{
@@ -264,14 +276,7 @@ namespace LatteDecompiler
 					cemu_assert_debug(decompilerContext->output->resourceMappingVK.attributeMapping[i] >= 0);
 					cemu_assert_debug(decompilerContext->output->resourceMappingGL.attributeMapping[i] == decompilerContext->output->resourceMappingVK.attributeMapping[i]);
 
-					// BotW-Native: the input type follows the Vulkan vertex format (LatteDecompiler_nativeAttrType)
-					const char* type = "uvec4";
-					for (auto& group : decompilerContext->fetchShader->bufferGroups)
-						for (sint32 j = 0; j < group.attribCount; j++)
-							if (group.attrib[j].semanticId == i)
-								if (char t = LatteDecompiler_nativeAttrType(group.attrib[j]))
-									type = t == 'i' ? "ivec4" : "vec4";
-					shaderSrc->addFmt("ATTR_LAYOUT({}) in {} attrDataSem{};" _CRLF, (sint32)decompilerContext->output->resourceMappingVK.attributeMapping[i], type, i);
+					shaderSrc->addFmt("ATTR_LAYOUT({}) in uvec4 attrDataSem{};" _CRLF, (sint32)decompilerContext->output->resourceMappingVK.attributeMapping[i], i);
 				}
 			}
 		}
@@ -424,6 +429,15 @@ namespace LatteDecompiler
 		{
 			if (psInputTable->import[i].semanticId > LATTE_ANALYZER_IMPORT_INDEX_PARAM_MAX)
 				continue;
+			const auto* options = shaderContext->options;
+			if (options && options->linkPSInputsToVS && !options->vsOutputSemantics.test(psInputTable->import[i].semanticId))
+			{
+				// WWHD: no vertex shader output for this input (LatteDecompilerOptions::linkPSInputsToVS):
+				// the value the GPU gives such an input, SPI_PS_INPUT_CNTL DEFAULT_VAL (LattePSInputDefault.h)
+				src->addFmt("const vec4 passParameterSem{} = {};" _CRLF, psInputTable->import[i].semanticId,
+					LattePSInputDefaultGLSL(shaderContext->contextRegisters[mmSPI_PS_INPUT_CNTL_0 + i]));
+				continue;
+			}
 			src->addFmt("layout(location = {}) ", i);
 			if (psInputTable->import[i].isFlat)
 				src->add("flat ");

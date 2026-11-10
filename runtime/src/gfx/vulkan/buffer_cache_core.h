@@ -42,7 +42,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "write_watch.h"
+#include "gfx/write_watch.h"
 
 namespace gfxvk::bufcache {
 

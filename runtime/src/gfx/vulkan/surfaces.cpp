@@ -8,7 +8,7 @@
 #include "settings.h"
 #include "shaders.h"
 #include "sparse_hash_memo.h"
-#include "write_watch.h"
+#include "gfx/write_watch.h"
 #define XXH_INLINE_ALL
 #include "../../../third_party/xxhash/xxhash.h"
 #include "Cafe/HW/Latte/ISA/LatteReg.h"

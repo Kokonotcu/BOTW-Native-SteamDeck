@@ -27,7 +27,7 @@
 #include <vector>
 
 #include "texture_churn.h"
-#include "write_watch.h"
+#include "gfx/write_watch.h"
 
 namespace texpieces {
 
