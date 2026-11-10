@@ -41,6 +41,18 @@ void VKRSynchronizedRingAllocator::allocateAdditionalUploadBuffer(uint32 sizeReq
 	else
 		cemu_assert_debug(false);
 
+	{
+		// the memory type CreateBuffer picked (first HOST_VISIBLE one the buffer allows)
+		VkMemoryRequirements req;
+		vkGetBufferMemoryRequirements(m_vkr->GetLogicalDevice(), newBuffer.vk_buffer, &req);
+		uint32 typeIndex;
+		if (m_vkrMemMgr->FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, typeIndex))
+		{
+			VkPhysicalDeviceMemoryProperties memProperties;
+			vkGetPhysicalDeviceMemoryProperties(m_vkr->GetPhysicalDevice(), &memProperties);
+			newBuffer.coherent = (memProperties.memoryTypes[typeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+		}
+	}
 	void* bufferPtr = nullptr;
 	vkMapMemory(m_vkr->GetLogicalDevice(), newBuffer.vk_mem, 0, VK_WHOLE_SIZE, 0, &bufferPtr);
 	newBuffer.basePtr = (uint8*)bufferPtr;
@@ -120,6 +132,8 @@ VKRSynchronizedRingAllocator::AllocatorReservation_t VKRSynchronizedRingAllocato
 void VKRSynchronizedRingAllocator::FlushReservation(AllocatorReservation_t& uploadReservation)
 {
 	cemu_assert_debug(m_bufferType == VKR_BUFFER_TYPE::STAGING); // only the staging buffer isn't coherent
+	if (uploadReservation.bufferIndex < m_buffers.size() && m_buffers[uploadReservation.bufferIndex].coherent)
+		return;  // BotW-Native: a flush of coherent memory does nothing (per texture slice / buffer upload otherwise)
 	// todo - use nonCoherentAtomSize for flush size (instead of hardcoded constant)
 	VkMappedMemoryRange flushedRange{};
 	flushedRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;

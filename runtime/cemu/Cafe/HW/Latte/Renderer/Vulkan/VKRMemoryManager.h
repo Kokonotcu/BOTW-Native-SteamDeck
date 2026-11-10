@@ -179,6 +179,7 @@ public:
 		uint64 lastSyncpointCmdBufferId{ 0xFFFFFFFFFFFFFFFFull };
 		uint32 index;
 		uint32 cleanupCounter{ 0 }; // increased by one every time CleanupBuffer() is called if there is no sync point. If it reaches 300 then the buffer is released
+		bool coherent{ false }; // BotW-Native: HOST_COHERENT memory needs no vkFlushMappedMemoryRanges per reservation
 	};
 
 	struct AllocatorReservation_t
