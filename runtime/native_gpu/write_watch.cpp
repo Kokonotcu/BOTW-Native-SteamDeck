@@ -1,0 +1,347 @@
+// Exact CPU-write tracking for guest memory (see write_watch.h for the protocol and its race argument).
+#include "write_watch.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
+#include <vector>
+
+#include "platform/host.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/ucontext.h>
+#endif
+#include <cstdio>
+#include <thread>
+
+namespace wwatch {
+namespace {
+bool (*g_guest_regs)(uint32_t* lr, uint32_t* r) = nullptr;  // set_guest_regs_hook
+}
+void set_guest_regs_hook(bool (*f)(uint32_t* lr, uint32_t* r)) { g_guest_regs = f; }
+}  // namespace wwatch
+
+namespace wwatch {
+namespace {
+
+// per page: kProt = read-only by us right now; kEver = armed at least once, so a write fault on the page
+// is ours (guest memory is otherwise all read-write; the null-page guard is never armed)
+constexpr uint8_t kProt = 1, kEver = 2;
+
+uint8_t* g_base = nullptr;
+uint64_t g_size = 0;
+unsigned g_shift = 0;
+uint64_t g_pages = 0;
+std::atomic<uint64_t>* g_stamp = nullptr;  // newest write stamp per page
+std::atomic<uint8_t>* g_flags = nullptr;
+std::atomic<uint64_t> g_clock{1};
+std::atomic<bool> g_active{false};
+std::atomic<uint64_t> g_faults{0}, g_protected{0};              // since init (totals)
+std::atomic<uint64_t> g_faults_taken{0}, g_protected_taken{0};  // the totals at the last take_stats
+std::atomic<uint64_t> g_seq{0};                // advanced after each stamp is stored (write_seq)
+std::atomic<uint64_t>* g_hint = nullptr;       // newest hint stamp per page (enable_hints)
+std::atomic<bool> g_hints{false};
+std::atomic<uint64_t> g_hint_calls{0}, g_hint_bytes{0};
+std::atomic<uint64_t> g_protect_failures{0};  // pages arm() could not protect
+// arm() vs host writes: a page inside a pending kernel write must stay writable until the write ends
+std::mutex g_m;
+std::vector<std::pair<uint64_t, uint64_t>> g_pins;  // page ranges [first, last] of pending host writes
+
+bool set_rw(uint64_t first, uint64_t count, bool writable) {
+    void* p = g_base + (first << g_shift);
+    size_t n = (size_t)(count << g_shift);
+#ifdef _WIN32
+    DWORD old;
+    return VirtualProtect(p, n, writable ? PAGE_READWRITE : PAGE_READONLY, &old) != 0;
+#else
+    return mprotect(p, n, writable ? PROT_READ | PROT_WRITE : PROT_READ) == 0;
+#endif
+}
+
+void stamp_page(uint64_t page, uint64_t v) {
+    // monotonic: two threads faulting on one page may store out of order
+    uint64_t cur = g_stamp[page].load(std::memory_order_relaxed);
+    while (cur < v && !g_stamp[page].compare_exchange_weak(cur, v, std::memory_order_release, std::memory_order_relaxed)) {}
+}
+
+// a write fault at host address a: ours if the page was ever armed. Unprotect first, then stamp (the
+// order the race argument in write_watch.h relies on). Async-signal-safe: atomics and one syscall.
+bool on_write_fault(uintptr_t a) {
+    if (!g_active.load(std::memory_order_acquire)) return false;
+    uintptr_t off = a - (uintptr_t)g_base;
+    if (a < (uintptr_t)g_base || off >= g_size) return false;
+    uint64_t page = off >> g_shift;
+    if (!(g_flags[page].load(std::memory_order_acquire) & kEver)) return false;
+    if (!set_rw(page, 1, true)) return false;
+    g_flags[page].fetch_and((uint8_t)~kProt, std::memory_order_acq_rel);
+    stamp_page(page, g_clock.fetch_add(1, std::memory_order_acq_rel) + 1);
+    g_seq.fetch_add(1, std::memory_order_acq_rel);
+    g_faults.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+#ifdef _WIN32
+LONG CALLBACK veh(EXCEPTION_POINTERS* e) {
+    const EXCEPTION_RECORD* r = e->ExceptionRecord;
+    // ExceptionInformation[0] == 1: a write; [1]: the address
+    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2 && r->ExceptionInformation[0] == 1 &&
+        on_write_fault((uintptr_t)r->ExceptionInformation[1]))
+        return EXCEPTION_CONTINUE_EXECUTION;
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+bool install_handler() { return AddVectoredExceptionHandler(1, veh) != nullptr; }
+#else
+struct sigaction g_old_segv, g_old_bus;
+// debug: WWHD_WRITE_TRAP=addr[+size] (guest, size default 0x300) logs each guest store into the range
+// with the recompiled function doing it and the guest registers; the page is protected again every 2 ms
+uint32_t g_trap = 0, g_trap_size = 0x300;
+std::atomic<int> g_trap_logs{0};
+void trap_log(uintptr_t a, void* uc) {
+    // anywhere on the range's host pages: only the first write after arming faults, and a copy that starts
+    // lower on the page faults there and then writes the range unseen
+    const uintptr_t ps = (uintptr_t)1 << g_shift, lo = ((uintptr_t)g_base + g_trap) & ~(ps - 1),
+                    hi = ((uintptr_t)g_base + g_trap + g_trap_size + ps - 1) & ~(ps - 1);
+    if (!g_trap || a < lo || a >= hi) return;
+    if (g_trap_logs.fetch_add(1) >= 400) return;
+    uintptr_t pc = 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+    pc = (uintptr_t)((ucontext_t*)uc)->uc_mcontext->__ss.__pc;
+#endif
+    Dl_info di{};
+    const char* fn = pc && dladdr((void*)pc, &di) && di.dli_sname ? di.dli_sname : "?";
+    char tn[32] = {};
+    host::get_thread_name(tn, sizeof tn);
+    uint32_t lr = 0, r[6] = {};
+    if (g_guest_regs && g_guest_regs(&lr, r))
+        fprintf(stderr, "[wtrap] %08X by %s img+%lX thread '%s' lr=%08X r3=%08X r4=%08X r5=%08X r6=%08X r30=%08X r31=%08X\n",
+                (uint32_t)(a - (uintptr_t)g_base), fn, (unsigned long)(pc - (uintptr_t)di.dli_fbase), tn, lr, r[0], r[1], r[2], r[3],
+                r[4], r[5]);
+    else
+        fprintf(stderr, "[wtrap] %08X by %s thread '%s' (host)\n", (uint32_t)(a - (uintptr_t)g_base), fn, tn);
+}
+void handler(int sig, siginfo_t* si, void* uc) {
+    trap_log((uintptr_t)si->si_addr, uc);
+    // macOS reports a write to a read-only page as SIGBUS, Linux/Android as SIGSEGV
+    if (on_write_fault((uintptr_t)si->si_addr)) return;
+    // not ours: the crash handler (main.cpp) or whatever was installed before
+    struct sigaction& o = sig == SIGBUS ? g_old_bus : g_old_segv;
+    if (o.sa_flags & SA_SIGINFO) o.sa_sigaction(sig, si, uc);
+    else if (o.sa_handler != SIG_DFL && o.sa_handler != SIG_IGN) o.sa_handler(sig);
+    else { signal(sig, SIG_DFL); raise(sig); }
+}
+bool install_handler() {
+    struct sigaction sa{};
+    sa.sa_sigaction = handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    return sigaction(SIGSEGV, &sa, &g_old_segv) == 0 && sigaction(SIGBUS, &sa, &g_old_bus) == 0;
+}
+#endif
+
+bool pinned(uint64_t page) {
+    for (auto& [a, b] : g_pins)
+        if (page >= a && page <= b) return true;
+    return false;
+}
+
+bool page_range(uint32_t addr, uint32_t size, uint64_t& first, uint64_t& last) {
+    if (!size || !g_active.load(std::memory_order_acquire)) return false;
+    uint64_t end = std::min<uint64_t>((uint64_t)addr + size, g_size);
+    if (addr >= end) return false;
+    first = (uint64_t)addr >> g_shift;
+    last = (end - 1) >> g_shift;
+    return true;
+}
+
+}  // namespace
+
+bool init(uint8_t* base, uint64_t size) {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        size_t ps = host::page_size();
+        if (!ps || (ps & (ps - 1))) return;
+        unsigned shift = 0;
+        while (((size_t)1 << shift) < ps) shift++;
+        g_base = base;
+        g_size = size;
+        g_shift = shift;
+        g_pages = size >> shift;
+        // zero-filled on demand by the OS (calloc of this size maps fresh pages); 9 bytes per host page
+        g_stamp = (std::atomic<uint64_t>*)calloc(g_pages, sizeof(std::atomic<uint64_t>));
+        g_flags = (std::atomic<uint8_t>*)calloc(g_pages, sizeof(std::atomic<uint8_t>));
+        if (!g_stamp || !g_flags || !install_handler()) return;
+        g_active.store(true, std::memory_order_release);
+#ifndef _WIN32
+        if (const char* e = getenv("WWHD_WRITE_TRAP")) {
+            char* p;
+            g_trap = (uint32_t)strtoul(e, &p, 16);
+            if (*p == '+') g_trap_size = (uint32_t)strtoul(p + 1, nullptr, 16);
+            fprintf(stderr, "[wtrap] watching %08X+%X\n", g_trap, g_trap_size);
+            std::thread([] {
+                for (;;) {
+                    arm(g_trap, g_trap_size);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            }).detach();
+        }
+#endif
+    });
+    return active();
+}
+
+bool active() { return g_active.load(std::memory_order_acquire); }
+
+uint64_t arm(uint32_t addr, uint32_t size) {
+    uint64_t t0 = g_clock.load(std::memory_order_acquire), first, last;
+    if (!page_range(addr, size, first, last)) return t0;
+    // fast path: every page is still protected (nothing written since some earlier arm)
+    uint64_t p = first;
+    while (p <= last && (g_flags[p].load(std::memory_order_acquire) & kProt)) p++;
+    if (p > last) return t0;
+    std::lock_guard<std::mutex> lk(g_m);
+    uint64_t run = 0, runStart = 0;
+    auto flush = [&] {
+        if (!run) return;
+        if (set_rw(runStart, run, false)) {
+            g_protected.fetch_add(run, std::memory_order_relaxed);
+        } else {
+            // not protected (Linux: too many mappings, vm.max_map_count): writes would go unseen, so
+            // the pages count as written now and stay unflagged; callers see a change on every check
+            uint64_t v = g_clock.fetch_add(1, std::memory_order_acq_rel) + 1;
+            for (uint64_t q = runStart; q < runStart + run; q++) {
+                g_flags[q].fetch_and((uint8_t)~kProt, std::memory_order_acq_rel);
+                stamp_page(q, v);
+            }
+            g_seq.fetch_add(1, std::memory_order_acq_rel);
+            g_protect_failures.fetch_add(run, std::memory_order_relaxed);
+        }
+        run = 0;
+    };
+    for (; p <= last; p++) {
+        // flag before protecting: a protected-flagged page is never writable (see write_watch.h)
+        if ((g_flags[p].load(std::memory_order_acquire) & kProt) || pinned(p)) { flush(); continue; }
+        g_flags[p].fetch_or(kProt | kEver, std::memory_order_acq_rel);
+        if (!run) runStart = p;
+        run++;
+    }
+    flush();
+    return t0;
+}
+
+bool written_since(uint32_t addr, uint32_t size, uint64_t stamp) {
+    uint64_t first, last;
+    if (!page_range(addr, size, first, last)) return false;
+    for (uint64_t p = first; p <= last; p++)
+        if (g_stamp[p].load(std::memory_order_acquire) > stamp) return true;
+    return false;
+}
+
+uint32_t written_pages(uint32_t addr, uint32_t size, uint64_t stamp, uint32_t* edges) {
+    uint64_t first, last;
+    uint32_t n = 0, e = 0;
+    if (page_range(addr, size, first, last))
+        for (uint64_t p = first; p <= last; p++)
+            if (g_stamp[p].load(std::memory_order_acquire) > stamp) {
+                n++;
+                e += p == first || p == last;
+            }
+    if (edges) *edges = e;
+    return n;
+}
+
+void host_write_begin(uint32_t addr, uint32_t size) {
+#ifndef _WIN32
+    if (g_trap && addr <= g_trap + g_trap_size && g_trap < addr + size) {
+        char tn[32] = {};
+        host::get_thread_name(tn, sizeof tn);
+        fprintf(stderr, "[wtrap] host write %08X+%X thread '%s'\n", addr, size, tn);
+    }
+#endif
+    uint64_t first, last;
+    if (!page_range(addr, size, first, last)) return;
+    std::lock_guard<std::mutex> lk(g_m);
+    g_pins.push_back({first, last});
+    for (uint64_t p = first; p <= last; p++)
+        if (g_flags[p].load(std::memory_order_acquire) & kProt) {
+            set_rw(p, 1, true);
+            g_flags[p].fetch_and((uint8_t)~kProt, std::memory_order_acq_rel);
+        }
+    uint64_t v = g_clock.fetch_add(1, std::memory_order_acq_rel) + 1;
+    for (uint64_t p = first; p <= last; p++) stamp_page(p, v);
+    g_seq.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void host_write_end(uint32_t addr, uint32_t size) {
+    uint64_t first, last;
+    if (!page_range(addr, size, first, last)) return;
+    std::lock_guard<std::mutex> lk(g_m);
+    auto it = std::find(g_pins.begin(), g_pins.end(), std::make_pair(first, last));
+    if (it != g_pins.end()) g_pins.erase(it);
+    // stamped again after the data is in: a texture checked during the write is checked once more
+    uint64_t v = g_clock.fetch_add(1, std::memory_order_acq_rel) + 1;
+    for (uint64_t p = first; p <= last; p++) stamp_page(p, v);
+    g_seq.fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool changed_since(uint32_t addr, uint32_t size, uint64_t stamp) {
+    uint64_t first, last;
+    if (!page_range(addr, size, first, last)) return false;
+    std::atomic<uint64_t>* hints = g_hints.load(std::memory_order_acquire) ? g_hint : nullptr;
+    for (uint64_t p = first; p <= last; p++)
+        if (g_stamp[p].load(std::memory_order_acquire) > stamp ||
+            (hints && hints[p].load(std::memory_order_acquire) > stamp))
+            return true;
+    return false;
+}
+
+uint64_t write_seq() { return g_seq.load(std::memory_order_acquire); }
+
+void enable_hints() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        if (!active()) return;
+        g_hint = (std::atomic<uint64_t>*)calloc(g_pages, sizeof(std::atomic<uint64_t>));
+        if (g_hint) g_hints.store(true, std::memory_order_release);
+    });
+}
+
+void hint(uint32_t addr, uint32_t size) {
+    if (!g_hints.load(std::memory_order_acquire) || size >= 0x10000000u) return;
+    uint64_t first, last;
+    if (!page_range(addr, size, first, last)) return;
+    // a stamp newer than every arm() so far, the same order as a fault: stamp, then the sequence
+    uint64_t v = g_clock.fetch_add(1, std::memory_order_acq_rel) + 1;
+    for (uint64_t p = first; p <= last; p++) {
+        uint64_t cur = g_hint[p].load(std::memory_order_relaxed);
+        while (cur < v && !g_hint[p].compare_exchange_weak(cur, v, std::memory_order_release, std::memory_order_relaxed)) {}
+    }
+    g_seq.fetch_add(1, std::memory_order_acq_rel);
+    g_hint_calls.fetch_add(1, std::memory_order_relaxed);
+    g_hint_bytes.fetch_add(size, std::memory_order_relaxed);
+}
+
+void take_stats(uint64_t& faults, uint64_t& protectedPages) {
+    const uint64_t f = g_faults.load(std::memory_order_relaxed), p = g_protected.load(std::memory_order_relaxed);
+    faults = f - g_faults_taken.exchange(f, std::memory_order_relaxed);
+    protectedPages = p - g_protected_taken.exchange(p, std::memory_order_relaxed);
+}
+
+void totals(uint64_t& faults, uint64_t& protectedPages) {
+    faults = g_faults.load(std::memory_order_relaxed);
+    protectedPages = g_protected.load(std::memory_order_relaxed);
+}
+
+uint64_t protect_failures() { return g_protect_failures.load(std::memory_order_relaxed); }
+
+void take_hint_stats(uint64_t& calls, uint64_t& bytes) {
+    calls = g_hint_calls.exchange(0, std::memory_order_relaxed);
+    bytes = g_hint_bytes.exchange(0, std::memory_order_relaxed);
+}
+
+}  // namespace wwatch

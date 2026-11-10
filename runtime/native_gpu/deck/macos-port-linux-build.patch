@@ -1,0 +1,218 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1d2d1c1..a0125fd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -131,6 +131,9 @@ endif()
+ # strong HLE definitions replace the generated weak import stubs.
+ file(GLOB RUNTIME_SOURCES CONFIGURE_DEPENDS runtime/src/*.cpp runtime/src/*.c runtime/src/hle/*.cpp runtime/src/mods/*.cpp runtime/src/motion/*.cpp
+                                             runtime/src/overlay/*.cpp)
++if(NOT APPLE)  # Deck test build: h264 uses VideoToolbox; without it the decoder imports stay logged stubs
++  list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "runtime/src/hle/h264\\.cpp$")
++endif()
+ list(APPEND RUNTIME_SOURCES runtime/src/platform/perf_hint.cpp)  # Android performance hints (no-op elsewhere)
+ list(APPEND RUNTIME_SOURCES ${WWHD_BUILD_INFO})
+ # Cemu graphic packs bundled with the runtime (runtime/data/graphic_packs, CC0): compiled in as text,
+diff --git a/runtime/src/gfx/vulkan/draw.cpp b/runtime/src/gfx/vulkan/draw.cpp
+index 0f676e1..df2cb81 100644
+--- a/runtime/src/gfx/vulkan/draw.cpp
++++ b/runtime/src/gfx/vulkan/draw.cpp
+@@ -1659,10 +1659,7 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+   else
+     supportUniforms.clear();
+   // Bloom extract cThresholdParam.z: scale once, before blur/downsampling.
+-  if (!sh->vertex && (r[mmSQ_PGM_START_PS] << 8) == 0x44F91200 &&
+-      sh->uniforms.offset_remapped >= 0 && size_t(sh->uniforms.offset_remapped) < supportUniforms.size())
+-    render::scale_bloom_uniforms(supportUniforms.data() + sh->uniforms.offset_remapped,
+-                                supportUniforms.size() - sh->uniforms.offset_remapped);
++  // (WWHD-only: its bloom shader address; not part of the BotW port's renderer interface)
+   // Metal AO mode 2 tiles noise per 960x540 output pixel rather than 640x360.
+   const int remapped = sh->uniforms.offset_remapped;
+   if (sh->vertex && ao_mode() == 2 &&
+@@ -1724,14 +1721,16 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT),
+                        VK_ACCESS_SHADER_READ_BIT);
+     uint32_t samplerId = sh->dec->textureUnitSamplerAssignment[unit];
+-    if (samplerId >= 18)
+-      exception_report::raise("missing texture sampler");
+     uint32_t samplerBase = sh->vertex ? 18 : 0;
+     if (imageCount >= imageInfos.size())
+       exception_report::raise("stage image descriptor capacity exceeded");
+     auto &info = imageInfos[imageCount++];
+-    const uint32_t* samplerWords = r + REGADDR::SQ_TEX_SAMPLER_WORD0_0 +
+-                                    (samplerBase + samplerId) * 3;
++    // A unit the shader only reads with texel fetches has no sampler (the decompiler's SAMPLER_NONE). The
++    // descriptor still needs one: an all-zero sampler (point filtering, wrap), as Cemu's Vulkan renderer does;
++    // fetches ignore it. Was: abort ("missing texture sampler", BotW at game load).
++    static const uint32_t kNoSampler[3] = {0, 0, 0};
++    const uint32_t* samplerWords = samplerId >= 18 ? kNoSampler
++                                                   : r + REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (samplerBase + samplerId) * 3;
+     uint32_t patchedSampler[3];
+     if (!sh->vertex && ao_mode() >= 1 && unit == 0 &&
+         sh->kind == gfx::ProgramKind::OcclusionPixel) {
+diff --git a/runtime/src/gfx/vulkan/overlay_sdl.cpp b/runtime/src/gfx/vulkan/overlay_sdl.cpp
+index 93dc538..8343329 100644
+--- a/runtime/src/gfx/vulkan/overlay_sdl.cpp
++++ b/runtime/src/gfx/vulkan/overlay_sdl.cpp
+@@ -181,7 +181,6 @@ void graphics_changed() {
+     put("aoMode", {"WWHD_AO_MODE", "WWHD_NO_AO_QUIRK"}, std::to_string(gfxvk::ao_mode()));
+     put("aoHires", {"WWHD_AO_HIRES"}, gfxvk::ao_hires_enabled() ? "1" : "0");
+     put("aniso", {"WWHD_ANISO"}, gfxvk::aniso_enabled() ? "1" : "0");
+-    put("bloomStrength", {"WWHD_BLOOM_STRENGTH"}, std::to_string(render::bloom_strength()));
+     put("fxaa", {"WWHD_FXAA"}, gfxvk::fxaa_enabled() ? "1" : "0");
+ #ifdef __ANDROID__
+     // the player's choice: the phone pauses interpolation by itself (platform/perf_hint.cpp)
+@@ -211,7 +210,6 @@ void load_saved_options() {
+     if (saved("aoMode", {"WWHD_AO_MODE", "WWHD_NO_AO_QUIRK"})) gfxvk::set_ao_mode((int)num("aoMode"));
+     if (saved("aoHires", {"WWHD_AO_HIRES"})) gfxvk::set_ao_hires(num("aoHires") != 0);
+     if (saved("aniso", {"WWHD_ANISO"})) gfxvk::set_aniso(num("aniso") != 0);
+-    if (saved("bloomStrength", {"WWHD_BLOOM_STRENGTH"})) render::set_bloom_strength((float)num("bloomStrength"));
+     if (saved("fxaa", {"WWHD_FXAA"})) gfxvk::set_fxaa(num("fxaa") != 0);
+     if (saved("interpFps", {"WWHD_INTERP_FPS"})) interp::set_fps((int)num("interpFps"));
+     if (saved("fps60", {"WWHD_INTERP", "WWHD_TRUE60", "WWHD_INTERP_FPS"})) interp::set_mode((int)num("fps60"));
+diff --git a/runtime/src/gfx/vulkan/present.cpp b/runtime/src/gfx/vulkan/present.cpp
+index a9bfdfe..9955095 100644
+--- a/runtime/src/gfx/vulkan/present.cpp
++++ b/runtime/src/gfx/vulkan/present.cpp
+@@ -6,7 +6,6 @@
+ #include "backend.h"
+ #include "shaders.h"
+ #include "settings.h"
+-#include "mods/climb.h"
+ #include "overlay/guest_hud.h"
+ #include "gfx/display_modes.h"
+ #include "platform/dual_display.h"
+@@ -640,9 +639,9 @@ bool record_screenshot(Screen& screen,Buffer& buffer,uint32_t& width,uint32_t& h
+ 
+ // ---------------------------------------------------------------- the climb mod's stamina wheel
+ void draw_mod_overlay(Surface& scan) {
+- if(!mods::climb_enabled()||!scan.image||!scan.view||!(scan.usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))return;
+- const mods::ClimbHud hud=mods::climb_hud();
+- if(hud.alpha<=0.0f)return;
++ return;  // Deck test build: the WWHD climb mod is not part of the BotW port
++ struct { float stamina=0, alpha=0; bool exhausted=false; } hud;
++ if(!scan.image||!scan.view||!(scan.usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))return;
+  transition_image(&scan,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                   VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+  auto cmd=command_buffer();
+diff --git a/runtime/src/gfx/vulkan/surfaces.cpp b/runtime/src/gfx/vulkan/surfaces.cpp
+index 79dcd53..c173e14 100644
+--- a/runtime/src/gfx/vulkan/surfaces.cpp
++++ b/runtime/src/gfx/vulkan/surfaces.cpp
+@@ -629,7 +629,11 @@ void create_surface_image(Surface* s, bool forRendering, VkExtent3D explicitExte
+     VkImageUsageFlags usage=VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+     if(!s->fmt.compressed&&(features&attachment))usage|=s->fmt.depth?VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT:VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+-    imageInfo.flags=(cube?VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT:0)|VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
++    // Any square 2D array with a multiple of 6 layers may later be sampled as a cube (games render environment
++    // maps face by face as a 2D array, then bind it as a cube texture): create those cube-compatible too.
++    const bool cubeable=cube||(s->imageType==VK_IMAGE_TYPE_2D&&s->arrayLayers>=6&&s->arrayLayers%6==0&&
++                               s->extent.width==s->extent.height);
++    imageInfo.flags=(cubeable?VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT:0)|VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+     // volumes are render targets too (the game renders its colour-grading volumes slice by slice): their
+     // slices get 2D attachment views (layer_view)
+     if(threeD&&R.imageView2DOn3DImage&&(usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))imageInfo.flags|=VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+@@ -707,8 +711,9 @@ VkImageView sampled_texture_view(Surface* s,const uint32_t* texWords) {
+     bool cube=type==VK_IMAGE_VIEW_TYPE_CUBE||type==VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+     if((oneD&&s->imageType!=VK_IMAGE_TYPE_1D)||(threeD!=(s->imageType==VK_IMAGE_TYPE_3D))||(!oneD&&!threeD&&s->imageType!=VK_IMAGE_TYPE_2D))
+         exception_report::raise("Vulkan sampled texture dimension does not match the backing image");
+-    if(cube&&(s->viewType!=VK_IMAGE_VIEW_TYPE_CUBE&&s->viewType!=VK_IMAGE_VIEW_TYPE_CUBE_ARRAY))
+-        exception_report::raise("Vulkan sampled cube requires a cube-compatible backing image");
++    if(cube&&!(s->createFlags&VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT))
++        exception_report::raise("Vulkan sampled cube requires a cube-compatible backing image ("+std::to_string(s->extent.width)+"x"+
++                                std::to_string(s->extent.height)+", "+std::to_string(s->arrayLayers)+" layers)");
+     uint32_t selectors[4]={uint32_t(w4.get_DST_SEL_X()),uint32_t(w4.get_DST_SEL_Y()),uint32_t(w4.get_DST_SEL_Z()),uint32_t(w4.get_DST_SEL_W())};
+     static const VkComponentSwizzle mapping[8]={VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_G,VK_COMPONENT_SWIZZLE_B,VK_COMPONENT_SWIZZLE_A,VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_ONE,VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_ZERO};
+     uint32_t key=uint32_t(type)<<12;for(unsigned i=0;i<4;++i)key|=(s->fmt.depth?i:selectors[i])<<(i*3);
+@@ -1354,28 +1359,43 @@ void copy_surface_impl(uint32_t srcAddr,uint32_t srcMip,uint32_t srcSlice,uint32
+         write_back_linear_copy(dst,dstSlice,d,dbase,dstMip,dstSlice,cw,ch);
+         return;
+     }
+-    auto sf=format_info(uint32_t(s->format.value()),bool(uint32_t(s->format.value())&0x800));
+-    auto df=format_info(uint32_t(d->format.value()),bool(uint32_t(d->format.value())&0x800));
+-    if(sf.pixel==VK_FORMAT_UNDEFINED||df.pixel==VK_FORMAT_UNDEFINED||sf.bytesPerBlock!=df.bytesPerBlock||sf.compressed!=df.compressed)
+-        exception_report::raise("Unsupported CPU GX2CopySurface format layout");
++    // CPU path, as Cemu (LatteSurfaceCopy) and the Metal backend: a byte copy in guest memory whose element size
++    // comes from the source's GX2 format alone, so any GX2 format of any game copies, also formats without a
++    // Vulkan format; the destination gets the source's element size. Was: both formats had to map to Vulkan
++    // formats of the same size (BotW stopped at startup on this).
++    const uint32_t sgx=uint32_t(s->format.value()),dgx=uint32_t(d->format.value());
++    const uint32_t bpp=Latte::GetFormatBits(static_cast<Latte::E_GX2SURFFMT>(sgx));
++    if(!bpp)exception_report::raise("Unsupported CPU GX2CopySurface source format "+std::to_string(sgx)+" -> "+std::to_string(dgx));
++    const uint32_t bytesPer=bpp/8;
++    const bool compressed=Latte::IsCompressedFormat(static_cast<Latte::E_GX2SURFFMT>(sgx));
++    auto sf=format_info(sgx,bool(sgx&0x800));
++    auto df=format_info(dgx,bool(dgx&0x800));
++    const bool sDepth=sf.pixel!=VK_FORMAT_UNDEFINED&&(sf.depth||sf.convert==Convert::D24_R32F);
++    const bool dDepth=df.pixel!=VK_FORMAT_UNDEFINED&&(df.depth||df.convert==Convert::D24_R32F);
++    {
++        static std::mutex seenMutex;static std::unordered_map<uint64_t,bool> seen;
++        std::lock_guard<std::mutex> lock(seenMutex);
++        if(seen.emplace((uint64_t(sgx)<<32)|dgx,true).second)
++            LOG("[copy] CPU GX2CopySurface fmt %X -> %X (%u bits/element, %ux%u)",sgx,dgx,bpp,cw,ch);
++    }
+     LatteAddrLib::AddrSurfaceInfo_OUT si{},di{};
+     LatteAddrLib::GX2CalculateSurfaceInfo(s->format,s->width,s->height,s->depth,s->dim,s->tileMode,s->aa,srcMip,&si);
+     LatteAddrLib::GX2CalculateSurfaceInfo(d->format,d->width,d->height,d->depth,d->dim,d->tileMode,d->aa,dstMip,&di);
+     if(srcSlice>=si.depth||dstSlice>=di.depth)exception_report::raise("CPU GX2CopySurface slice is out of range");
+     auto stm=static_cast<Latte::E_HWTILEMODE>(si.hwTileMode),dtm=static_cast<Latte::E_HWTILEMODE>(di.hwTileMode);
+-    uint32_t bpp=sf.bytesPerBlock*8,bw=sf.compressed?(cw+3)/4:cw,bh=sf.compressed?(ch+3)/4:ch;
++    uint32_t bw=compressed?(cw+3)/4:cw,bh=compressed?(ch+3)/4:ch;
+     uint32_t sswz=s->swizzle,dswz=d->swizzle;LatteAddrLib::CachedSurfaceAddrInfo sci{},dci{};
+-    if(Latte::TM_IsMacroTiled(stm))LatteAddrLib::SetupCachedSurfaceAddrInfo(&sci,srcSlice,0,bpp,si.pitch,si.height,si.depth,1,stm,(sf.depth||sf.convert==Convert::D24_R32F),(sswz>>8)&1,(sswz>>9)&3);
+-    if(Latte::TM_IsMacroTiled(dtm))LatteAddrLib::SetupCachedSurfaceAddrInfo(&dci,dstSlice,0,bpp,di.pitch,di.height,di.depth,1,dtm,(df.depth||df.convert==Convert::D24_R32F),(dswz>>8)&1,(dswz>>9)&3);
++    if(Latte::TM_IsMacroTiled(stm))LatteAddrLib::SetupCachedSurfaceAddrInfo(&sci,srcSlice,0,bpp,si.pitch,si.height,si.depth,1,stm,sDepth,(sswz>>8)&1,(sswz>>9)&3);
++    if(Latte::TM_IsMacroTiled(dtm))LatteAddrLib::SetupCachedSurfaceAddrInfo(&dci,dstSlice,0,bpp,di.pitch,di.height,di.depth,1,dtm,dDepth,(dswz>>8)&1,(dswz>>9)&3);
+     // Gather before storing so overlapping guest ranges survive a change in tiling geometry.
+-    std::vector<uint8_t> rows(size_t(bw)*bh*sf.bytesPerBlock);
++    std::vector<uint8_t> rows(size_t(bw)*bh*bytesPer);
+     for(uint32_t y=0;y<bh;++y)for(uint32_t x=0;x<bw;++x) {
+-        uint32_t offset=element_offset(si,stm,x,y,srcSlice,bpp,sswz,&sci,(sf.depth||sf.convert==Convert::D24_R32F));
+-        memcpy(rows.data()+(size_t(y)*bw+x)*sf.bytesPerBlock,mem::ptr(sbase+offset),sf.bytesPerBlock);
++        uint32_t offset=element_offset(si,stm,x,y,srcSlice,bpp,sswz,&sci,sDepth);
++        memcpy(rows.data()+(size_t(y)*bw+x)*bytesPer,mem::ptr(sbase+offset),bytesPer);
+     }
+     for(uint32_t y=0;y<bh;++y)for(uint32_t x=0;x<bw;++x) {
+-        uint32_t offset=element_offset(di,dtm,x,y,dstSlice,bpp,dswz,&dci,(df.depth||df.convert==Convert::D24_R32F));
+-        memcpy(mem::ptr(dbase+offset),rows.data()+(size_t(y)*bw+x)*sf.bytesPerBlock,sf.bytesPerBlock);
++        uint32_t offset=element_offset(di,dtm,x,y,dstSlice,bpp,dswz,&dci,dDepth);
++        memcpy(mem::ptr(dbase+offset),rows.data()+(size_t(y)*bw+x)*bytesPer,bytesPer);
+     }
+     for(auto& [address,image]:R.surfaces)if(address==dbase){image->gpuWritten=false;image->dirty=true;image->lastCheckedFrame=~0ull;}
+ }
+diff --git a/runtime/src/mods/byml.h b/runtime/src/mods/byml.h
+index e4c466b..b67ae8e 100644
+--- a/runtime/src/mods/byml.h
++++ b/runtime/src/mods/byml.h
+@@ -26,7 +26,10 @@ struct Value {
+     std::vector<Value> array;                         // Array
+     std::vector<std::pair<std::string, Value>> hash;  // Hash: sorted by key (byte order), each key once
+ 
+-    static Value null() { return {}; }
++    // Both defined after the struct: libstdc++ checks pair<string, Value> default construction while Value is
++    // still incomplete when the constructor is implicit (libc++ does not)
++    Value();
++    static Value null();
+     static Value string(std::string s);
+     static Value boolean(bool b);
+     static Value s32(int32_t v);
+@@ -57,6 +60,8 @@ struct Value {
+     bool operator==(const Value& o) const;  // the same type and value (floats by their bits)
+     bool operator!=(const Value& o) const { return !(*this == o); }
+ };
++inline Value::Value() = default;
++inline Value Value::null() { return {}; }
+ 
+ struct Document {
+     Value root;  // a Hash, an Array or Null
+diff --git a/runtime/src/gfx/vulkan/frame_times_stub.cpp b/runtime/src/gfx/vulkan/frame_times_stub.cpp
+new file mode 100644
+index 0000000..36ba7f8
+--- /dev/null
++++ b/runtime/src/gfx/vulkan/frame_times_stub.cpp
+@@ -0,0 +1,6 @@
++// Deck test build: the Metal renderer records per-frame GPU start/done times for gx2_core.cpp's [frame] log
++// line (metal_main.mm). The Vulkan backend has no such record yet; 0 means "not known yet" to that log.
++#include <cstdint>
++
++extern "C" int64_t wwhd_frame_done_ns(uint64_t) { return 0; }
++extern "C" int64_t wwhd_frame_gpu_start_ns(uint64_t) { return 0; }
