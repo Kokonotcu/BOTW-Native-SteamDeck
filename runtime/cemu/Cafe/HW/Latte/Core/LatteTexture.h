@@ -149,6 +149,7 @@ public:
 	MPTR texDataPtrLow{};
 	MPTR texDataPtrHigh{};
 	uint32 texDataHash2{};
+	struct LatteTextureHashJob* pendingHash{};  // BotW-Native: reload hash computed on a decode helper (LatteTC_ResolvePendingHash)
 	// BotW-Native: 2D arrays, mip-0 hash per slice and the slices changed at the last reload (LatteTexture_ReloadData)
 	std::vector<uint64> sliceHash;
 	std::vector<uint32> sliceRecheck;

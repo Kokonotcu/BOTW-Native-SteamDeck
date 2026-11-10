@@ -603,6 +603,10 @@ void LatteTextureLoader_loadTextureDataIntoSlice(LatteTexture* hostTexture, sint
 // writes and semaphores, swap/flip, bottom-of-pipe callbacks, timer samples) first joins all pending decodes, so the
 // data is in place before the GPU runs the copy and the guest texture memory is read before the game can learn that
 // the GPU is done with it - the same bytes as the synchronous decode. BOTW_ASYNC_TEXDECODE=0 off.
+void LatteTC_RunHashJob(LatteTextureHashJob* job);  // LatteTextureCache.cpp
+void LatteTC_ResolvePendingHash(LatteTexture* tex);
+void LatteTC_ResetTextureChangeTrackerAsync(LatteTexture* tex);
+
 namespace
 {
 	bool AsyncTexDecodeOn()
@@ -633,7 +637,18 @@ namespace
 						m_threads.emplace_back([this] { helperLoop(); }).detach();
 				Batch* batch = &m_batches[m_batchIndex];
 				batch->pending.fetch_add(1, std::memory_order_relaxed);
-				m_jobs.push_back(Job{decoder, ctx, dst, size, batch});
+				m_jobs.push_back(Job{decoder, ctx, dst, size, batch, nullptr});
+				m_pending.fetch_add(1, std::memory_order_relaxed);
+			}
+			m_jobCv.notify_one();
+		}
+
+		// a reload's change-tracking hash (LatteTC_ResetTextureChangeTrackerAsync); no submit waits for it
+		void pushHash(LatteTextureHashJob* hashJob)
+		{
+			{
+				std::lock_guard lock(m_mutex);
+				m_jobs.push_back(Job{nullptr, {}, nullptr, 0, nullptr, hashJob});
 				m_pending.fetch_add(1, std::memory_order_relaxed);
 			}
 			m_jobCv.notify_one();
@@ -689,13 +704,14 @@ namespace
 			uint8* dst;
 			uint32 size;
 			Batch* batch;
+			LatteTextureHashJob* hashJob;
 		};
 		static constexpr int kBatches = 64;
 
 		// m_mutex held
 		void finish(Job& job)
 		{
-			if (job.batch->pending.fetch_sub(1, std::memory_order_release) == 1)
+			if (job.batch && job.batch->pending.fetch_sub(1, std::memory_order_release) == 1)
 				job.batch->pending.notify_all();
 			if (m_pending.fetch_sub(1, std::memory_order_release) == 1)
 				m_doneCv.notify_all();
@@ -703,6 +719,11 @@ namespace
 
 		static void run(Job& job)
 		{
+			if (job.hashJob)
+			{
+				LatteTC_RunHashJob(job.hashJob);
+				return;
+			}
 			// decode into cached memory, then one sequential copy into the (write-combined) upload memory
 			static thread_local std::vector<uint8> scratch;
 			if (scratch.size() < job.size)
@@ -761,6 +782,11 @@ void LatteTextureLoader_JoinAsyncDecodes()
 	s_asyncTextureDecoder->join();
 }
 
+void LatteTextureLoader_QueueHashJob(LatteTextureHashJob* job)
+{
+	s_asyncTextureDecoder->pushHash(job);
+}
+
 void* LatteTextureLoader_CloseAsyncDecodeBatch()
 {
 	return s_asyncTextureDecoder->closeBatch();
@@ -817,12 +843,14 @@ void LatteTextureLoader_UpdateTextureSliceData(LatteTexture* tex, uint32 sliceIn
 
 	if (LatteTextureLoader_TryAsyncDecode(tex, texDecoder, textureLoader, depth, sliceIndex, mipIndex, imageSize))
 	{
-		// the same tracker update as below; the decode itself runs later (LatteTextureLoader_JoinAsyncDecodes)
+		// the same tracker update as below; the decode itself runs later (LatteTextureLoader_JoinAsyncDecodes), and so
+		// does the hash
 		if ((mipIndex == 0 && sliceIndex == 0) || (tex->texDataPtrLow == 0 && tex->texDataPtrHigh == 0))
 		{
+			LatteTC_ResolvePendingHash(tex);  // a helper may still hash the old range
 			tex->texDataPtrLow = physImagePtr + textureLoader.minOffsetOutdated;
 			tex->texDataPtrHigh = physImagePtr + textureLoader.maxOffsetOutdated;
-			LatteTC_ResetTextureChangeTracker(tex, true);
+			LatteTC_ResetTextureChangeTrackerAsync(tex);
 		}
 		return;
 	}
@@ -872,6 +900,7 @@ void LatteTextureLoader_UpdateTextureSliceData(LatteTexture* tex, uint32 sliceIn
 	// the whole texture again (an 83-slice terrain array was hashed 83 times per load)
 	if ((mipIndex == 0 && sliceIndex == 0) || (tex->texDataPtrLow == 0 && tex->texDataPtrHigh == 0))
 	{
+		LatteTC_ResolvePendingHash(tex);  // a helper may still hash the old range
 		tex->texDataPtrLow = physImagePtr + textureLoader.minOffsetOutdated; // always zero
 		tex->texDataPtrHigh = physImagePtr + textureLoader.maxOffsetOutdated; // currently set to surface size
 		LatteTC_ResetTextureChangeTracker(tex, true);
@@ -1013,6 +1042,7 @@ void LatteTextureLoader_UpdateTextureSlices(LatteTexture* tex, const std::vector
 	{
 		if ((sliceMips[i] == std::pair<uint32, uint32>(0, 0)) || (tex->texDataPtrLow == 0 && tex->texDataPtrHigh == 0))
 		{
+			LatteTC_ResolvePendingHash(tex);  // a helper may still hash the old range
 			tex->texDataPtrLow = tex->physAddress + ctx[i].minOffsetOutdated;
 			tex->texDataPtrHigh = tex->physAddress + ctx[i].maxOffsetOutdated;
 			LatteTC_ResetTextureChangeTracker(tex, true);

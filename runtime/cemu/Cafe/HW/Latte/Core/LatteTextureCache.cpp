@@ -229,6 +229,87 @@ uint32 LatteTexture_CalculateTextureDataHash(LatteTexture* hostTexture)
 
 uint64 _botwLargeTexHax = 0;
 
+// BotW-Native: the reset hash of a reload whose decode runs on the texture decode helpers is computed there too (it
+// read the whole texture on the GPU thread, ~15% of the worst load-in frames, b175 Deck profile). Like the decode, it
+// reads the guest memory before the next GPU progress point the game can observe (those join all helper jobs).
+// Whatever reads texDataHash2 or changes what the hash covers resolves the pending hash first: it takes the helper's
+// value or, when no helper has started it yet, cancels the job and hashes here as before.
+struct LatteTextureHashJob
+{
+	std::atomic<uint32> state{1};  // 1 queued, 2 running, 3 done, 0 cancelled
+	std::atomic<uint32> refs{2};  // held by the texture and by the queued job
+	uint32 value{};
+	LatteTexture* tex{};
+};
+
+void LatteTextureLoader_QueueHashJob(LatteTextureHashJob* job);  // LatteTextureLoader.cpp
+
+static void HashJobRelease(LatteTextureHashJob* job)
+{
+	if (job->refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+		delete job;
+}
+
+// decode helper (or the GPU thread joining)
+void LatteTC_RunHashJob(LatteTextureHashJob* job)
+{
+	uint32 expected = 1;
+	if (job->state.compare_exchange_strong(expected, 2, std::memory_order_acquire))
+	{
+		job->value = LatteTexture_CalculateTextureDataHash(job->tex);
+		job->state.store(3, std::memory_order_release);
+		job->state.notify_all();
+	}
+	HashJobRelease(job);
+}
+
+// apply = false: the texture is being deleted, only make sure no helper still reads it
+void LatteTC_ResolvePendingHash(LatteTexture* tex, bool apply)
+{
+	LatteTextureHashJob* job = tex->pendingHash;
+	if (!job)
+		return;
+	tex->pendingHash = nullptr;
+	uint32 expected = 1;
+	if (job->state.compare_exchange_strong(expected, 0, std::memory_order_acquire))
+	{
+		if (apply)
+			tex->texDataHash2 = LatteTexture_CalculateTextureDataHash(tex);
+	}
+	else
+	{
+		for (uint32 s; (s = job->state.load(std::memory_order_acquire)) != 3;)
+			job->state.wait(s, std::memory_order_acquire);
+		if (apply)
+			tex->texDataHash2 = job->value;  // what the reset's LatteTC_HasTextureChanged(tex, true) stores
+	}
+	HashJobRelease(job);
+}
+
+void LatteTC_ResolvePendingHash(LatteTexture* tex)
+{
+	LatteTC_ResolvePendingHash(tex, true);
+}
+
+// LatteTC_ResetTextureChangeTracker(tex, true) with the hash queued for the decode helpers
+void LatteTC_ResetTextureChangeTrackerAsync(LatteTexture* tex)
+{
+	LatteTC_ResolvePendingHash(tex, true);
+	if (tex->depth == 83 && tex->width == 1024 && tex->height == 1024)
+	{
+		// BotW's terrain array: its _botwLargeTexHax bookkeeping (LatteTC_HasTextureChanged) is done at once
+		LatteTC_ResetTextureChangeTracker(tex, true);
+		return;
+	}
+	// what the forced reset does before hashing
+	tex->forceInvalidate = false;
+	tex->lastDataUpdateFrameCounter = LatteGPUState.frameCounter;
+	auto* job = new LatteTextureHashJob();
+	job->tex = tex;
+	tex->pendingHash = job;
+	LatteTextureLoader_QueueHashJob(job);
+}
+
 bool LatteTC_HasTextureChanged(LatteTexture* hostTexture, bool force)
 {
 	if (hostTexture->forceInvalidate)
@@ -250,6 +331,7 @@ bool LatteTC_HasTextureChanged(LatteTexture* hostTexture, bool force)
 	}
 	// workaround for corrupted terrain texture in BotW after video playback
 	// probably would be fixed if we added support for invalidating individual slices/mips of a texture
+	LatteTC_ResolvePendingHash(hostTexture, true);
 	uint32 texDataHash = LatteTexture_CalculateTextureDataHash(hostTexture);
 	if( texDataHash != hostTexture->texDataHash2 )
 	{
@@ -273,6 +355,7 @@ void LatteTC_SwitchToLightHash(LatteTexture* hostTexture)
 {
 	if (hostTexture->useLightHash)
 		return;
+	LatteTC_ResolvePendingHash(hostTexture, true);
 	hostTexture->useLightHash = true;
 	hostTexture->texDataHash2 = LatteTexture_CalculateTextureDataHash(hostTexture);
 }
@@ -337,6 +420,7 @@ bool LatteTC_IsTextureDataOverwritten(LatteTexture* texture)
 
 void LatteTexture_Delete(LatteTexture* texture)
 {
+	LatteTC_ResolvePendingHash(texture, false);
 	LatteTC_UnregisterTexture(texture);
 	LatteMRT::NotifyTextureDeletion(texture);
 	LatteTextureReadback_NotifyTextureDeletion(texture);
